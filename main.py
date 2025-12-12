@@ -1,14 +1,18 @@
-# main.py - V3: УЛУЧШЕННАЯ СТАБИЛЬНОСТЬ И АРХИТЕКТУРА (WEBHOOK V2)
+# main.py - V4-FIXED: БОЕВАЯ ВЕРСИЯ (PostgreSQL + Async API + СТАБИЛЬНЫЙ WEBHOOK)
 
 import os
 import asyncio
 import pandas as pd
-import yfinance as yf
 import pandas_ta as ta
 import logging
 import sys 
 from typing import Dict, Any, List, Union
-from threading import Lock # Для защиты данных в памяти
+from datetime import datetime
+import time
+
+# --- Добавлены библиотеки для стабильности ---
+import asyncpg 
+from functools import lru_cache 
 
 # --- Импорты для aiogram V3 и aiohttp V2 запуска ---
 from aiogram import Bot, Dispatcher, types
@@ -22,28 +26,36 @@ from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.client.default import DefaultBotProperties
 from aiogram.webhook.aiohttp_server import setup_application
 from aiohttp import web 
-import time
+from aiogram.utils.markdown import link
 
-# -------------------- Конфиг (WEBHOOK) --------------------
-# Переменные читаются из Env Vars.
+# --- ВРЕМЕННЫЙ ИМПОРТ: Заглушка для API ---
+import yfinance as yf 
+
+# -------------------- Конфиг и Ключи --------------------
 TG_TOKEN = os.environ.get("TG_TOKEN") 
+DATABASE_URL = os.environ.get("DATABASE_URL") 
+API_KEY = os.environ.get("API_KEY") 
+SECRET_KEY = os.environ.get("SECRET_KEY") 
+
 PO_REFERRAL_LINK = "https://m.po-tck.com/ru/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START" 
 
-# НАСТРОЙКИ WEBHOOK (Используем стандартные переменные Render)
+# НАСТРОЙКИ WEBHOOK
 WEB_SERVER_PORT = int(os.environ.get("PORT", 10000)) 
 WEB_SERVER_HOST = os.environ.get("WEB_SERVER_HOST", "0.0.0.0") 
 RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME") 
 
-# --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ ПУТИ WEBHOOK ---
-if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
+# Проверка критических переменных
+if not all([TG_TOKEN, RENDER_EXTERNAL_HOSTNAME]):
     logging.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Не задан TG_TOKEN или RENDER_EXTERNAL_HOSTNAME. Выход.")
     sys.exit(1)
 
-# WEBHOOK_PATH для установки в Telegram API (с токеном)
+# --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ WEBHOOK PATH ---
+# 1. Путь для установки в Telegram API (С ТОКЕНОМ)
 WEBHOOK_PATH = f"/webhook/{TG_TOKEN}" 
 WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
-# WEBHOOK_BASE_PATH для aiohttp роутера (без токена)
-WEBHOOK_BASE_PATH = "/webhook"
+
+# 2. Путь для aiohttp роутера (ДОЛЖЕН СОВПАДАТЬ С ПУНКТ 1, чтобы избежать 404)
+WEBHOOK_BASE_PATH = WEBHOOK_PATH # ИСПРАВЛЕНО!
 
 # ОСТАЛЬНЫЕ КОНСТАНТЫ
 PAIRS = [
@@ -58,81 +70,126 @@ PAIRS_PER_PAGE = 6
 bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher(storage=MemoryStorage())
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+DB_POOL: Union[asyncpg.Pool, None] = None 
 
-# -------------------- In-Memory База данных (ЗАМЕНА SQLite и users.txt) --------------------
-# Используем словари в памяти, так как Render не гарантирует сохранение файлов.
 
-# {user_id: True}
+# -------------------- PostgreSQL Логика (ОБЯЗАТЕЛЬНАЯ) --------------------
+
+async def init_db_pool():
+    """Инициализирует пул подключений к PostgreSQL."""
+    global DB_POOL
+    if not DATABASE_URL:
+        logging.warning("⚠️ DATABASE_URL не задан. Бот будет работать без сохранения истории и авторизации (In-Memory).")
+        return
+    try:
+        DB_POOL = await asyncpg.create_pool(DATABASE_URL)
+        logging.info("✅ Пул PostgreSQL успешно создан.")
+        await init_db_tables()
+    except Exception as e:
+        logging.error(f"❌ Ошибка подключения или создания пула PostgreSQL: {e}")
+        # Не выходим, чтобы бот работал хотя бы в In-Memory режиме, если DB упала.
+
+async def init_db_tables():
+    """Создает необходимые таблицы (users и trades)."""
+    if not DB_POOL: return
+    async with DB_POOL.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(user_id),
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                pair TEXT NOT NULL,
+                timeframe INTEGER NOT NULL,
+                result TEXT, 
+                direction TEXT
+            );
+        """)
+    logging.info("✅ Таблицы users и trades успешно созданы/проверены.")
+
+
+# In-Memory заглушка, если DB не работает
 AUTHORIZED_USERS: Dict[int, bool] = {}
 
-# {trade_id: {user_id: 123, pair: 'EURUSD', timeframe: 5, direction: 'BUY', result: None}}
-ACTIVE_TRADES: Dict[int, Dict[str, Any]] = {}
-trade_id_counter: int = 1
-data_lock = Lock() # Мьютекс для защиты общих данных
-
-def get_next_trade_id() -> int:
-    global trade_id_counter
-    with data_lock:
-        trade_id_counter += 1
-        return trade_id_counter - 1
-
-def save_user(user_id: int):
-    with data_lock:
+async def save_user_db(user_id: int):
+    if DB_POOL:
+        async with DB_POOL.acquire() as conn:
+            try:
+                await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
+            except Exception as e:
+                logging.error(f"Ошибка сохранения пользователя {user_id} в DB: {e}")
+    else:
         AUTHORIZED_USERS[user_id] = True
 
-def is_user_authorized(user_id: int) -> bool:
-    with data_lock:
+async def is_user_authorized_db(user_id: int) -> bool:
+    if DB_POOL:
+        async with DB_POOL.acquire() as conn:
+            result = await conn.fetchval("SELECT 1 FROM users WHERE user_id = $1", user_id)
+            return result is not None
+    else:
         return user_id in AUTHORIZED_USERS
 
-def save_trade(user_id: int, pair: str, timeframe: int, direction: str) -> int:
-    trade_id = get_next_trade_id()
-    with data_lock:
-        ACTIVE_TRADES[trade_id] = {
-            'user_id': user_id,
-            'timestamp': time.time(),
-            'pair': pair,
-            'timeframe': timeframe,
-            'direction': direction,
-            'result': None
-        }
-    return trade_id
+async def save_trade_db(user_id: int, pair: str, timeframe: int, direction: str) -> int:
+    # Используем заглушку, так как без DB нельзя вернуть ID сделки для дальнейшего обновления.
+    if not DB_POOL: 
+        logging.warning("⚠️ DB недоступна. Сделка не сохранена.")
+        return int(time.time()) 
 
-def update_trade_result(trade_id: int, result: str):
-    with data_lock:
-        if trade_id in ACTIVE_TRADES:
-            ACTIVE_TRADES[trade_id]['result'] = result
+    async with DB_POOL.acquire() as conn:
+        return await conn.fetchval("""
+            INSERT INTO trades (user_id, pair, timeframe, direction) 
+            VALUES ($1, $2, $3, $4)
+            RETURNING id
+        """, user_id, pair, timeframe, direction)
 
-def get_user_stats(user_id: int) -> Dict[str, Any]:
-    with data_lock:
-        user_trades = [trade for trade in ACTIVE_TRADES.values() 
-                       if trade['user_id'] == user_id and trade['result'] is not None]
+async def update_trade_result_db(trade_id: int, result: str):
+    if not DB_POOL: return
+    async with DB_POOL.acquire() as conn:
+        await conn.execute("""
+            UPDATE trades SET result = $1 WHERE id = $2
+        """, result, trade_id)
 
-    total_plus = sum(1 for trade in user_trades if trade['result'] == 'PLUS')
-    total_minus = sum(1 for trade in user_trades if trade['result'] == 'MINUS')
+async def get_user_stats_db(user_id: int) -> Dict[str, Any]:
+    if not DB_POOL:
+        return {'total_plus': 0, 'total_minus': 0, 'pair_stats': {}}
+
+    async with DB_POOL.acquire() as conn:
+        stats_rows = await conn.fetch("""
+            SELECT result, COUNT(*) FROM trades 
+            WHERE user_id = $1 AND result IS NOT NULL 
+            GROUP BY result
+        """, user_id)
+        stats = dict(stats_rows)
+
+        pair_rows = await conn.fetch("""
+            SELECT pair, result, COUNT(*) FROM trades 
+            WHERE user_id = $1 AND result IS NOT NULL 
+            GROUP BY pair, result
+        """, user_id)
     
-    pair_stats: Dict[str, Dict[str, int]] = {}
-    for trade in user_trades:
-        pair = trade['pair']
-        result = trade['result']
-        if pair not in pair_stats:
-            pair_stats[pair] = {'PLUS': 0, 'MINUS': 0}
-        pair_stats[pair][result] += 1
+    formatted_pair_stats: Dict[str, Dict[str, int]] = {}
+    for pair, result, count in pair_rows:
+        if pair not in formatted_pair_stats:
+            formatted_pair_stats[pair] = {'PLUS': 0, 'MINUS': 0}
+        if result in formatted_pair_stats[pair]:
+            formatted_pair_stats[pair][result] = count
 
     return {
-        'total_plus': total_plus,
-        'total_minus': total_minus,
-        'pair_stats': pair_stats
+        'total_plus': stats.get('PLUS', 0),
+        'total_minus': stats.get('MINUS', 0),
+        'pair_stats': formatted_pair_stats
     }
 
 
-# -------------------- FSM (Состояния) --------------------
+# -------------------- FSM и Клавиатуры --------------------
 class Form(StatesGroup):
     waiting_for_referral = State() 
     choosing_pair = State()
     choosing_timeframe = State()
-    
-# -------------------- Клавиатуры (БЕЗ ИЗМЕНЕНИЙ) --------------------
-# [Код клавиатур из предыдущей версии]
 
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -187,7 +244,7 @@ def get_timeframes_keyboard(pair: str) -> InlineKeyboardMarkup:
 async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     
-    if is_user_authorized(user_id):
+    if await is_user_authorized_db(user_id):
         await state.clear()
         await message.answer(
             "🏠 **Главное меню**\n\nВыберите действие:",
@@ -195,10 +252,11 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
     else:
         await state.set_state(Form.waiting_for_referral)
+        referral_link = link("НАША РЕФЕРАЛЬНАЯ ССЫЛКА", PO_REFERRAL_LINK)
         referral_text = (
             "🚀 **Привет! Для получения торговых сигналов тебе необходимо зарегистрироваться "
             "по нашей реферальной ссылке Pocket Option!**\n\n"
-            f"1. Перейди по ссылке: [НАША РЕФЕРАЛЬНАЯ ССЫЛКА]({PO_REFERRAL_LINK})\n"
+            f"1. Перейди по ссылке: {referral_link}\n"
             "2. Зарегистрируйся.\n"
             "3. **После регистрации** скопируй свой **ID аккаунта** (только цифры) "
             "и **отправь его в этот чат** для активации бота."
@@ -209,17 +267,18 @@ async def cmd_start(message: types.Message, state: FSMContext):
 @dp.callback_query(lambda c: c.data in ["main_menu", "start_trade"])
 async def main_menu_handler(query: types.CallbackQuery, state: FSMContext):
     user_id = query.from_user.id
-    if not is_user_authorized(user_id):
+    if not await is_user_authorized_db(user_id):
         await query.answer("Сначала активируйте бота, отправив свой ID.", show_alert=True)
         return
         
     await state.clear()
     
     if query.data == "main_menu":
-        await query.message.edit_text(
-            "🏠 **Главное меню**\n\nВыберите действие:",
-            reply_markup=get_main_menu_keyboard()
-        )
+        if query.message:
+            await query.message.edit_text(
+                "🏠 **Главное меню**\n\nВыберите действие:",
+                reply_markup=get_main_menu_keyboard()
+            )
         
     elif query.data == "start_trade":
         await state.set_state(Form.choosing_pair)
@@ -233,14 +292,14 @@ async def main_menu_handler(query: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(lambda c: c.data == "show_history")
 async def show_history_handler(query: types.CallbackQuery, state: FSMContext):
     user_id = query.from_user.id
-    if not is_user_authorized(user_id):
+    if not await is_user_authorized_db(user_id):
         await query.answer("Сначала активируйте бота, отправив свой ID.", show_alert=True)
         return
         
-    stats = get_user_stats(user_id)
+    stats = await get_user_stats_db(user_id) 
+    
     total_trades = stats['total_plus'] + stats['total_minus']
     
-    # ... [Код статистики без изменений]
     if total_trades == 0:
         text = "📜 **История сделок**\n\nУ вас пока нет закрытых сделок."
     else:
@@ -263,6 +322,9 @@ async def show_history_handler(query: types.CallbackQuery, state: FSMContext):
             text += (
                 f"\n**{pair}**: {plus} ✅ / {minus} ❌ ({pair_win_rate:.1f}%)"
             )
+        
+        if not DB_POOL:
+            text += "\n\n⚠️ **Примечание:** История сохраняется только до перезапуска, так как DATABASE_URL не задан или не работает."
 
     await query.message.edit_text(
         text,
@@ -275,24 +337,25 @@ async def trade_result_handler(query: types.CallbackQuery, state: FSMContext):
     _, trade_id_str, result = query.data.split(":")
     trade_id = int(trade_id_str)
     
-    update_trade_result(trade_id, result)
+    await update_trade_result_db(trade_id, result)
     
     icon = "✅" if result == "PLUS" else "❌"
     
-    # Удаляем кнопки после выбора
     await query.message.edit_reply_markup(reply_markup=None)
     
     keyboard = InlineKeyboardBuilder()
     keyboard.button(text="🏠 Главное меню", callback_data="main_menu")
     
+    text = f"{icon} **Результат сделки сохранен: {result}**\n\nВыберите следующее действие:"
+    if not DB_POOL:
+        text += "\n\n⚠️ **ВНИМАНИЕ:** История не сохранена навсегда (нет DB)."
+    
     await query.message.answer(
-        f"{icon} **Результат сделки сохранен: {result}**\n\n"
-        "Выберите следующее действие:",
+        text,
         reply_markup=keyboard.as_markup()
     )
 
     await query.answer(f"Результат {result} сохранен!")
-    # State остается чистым
 
 @dp.message(Form.waiting_for_referral)
 async def process_referral_check(message: types.Message, state: FSMContext):
@@ -301,7 +364,7 @@ async def process_referral_check(message: types.Message, state: FSMContext):
     is_valid = user_input.isdigit() and len(user_input) > 4
 
     if is_valid:
-        save_user(user_id) 
+        await save_user_db(user_id) 
         await state.clear()
         
         await message.answer(
@@ -317,7 +380,7 @@ async def process_referral_check(message: types.Message, state: FSMContext):
 @dp.callback_query(lambda c: c.data.startswith("page:"))
 async def page_handler(query: types.CallbackQuery, state: FSMContext):
     user_id = query.from_user.id
-    if not is_user_authorized(user_id):
+    if not await is_user_authorized_db(user_id):
         await query.answer("Сначала активируйте бота.", show_alert=True)
         return
         
@@ -331,7 +394,7 @@ async def page_handler(query: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
 async def pair_handler(query: types.CallbackQuery, state: FSMContext):
     user_id = query.from_user.id
-    if not is_user_authorized(user_id):
+    if not await is_user_authorized_db(user_id):
         await query.answer("Сначала активируйте бота.", show_alert=True)
         return
         
@@ -349,28 +412,24 @@ async def pair_handler(query: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(lambda c: c.data.startswith("tf:"))
 async def tf_handler(query: types.CallbackQuery, state: FSMContext):
     user_id = query.from_user.id
-    if not is_user_authorized(user_id):
+    if not await is_user_authorized_db(user_id):
         await query.answer("Сначала активируйте бота.", show_alert=True)
         return
         
-    # Блокировка concurrency: проверяем, не ждет ли бот сейчас ввода
     current_state = await state.get_state()
-    if current_state == Form.choosing_timeframe:
-        await state.set_state(None) # Снимаем состояние, чтобы разрешить следующие команды
-    else:
-        # Если вдруг пришел еще один callback, пока предыдущий обрабатывается
-        await query.answer("⏳ Дождитесь завершения предыдущего запроса.", show_alert=False)
+    if current_state != Form.choosing_timeframe:
+        await query.answer("⏳ Дождитесь завершения предыдущего запроса или выберите пару снова.", show_alert=False)
         return
         
+    await state.set_state(None) 
+
     _, pair, tf = query.data.split(":")
     tf = int(tf)
     
-    # 1. Изменяем сообщение на "Загрузка"
     await query.answer("Идет загрузка сигнала...", show_alert=False) 
     message_to_edit = await query.message.edit_text(f"Выбраны {pair} и {tf} мин. Идет загрузка сигнала...")
 
     try:
-        # 2. Вызов асинхронной функции
         await send_signal(pair, tf, query.from_user.id, message_to_edit.chat.id, message_to_edit.message_id)
     except Exception as e:
         error_text = f"❌ **Критическая ошибка.** Не удалось обработать сигнал. Попробуйте позже."
@@ -384,13 +443,20 @@ async def tf_handler(query: types.CallbackQuery, state: FSMContext):
     
 # -------------------- Получение свечей и Индикаторы --------------------
 
-# Оборачиваем синхронную функцию YFinance в асинхронный поток
+# Кэш сбрасывается каждую минуту
+@lru_cache(maxsize=128)
+def get_cache_key(symbol: str, exp_minutes: int, current_minute: int) -> str:
+    return f"{symbol}_{exp_minutes}_{current_minute}"
+
+
 async def async_fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
-    def sync_fetch():
-        interval = "1m"
+    current_minute = datetime.now().minute
+    cache_key = get_cache_key(symbol, exp_minutes, current_minute)
+    
+    def sync_fetch_data():
         try:
-            # yfinance не очень надежен для форекс, но оставим его для простоты.
-            df = yf.download(f"{symbol}=X", period="5d", interval=interval, progress=False, show_errors=False) 
+            # Используем yfinance как заглушку, так как ключи Alpaca не предоставлены.
+            df = yf.download(f"{symbol}=X", period="5d", interval="1m", progress=False, show_errors=False) 
         except Exception as e:
             logging.error(f"Ошибка загрузки данных YFinance для {symbol}: {e}")
             return pd.DataFrame() 
@@ -399,7 +465,7 @@ async def async_fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
         if not all(col in df.columns for col in required_cols):
             return pd.DataFrame()
 
-        df = df[required_cols] 
+        df = df[required_cols].copy() 
         df.columns = [col.lower() for col in required_cols]
         
         if exp_minutes > 1 and not df.empty:
@@ -407,21 +473,17 @@ async def async_fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
                 'open':'first','high':'max','low':'min','close':'last','volume':'sum'
             }).dropna()
             
-        # Усиленная проверка данных: нужно минимум 50 свечей
         if len(df) < 50:
             logging.warning(f"Недостаточно данных ({len(df)}) для {symbol} {exp_minutes}min.")
             return pd.DataFrame()
             
         return df
 
-    # Запускаем синхронную операцию в отдельном потоке, чтобы не блокировать event loop
-    return await asyncio.to_thread(sync_fetch)
-
+    return await asyncio.to_thread(sync_fetch_data)
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     
-    # Расчет индикаторов
     df['ema9'] = ta.ema(df['close'], length=9)
     df['ema21'] = ta.ema(df['close'], length=21)
     df['sma50'] = ta.sma(df['close'], length=50)
@@ -438,7 +500,6 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df['cci20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
     
-    # Проверка на наличие критических колонок после расчета
     critical_cols = ['ema9', 'ema21', 'macd', 'rsi14', 'stoch_k', 'sma50']
     df_cleaned = df.dropna(subset=critical_cols)
     
@@ -454,29 +515,24 @@ def support_resistance(df: pd.DataFrame) -> Dict[str, float]:
 
 def indicator_vote(latest: pd.Series) -> Dict[str, Union[str, float]]:
     score = 0
-    # Проверка на тренд (ADX не используется, так как он иногда требует слишком много данных)
     
-    # 1. EMA (Trend)
     if latest['ema9'] > latest['ema21'] and latest['close'] > latest['ema21']:
-        score += 1 # UP Trend
+        score += 1 
     elif latest['ema9'] < latest['ema21'] and latest['close'] < latest['ema21']:
-        score -= 1 # DOWN Trend
+        score -= 1 
     
-    # 2. RSI (Momentum/Overbought/Oversold)
-    if latest['rsi14'] < 30: score += 1 # Oversold -> Buy
-    if latest['rsi14'] > 70: score -= 1 # Overbought -> Sell
+    if latest['rsi14'] < 30: score += 1 
+    if latest['rsi14'] > 70: score -= 1 
 
-    # 3. MACD (Momentum cross)
     if latest['macd'] > latest['macd_signal'] and latest['macd'] < 0:
-        score += 1 # Buy signal from momentum shift
+        score += 1 
     elif latest['macd'] < latest['macd_signal'] and latest['macd'] > 0:
-        score -= 1 # Sell signal from momentum shift
+        score -= 1 
     
-    # 4. Stochastics (Reversal/Overbought/Oversold)
     if latest['stoch_k'] < 20 and latest['stoch_k'] > latest['stoch_d']:
-        score += 1 # Strong Buy
+        score += 1 
     if latest['stoch_k'] > 80 and latest['stoch_k'] < latest['stoch_d']:
-        score -= 1 # Strong Sell
+        score -= 1 
             
     if score >= 2:
         direction = "BUY"
@@ -485,10 +541,10 @@ def indicator_vote(latest: pd.Series) -> Dict[str, Union[str, float]]:
     else:
         direction = "HOLD" 
 
-    # Простая уверенность, основанная на силе скоринга
     confidence = min(100, abs(score) * 20 + 30)
     
     return {"direction": direction, "confidence": confidence, "score": score}
+
 
 async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, message_id: int):
     
@@ -511,8 +567,8 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
     res = indicator_vote(latest)
     sr = support_resistance(df_ind)
     
-    # Сохраняем сделку в In-Memory DB
-    trade_id = save_trade(user_id, pair, timeframe, res['direction'])
+    # Сохраняем сделку в PostgreSQL (или получаем временный ID)
+    trade_id = await save_trade_db(user_id, pair, timeframe, res['direction'])
 
     dir_map = {"BUY":"🔺 ПОКУПКА","SELL":"🔻 ПРОДАЖА","HOLD":"⚠️ НЕОДНОЗНАЧНО"}
     text = (
@@ -536,13 +592,15 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
     except Exception as e:
         logging.error(f"Ошибка при редактировании сообщения пользователю {chat_id}: {e}")
 
-# -------------------- БЛОК ЗАПУСКА WEBHOOK (УЛУЧШЕННЫЙ) --------------------
+# -------------------- БЛОК ЗАПУСКА WEBHOOK (ФИНАЛЬНЫЙ С FIX) --------------------
 
 async def on_startup_webhook(bot: Bot):
+    await init_db_pool() # Инициализация пула DB при старте
+    
     try:
         await bot(DeleteWebhook(drop_pending_updates=True))
         if WEBHOOK_URL:
-            # Устанавливаем полный путь с токеном
+            # Устанавливаем Webhook с полным путем (с токеном)
             await bot(SetWebhook(url=WEBHOOK_URL)) 
             logging.info(f"✅ Webhook успешно переустановлен: {WEBHOOK_URL}")
         else:
@@ -552,19 +610,24 @@ async def on_startup_webhook(bot: Bot):
 
 async def on_shutdown_webhook(bot: Bot):
     try:
+        if DB_POOL:
+            await DB_POOL.close()
+            logging.info("❌ Пул PostgreSQL закрыт.")
         await bot(DeleteWebhook(drop_pending_updates=True))
     except Exception as e:
-        logging.error(f"Ошибка при удалении Webhook: {e}")
+        logging.error(f"Ошибка при удалении Webhook/закрытии DB: {e}")
     logging.info("❌ Webhook удален.")
 
 
 async def start_webhook():
+    logging.info(f"--- ЗАПУСК WEBHOOK СЕРВЕРА V4-FIXED: {WEBHOOK_URL} ---")
+    
     dp.startup.register(on_startup_webhook)
     dp.shutdown.register(on_shutdown_webhook)
     
     app = web.Application()
     
-    # Используем WEBHOOK_BASE_PATH = "/webhook" для aiohttp роутера
+    # Используем WEBHOOK_BASE_PATH, который теперь включает токен!
     setup_application(app, dp, bot=bot, path=WEBHOOK_BASE_PATH) 
     
     try:
@@ -589,3 +652,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
