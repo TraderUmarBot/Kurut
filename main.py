@@ -38,9 +38,9 @@ if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
     logging.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Не задан TG_TOKEN или RENDER_EXTERNAL_HOSTNAME. Выход.")
     sys.exit(1)
 
-# В aiogram 3.x Webhook-путь часто должен содержать токен для правильной маршрутизации.
+# В aiogram 3.x Webhook-путь должен содержать токен для правильной установки Webhook Telegram.
 WEBHOOK_PATH = f"/webhook/{TG_TOKEN}" 
-WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}" 
+WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 
 # ОСТАЛЬНЫЕ КОНСТАНТЫ
 PAIRS = [
@@ -518,7 +518,7 @@ async def on_startup_webhook(bot: Bot):
     try:
         await bot(DeleteWebhook(drop_pending_updates=True))
         if WEBHOOK_URL:
-            # Используем WEBHOOK_URL, который теперь содержит только /webhook
+            # Используем WEBHOOK_URL, который содержит полный путь с токеном
             await bot(SetWebhook(url=WEBHOOK_URL)) 
             logging.info(f"✅ Webhook успешно переустановлен: {WEBHOOK_URL}")
         else:
@@ -547,8 +547,12 @@ async def start_webhook():
     # Создаем aiohttp Web Application
     app = web.Application()
     
-    # Настраиваем Диспетчер для обработки запросов по пути WEBHOOK_PATH
-    setup_application(app, dp, bot=bot, path=WEBHOOK_PATH)
+    # --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: ПЕРЕДАЕМ БАЗОВЫЙ ПУТЬ ДЛЯ МАРШРУТИЗАЦИИ AIOHTTP ---
+    # aiogram 3.x ожидает, что базовый путь будет /webhook, и сам добавит /ТОКЕН
+    WEBHOOK_BASE_PATH = "/webhook"
+    
+    # Настраиваем Диспетчер для обработки запросов
+    setup_application(app, dp, bot=bot, path=WEBHOOK_BASE_PATH)
     
     try:
         # Запускаем aiohttp Web Server
@@ -574,4 +578,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
