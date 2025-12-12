@@ -18,7 +18,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder 
-from aiogram.methods import DeleteWebhook, SetWebhook # SetWebhook добавлен явно
+from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.client.default import DefaultBotProperties
 from aiogram.webhook.aiohttp_server import setup_application
 from aiohttp import web 
@@ -33,13 +33,14 @@ WEB_SERVER_PORT = int(os.environ.get("PORT", 10000))
 WEB_SERVER_HOST = os.environ.get("WEB_SERVER_HOST", "0.0.0.0") 
 RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME") 
 
-# --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ ПУТИ WEBHOOK ---
-# Путь Webhook должен начинаться с косой черты (/)
+# --- ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ ПУТИ WEBHOOK (Устранение 404) ---
 if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
     logging.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Не задан TG_TOKEN или RENDER_EXTERNAL_HOSTNAME. Выход.")
     sys.exit(1)
 
-WEBHOOK_PATH = f"/webhook/{TG_TOKEN}" 
+# Устанавливаем простой и стабильный путь для AioHTTP маршрутизатора
+# Telegram добавит токен в URL при установке Webhook автоматически
+WEBHOOK_PATH = "/webhook" 
 WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 
 # ОСТАЛЬНЫЕ КОНСТАНТЫ
@@ -88,7 +89,6 @@ def init_db():
     except Exception as e:
         logging.error(f"Ошибка инициализации БД: {e}")
 
-# Функции save_trade, update_trade_result, get_user_stats (без изменений)
 def save_trade(user_id: int, pair: str, timeframe: int, direction: str) -> int:
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -148,12 +148,10 @@ def save_user(user_id: int):
     users = load_users()
     if user_id not in users:
         users.add(user_id)
-        # Используем "w" (write) с перезаписью, чтобы избежать дубликатов в логах
-        # Если файл большой, лучше использовать "a" (append), но для этого проекта "w" безопаснее.
         with open(USERS_FILE, "w") as f: 
             f.writelines(f"{uid}\n" for uid in users)
 
-# -------------------- Клавиатуры (без изменений) --------------------
+# -------------------- Клавиатуры --------------------
 
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -256,7 +254,6 @@ async def show_history_handler(query: types.CallbackQuery, state: FSMContext):
     if total_trades == 0:
         text = "📜 **История сделок**\n\nУ вас пока нет закрытых сделок."
     else:
-        # Устойчивый расчет Win Rate
         win_rate = (stats['total_plus'] / total_trades) * 100 if total_trades > 0 else 0
         
         text = (
@@ -312,7 +309,6 @@ async def trade_result_handler(query: types.CallbackQuery, state: FSMContext):
 async def process_referral_check(message: types.Message, state: FSMContext):
     user_input = message.text.strip()
     user_id = message.from_user.id
-    # Простая проверка на то, что это цифры и похоже на ID
     is_valid = user_input.isdigit() and len(user_input) > 4
 
     if is_valid:
@@ -372,7 +368,7 @@ async def tf_handler(query: types.CallbackQuery, state: FSMContext):
         
     await state.clear() 
 
-# -------------------- Получение свечей и Индикаторы (без изменений) --------------------
+# -------------------- Получение свечей и Индикаторы --------------------
 
 def fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
     interval = "1m"
@@ -446,25 +442,21 @@ def indicator_vote(latest: pd.Series) -> Dict[str, Any]:
     score = 0
     is_trending = latest['adx14'] > 25
     
-    # 1. Анализ тренда (EMA и SMA)
     if is_trending:
         if latest['ema9'] > latest['ema21'] and latest['close'] > latest['sma50']:
             score += 2 
         elif latest['ema9'] < latest['ema21'] and latest['close'] < latest['sma50']:
             score -= 2 
     
-    # 2. Анализ осцилляторов (RSI и Stochastic)
     is_oversold = (latest['rsi14'] < 30) and (latest['stoch_k'] < 20)
     is_overbought = (latest['rsi14'] > 70) and (latest['stoch_k'] > 80)
     
     if is_oversold: score += 1 
     if is_overbought: score -= 1 
 
-    # 3. Анализ паттернов
     if latest['hammer']: score += 1
     if latest['shooting_star']: score -= 1
             
-    # 4. Вывод
     if score >= 2:
         direction = "BUY"
     elif score <= -2:
@@ -524,11 +516,11 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
 # -------------------- БЛОК ЗАПУСКА WEBHOOK (ФИНАЛЬНЫЙ) --------------------
 
 async def on_startup_webhook(bot: Bot):
-    # Явно удаляем и устанавливаем Webhook
     try:
         await bot(DeleteWebhook(drop_pending_updates=True))
         if WEBHOOK_URL:
-            await bot(SetWebhook(url=WEBHOOK_URL))
+            # Используем WEBHOOK_URL, который теперь содержит только /webhook
+            await bot(SetWebhook(url=WEBHOOK_URL)) 
             logging.info(f"✅ Webhook успешно переустановлен: {WEBHOOK_URL}")
         else:
             logging.error("❌ Webhook URL не определен. Невозможно установить Webhook.")
@@ -571,7 +563,6 @@ async def start_webhook():
         await asyncio.Event().wait() 
 
     except Exception as e:
-        # Это должно быть устранено, но оставляем на случай непредвиденных проблем
         logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА ЗАПУСКА WEBHOOK-СЕРВЕРА: {e}")
         sys.exit(1) 
 
@@ -584,3 +575,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
