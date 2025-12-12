@@ -2,31 +2,31 @@
 import os
 import io
 import asyncio
+import threading
+from datetime import datetime
+
 import pandas as pd
 import yfinance as yf
 import pandas_ta as ta
 import mplfinance as mpf
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # -------------------- Конфиг --------------------
 TG_TOKEN = os.getenv("TG_TOKEN") or "ВАШ_TELEGRAM_TOKEN"
-CANDLES_LIMIT = int(os.getenv("CANDLES_LIMIT", 500))  # по умолчанию 500 свечей
+CANDLES_LIMIT = int(os.getenv("CANDLES_LIMIT", 500))
 
-# Валютные пары и таймфреймы
 PAIRS = [
     "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X",
     "EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X",
     "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
-EXPIRATIONS = [1, 3, 5, 10]  # минуты
+EXPIRATIONS = [1, 3, 5, 10]
 
-# Файл для хранения пользователей
 USERS_FILE = "users.txt"
 
 bot = Bot(token=TG_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(bot)
 
 # -------------------- Пользователи --------------------
 def load_users():
@@ -45,14 +45,32 @@ def save_user(user_id):
                 f.write(f"{u}\n")
 
 # -------------------- Telegram Handlers --------------------
-async def start_handler(message: Message):
+@dp.message_handler(commands=['start'])
+async def start_handler(message: types.Message):
     save_user(message.from_user.id)
     await message.answer(
         "Привет! Я твой торговый помощник 🤖\n"
         "Выбери валюты и таймфреймы, и я буду присылать тебе торговые сигналы 24/7."
     )
+    
+    keyboard = InlineKeyboardMarkup(row_width=3)
+    buttons = [InlineKeyboardButton(text=p, callback_data=f"pair:{p}") for p in PAIRS]
+    keyboard.add(*buttons)
+    await message.answer("Выбери валютную пару:", reply_markup=keyboard)
 
-dp.message.register(start_handler, Command(commands=["start"]))
+@dp.callback_query_handler(lambda c: c.data.startswith("pair:"))
+async def pair_chosen(callback: types.CallbackQuery):
+    pair = callback.data.split(":")[1]
+    keyboard = InlineKeyboardMarkup(row_width=4)
+    buttons = [InlineKeyboardButton(text=f"{t} мин", callback_data=f"time:{pair}:{t}") for t in EXPIRATIONS]
+    keyboard.add(*buttons)
+    await callback.message.answer(f"Вы выбрали {pair}. Теперь выбери таймфрейм:", reply_markup=keyboard)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("time:"))
+async def timeframe_chosen(callback: types.CallbackQuery):
+    _, pair, t = callback.data.split(":")
+    t = int(t)
+    await callback.message.answer(f"Выбрана пара {pair} и таймфрейм {t} мин. Сигналы будут присылаться автоматически!")
 
 # -------------------- Получение свечей --------------------
 def fetch_ohlcv_yf(symbol: str, exp_minutes: int, limit: int = CANDLES_LIMIT) -> pd.DataFrame:
@@ -199,14 +217,9 @@ async def main_loop():
                     await send_signal_to_all(pair, timeframe)
                 except Exception as e:
                     print(f"Ошибка {pair} {timeframe} мин: {e}")
-        await asyncio.sleep(60)  # проверка каждую минуту
+        await asyncio.sleep(60)
 
 # -------------------- Запуск --------------------
-async def main():
-    # запускаем polling и одновременно основной цикл
-    task_bot = asyncio.create_task(dp.start_polling(bot))
-    task_loop = asyncio.create_task(main_loop())
-    await asyncio.gather(task_bot, task_loop)
-
 if __name__=="__main__":
-    asyncio.run(main())
+    threading.Thread(target=lambda: dp.start_polling()).start()
+    asyncio.run(main_loop())
