@@ -6,8 +6,7 @@ from datetime import datetime
 import pandas as pd
 import yfinance as yf
 import pandas_ta as ta
-import mplfinance as mpf
-from aiohttp import web # <--- ДОБАВЛЕНО для явного запуска Webhook
+# from aiohttp import web # УДАЛЕНО: Не нужно для Polling
 
 # --- Импорты aiogram ---
 from aiogram import Bot, Dispatcher, types
@@ -19,6 +18,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder 
 
 # -------------------- Конфиг --------------------
+# В Polling нам не нужны переменные для WEBHOOK_URL и PORT, кроме TG_TOKEN
 TG_TOKEN = os.getenv("TG_TOKEN") or "ВАШ_TELEGRAM_TOKEN"
 CANDLES_LIMIT = 500
 
@@ -35,19 +35,6 @@ TIMEFRAMES = [1, 3, 5, 10]  # минуты
 PAIRS_PER_PAGE = 6
 
 USERS_FILE = "users.txt"
-
-# -------------------- Конфиг Webhook для Render --------------------
-WEB_SERVER_HOST = "0.0.0.0"
-# Используем PORT из окружения (должен быть 10000, как вы указали)
-WEB_SERVER_PORT = int(os.environ.get("PORT", 8080)) 
-
-BASE_WEBHOOK_URL = os.environ.get("WEBHOOK_URL") 
-if not BASE_WEBHOOK_URL:
-    BASE_WEBHOOK_URL = "https://<ЗДЕСЬ_ВАШ_URL_RENDER>.onrender.com" 
-
-# Используем часть токена для Webhook Path
-WEBHOOK_PATH = f"/webhook/{TG_TOKEN.split(':')[0]}" 
-WEBHOOK_URL = BASE_WEBHOOK_URL + WEBHOOK_PATH
 
 # -------------------- Бот и диспетчер --------------------
 bot = Bot(token=TG_TOKEN)
@@ -112,14 +99,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
     
     if user_id in load_users():
         # Пользователь уже активирован
-        await state.set_state(Form.choosing_pair) # ИСПРАВЛЕНО
+        await state.set_state(Form.choosing_pair)
         await message.answer(
             "С возвращением! Выбери валютную пару:",
             reply_markup=get_pairs_keyboard(0)
         )
     else:
         # Пользователь не активирован, отправляем реферальную ссылку
-        await state.set_state(Form.waiting_for_referral) # ИСПРАВЛЕНО
+        await state.set_state(Form.waiting_for_referral)
         
         referral_text = (
             "🚀 **Привет! Для получения торговых сигналов тебе необходимо зарегистрироваться "
@@ -150,7 +137,7 @@ async def process_referral_check(message: types.Message, state: FSMContext):
     
     if is_valid:
         save_user(user_id) 
-        await state.set_state(Form.choosing_pair) # ИСПРАВЛЕНО
+        await state.set_state(Form.choosing_pair)
         
         await message.answer(
             "✅ **Активация успешна!**\nСпасибо за регистрацию. Теперь вы можете получать торговые сигналы.\n\n"
@@ -180,7 +167,6 @@ async def pair_handler(query: types.CallbackQuery, state: FSMContext):
     pair = query.data.split(":")[1]
     await state.update_data(selected_pair=pair)
     
-    # ИСПРАВЛЕНИЕ FSM: используем state.set_state()
     await state.set_state(Form.choosing_timeframe) 
     
     await query.message.edit_text(
@@ -202,21 +188,76 @@ async def tf_handler(query: types.CallbackQuery, state: FSMContext):
 # -------------------- Получение свечей --------------------
 def fetch_ohlcv(symbol: str, exp_minutes: int, limit=CANDLES_LIMIT) -> pd.DataFrame:
     interval = "1m"
-    # Добавлена базовая обработка ошибок получения данных
     try:
+        # YFinance использует котировки Forex через символ=X (например, EURUSD=X)
         df = yf.download(f"{symbol}=X", period="2d", interval=interval, progress=False)
     except Exception as e:
         print(f"Ошибка загрузки данных YFinance для {symbol}: {e}")
-        return pd.DataFrame() # Возвращаем пустой DF при ошибке
+        return pd.DataFrame() 
 
+    # Переименование колонок и выбор нужных
     df = df.rename(columns=str.lower)[['open','high','low','close','volume']]
+    
+    # Ресэмплинг для более высоких таймфреймов
     if exp_minutes > 1:
         df = df.resample(f"{exp_minutes}min").agg({
             'open':'first','high':'max','low':'min','close':'last','volume':'sum'
         })
     return df.tail(limit)
 
-# (Остальные функции: compute_indicators, support_resistance, indicator_vote, plot_chart, send_signal остаются прежними)
+# -------------------- Индикаторы --------------------
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # Трендовые индикаторы
+    df['ema9'] = ta.ema(df['close'], length=9)
+    df['ema21'] = ta.ema(df['close'], length=21)
+    df['sma50'] = ta.sma(df['close'], length=50)
+    macd = ta.macd(df['close'])
+    df['macd'] = macd['MACD_12_26_9']
+    df['macd_signal'] = macd['MACDs_12_26_9']
+    
+    # Осцилляторы
+    df['rsi14'] = ta.rsi(df['close'], length=14)
+    stoch = ta.stoch(df['high'], df['low'], df['close'])
+    df['stoch_k'] = stoch['STOCHk_14_3_3']
+    df['stoch_d'] = stoch['STOCHd_14_3_3']
+    df['cci20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
+    df['mom10'] = ta.mom(df['close'], length=10)
+    
+    # Волатильность и другие
+    bb = ta.bbands(df['close'])
+    df['bb_upper'] = bb['BBU_20_2.0']
+    df['bb_lower'] = bb['BBL_20_2.0']
+    df['atr14'] = ta.atr(df['high'], df['low'], df['close'])
+    df['adx14'] = ta.adx(df['high'], df['low'], df['close'])['ADX_14']
+    df['obv'] = ta.obv(df['close'], df['volume'])
+    
+    # свечные паттерны (упрощенные)
+    df['hammer'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['close']-df['low'])/(.001+df['high']-df['low'])>0.6)
+    df['shooting_star'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['high']-df['close'])/(.001+df['high']-df['low'])>0.6)
+    return df
+
+# -------------------- Поддержка/Сопротивление --------------------
+def support_resistance(df: pd.DataFrame) -> dict:
+    levels = {}
+    levels['support'] = df['low'].rolling(20).min().iloc[-1]
+    levels['resistance'] = df['high'].rolling(20).max().iloc[-1]
+    return levels
+
+# -------------------- Голосование индикаторов --------------------
+def indicator_vote(latest: pd.Series) -> dict:
+    score = 0
+    # Простейшая логика голосования
+    if latest['ema9'] > latest['ema21']: score += 1
+    else: score -=1
+    if latest['rsi14'] < 30: score += 1 # Перепроданность -> BUY
+    elif latest['rsi14'] > 70: score -=1 # Перекупленность -> SELL
+    if latest['hammer']: score += 1
+    if latest['shooting_star']: score -=1
+    
+    direction = "BUY" if score > 0 else ("SELL" if score < 0 else "HOLD")
+    confidence = min(100, abs(score)*20 + 40)
+    return {"direction": direction, "confidence": confidence}
 
 # -------------------- Отправка сигнала (С ОБРАБОТКОЙ ОШИБОК) --------------------
 async def send_signal(pair: str, timeframe: int, chat_id: int, message_id: int):
@@ -224,7 +265,7 @@ async def send_signal(pair: str, timeframe: int, chat_id: int, message_id: int):
     df = fetch_ohlcv(pair, timeframe)
     
     if df.empty or len(df) < 50: # Проверка на отсутствие данных
-        error_text = f"❌ **Ошибка.** Не удалось загрузить достаточно данных для {pair} {timeframe} мин."
+        error_text = f"❌ **Ошибка.** Не удалось загрузить достаточно данных для {pair} {timeframe} мин. Попробуйте позже."
         await bot.edit_message_text(
             chat_id=chat_id, 
             message_id=message_id, 
@@ -272,38 +313,17 @@ async def send_signal(pair: str, timeframe: int, chat_id: int, message_id: int):
                 print(f"Ошибка отправки пользователю {user_id}: {e}")
 
 
-# -------------------- Запуск Webhook (С ИСПРАВЛЕНИЕМ) --------------------
-
-async def on_startup_webhook(bot: Bot):
-    print("--- ЗАПУСК WEBHOOK ---")
-    await bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
-
-async def on_shutdown_webhook(bot: Bot):
-    await bot.delete_webhook()
+# -------------------- Запуск (ПОЛЛИНГ) --------------------
 
 def main():
     import logging
     logging.basicConfig(level=logging.INFO)
 
-    # 1. Добавление функций старта/завершения к диспетчеру
-    dp.startup.register(on_startup_webhook)
-    dp.shutdown.register(on_shutdown_webhook)
+    print("--- ЗАПУСК В РЕЖИМЕ ПОЛЛИНГА ---")
     
-    # 2. Запуск Aiohttp приложения через aiogram (исправленный метод)
-    # Используем aiogram 3.x's built-in web handler
-    app = web.Application()
-    webhook_requests_handler = dp.get_web_app()
-    app.router.add_route("POST", WEBHOOK_PATH, webhook_requests_handler)
-    
-    print(f"Сервер запускается на {WEB_SERVER_HOST}:{WEB_SERVER_PORT} с путем {WEBHOOK_PATH}")
-    
-    web.run_app(
-        app,
-        host=WEB_SERVER_HOST,
-        port=WEB_SERVER_PORT,
-        # Запускаем, используя стандартный aiohttp метод
-        handle_signals=True 
-    )
+    # Важно: dp.start_polling() блокирует выполнение и запускает бота
+    asyncio.run(dp.start_polling(bot))
+
 
 if __name__ == "__main__":
     main()
