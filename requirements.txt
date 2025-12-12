@@ -1,8 +1,4 @@
-aiogram 
-yfinance
-pandas 
-pandas_ta 
-mplfinance
-matplotlib
-numpy
+aiogram==3.1.1
+pandas
+yfinance pandas-ta
 aiohttp
