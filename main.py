@@ -33,15 +33,14 @@ WEB_SERVER_PORT = int(os.environ.get("PORT", 10000))
 WEB_SERVER_HOST = os.environ.get("WEB_SERVER_HOST", "0.0.0.0") 
 RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME") 
 
-# --- ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ ПУТИ WEBHOOK (Устранение 404) ---
+# --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ ПУТИ WEBHOOK (Возврат пути с токеном) ---
 if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
     logging.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Не задан TG_TOKEN или RENDER_EXTERNAL_HOSTNAME. Выход.")
     sys.exit(1)
 
-# Устанавливаем простой и стабильный путь для AioHTTP маршрутизатора
-# Telegram добавит токен в URL при установке Webhook автоматически
-WEBHOOK_PATH = "/webhook" 
-WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
+# В aiogram 3.x Webhook-путь часто должен содержать токен для правильной маршрутизации.
+WEBHOOK_PATH = f"/webhook/{TG_TOKEN}" 
+WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}" 
 
 # ОСТАЛЬНЫЕ КОНСТАНТЫ
 PAIRS = [
