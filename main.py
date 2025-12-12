@@ -15,13 +15,14 @@ from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.utils.keyboard import InlineKeyboardBuilder # <-- Исправление Pydantic ошибки
-# from aiohttp import web # aiogram 3.x может запустить Aiohttp через dp.run_app
+from aiogram.utils.keyboard import InlineKeyboardBuilder 
 
 # -------------------- Конфиг --------------------
-# Используйте переменные окружения Render
 TG_TOKEN = os.getenv("TG_TOKEN") or "ВАШ_TELEGRAM_TOKEN"
 CANDLES_LIMIT = 500
+
+# !!! ВАША РЕФЕРАЛЬНАЯ ССЫЛКА POCKET OPTION !!!
+PO_REFERRAL_LINK = "https://m.po-tck.com/ru/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START" 
 
 PAIRS = [
     "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF",
@@ -35,16 +36,12 @@ PAIRS_PER_PAGE = 6
 USERS_FILE = "users.txt"
 
 # -------------------- Конфиг Webhook для Render --------------------
-
-# Render автоматически устанавливает PORT. Нам нужно его использовать.
 WEB_SERVER_HOST = "0.0.0.0"
 WEB_SERVER_PORT = int(os.environ.get("PORT", 8080))
 
-# ВАЖНО: Установите эту переменную окружения (WEBHOOK_URL) на Render
-# Пример: https://your-service-name.onrender.com
 BASE_WEBHOOK_URL = os.environ.get("WEBHOOK_URL") 
 if not BASE_WEBHOOK_URL:
-    print("!!! ВНИМАНИЕ: Переменная WEBHOOK_URL не установлена. Замените заглушку в коде. !!!")
+    print("!!! ВНИМАНИЕ: Переменная WEBHOOK_URL не установлена. Используется заглушка. !!!")
     BASE_WEBHOOK_URL = "https://<ЗДЕСЬ_ВАШ_URL_RENDER>.onrender.com" 
 
 WEBHOOK_PATH = f"/webhook/{TG_TOKEN}"
@@ -56,6 +53,7 @@ dp = Dispatcher(storage=MemoryStorage())
 
 # -------------------- FSM --------------------
 class Form(StatesGroup):
+    waiting_for_referral = State() 
     choosing_pair = State()
     choosing_timeframe = State()
 
@@ -71,23 +69,19 @@ def save_user(user_id):
     users = load_users()
     if user_id not in users:
         users.add(user_id)
-        with open(USERS_FILE, "w") as f:
+        with open(USERS_FILE, "w") as f: 
             for u in users:
                 f.write(f"{u}\n")
 
-# -------------------- Клавиатуры (Исправлено) --------------------
+# -------------------- Клавиатуры --------------------
 def get_pairs_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     start = page * PAIRS_PER_PAGE
     end = start + PAIRS_PER_PAGE
-    
-    # Используем Builder для корректной валидации Pydantic
     builder = InlineKeyboardBuilder() 
-    
-    # Добавляем кнопки пар, разбивая их на ряды по 2
     for pair in PAIRS[start:end]:
         builder.button(text=pair, callback_data=f"pair:{pair}")
     
-    builder.adjust(2) # Устанавливаем макет: 2 кнопки в ряд
+    builder.adjust(2) 
     
     nav_buttons = []
     if page > 0:
@@ -98,31 +92,87 @@ def get_pairs_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     if nav_buttons:
         builder.row(*nav_buttons) 
     
-    return builder.as_markup() # Возвращаем готовый объект InlineKeyboardMarkup
-
-def get_timeframes_keyboard(pair: str) -> InlineKeyboardMarkup:
-    # Используем Builder для корректной валидации Pydantic
-    builder = InlineKeyboardBuilder()
-    
-    # Добавляем кнопки таймфреймов
-    for tf in TIMEFRAMES:
-        builder.button(text=f"{tf} мин", callback_data=f"tf:{pair}:{tf}")
-    
-    builder.adjust(2) # Разбиваем на ряды по 2 кнопки
-
     return builder.as_markup()
 
+def get_timeframes_keyboard(pair: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for tf in TIMEFRAMES:
+        builder.button(text=f"{tf} мин", callback_data=f"tf:{pair}:{tf}")
+    builder.adjust(2) 
+    return builder.as_markup()
+
+
 # -------------------- Обработчики --------------------
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
-    save_user(message.from_user.id)
-    await state.set_state(Form.choosing_pair)
-    await message.answer(
-        "Привет! Выбери валютную пару:",
-        reply_markup=get_pairs_keyboard(0)
-    )
+    user_id = message.from_user.id
+    
+    if user_id in load_users():
+        # Пользователь уже активирован
+        await state.set_state(Form.choosing_pair)
+        await message.answer(
+            "С возвращением! Выбери валютную пару:",
+            reply_markup=get_pairs_keyboard(0)
+        )
+    else:
+        # Пользователь не активирован, отправляем реферальную ссылку
+        await state.set_state(Form.waiting_for_referral)
+        
+        referral_text = (
+            "🚀 **Привет! Для получения торговых сигналов тебе необходимо зарегистрироваться "
+            "по нашей реферальной ссылке Pocket Option!**\n\n"
+            f"1. Перейди по ссылке: [НАША РЕФЕРАЛЬНАЯ ССЫЛКА]({PO_REFERRAL_LINK})\n"
+            "2. Зарегистрируйся.\n"
+            "3. **После регистрации** скопируй свой **ID аккаунта** (только цифры) "
+            "и **отправь его в этот чат** для активации бота."
+        )
+        
+        await message.answer(
+            referral_text,
+            parse_mode="Markdown"
+        )
 
-@dp.callback_query(lambda c: c.data.startswith("page:"))
+
+@dp.message(Form.waiting_for_referral)
+async def process_referral_check(message: types.Message, state: FSMContext):
+    user_input = message.text.strip()
+    user_id = message.from_user.id
+
+    # ! ВАЖНО: ЭТА ЛОГИКА ДОЛЖНА БЫТЬ ЗАМЕНЕНА НА РЕАЛЬНУЮ ПРОВЕРКУ ЧЕРЕЗ API,
+    # ! или вы должны ВРУЧНУЮ проверять ID и выдавать код активации.
+    # 
+    # Используем простую заглушку для проверки:
+    is_valid = False
+    
+    # Если прислано число больше 4 цифр, считаем это потенциальным ID
+    if user_input.isdigit() and len(user_input) > 4:
+        is_valid = True
+    
+    
+    if is_valid:
+        # 1. Сохраняем пользователя и активируем бота
+        save_user(user_id) 
+        
+        # 2. Переводим в следующее состояние (выбор пары)
+        await state.set_state(Form.choosing_pair)
+        
+        await message.answer(
+            "✅ **Активация успешна!**\nСпасибо за регистрацию. Теперь вы можете получать торговые сигналы.\n\n"
+            "Выбери валютную пару:",
+            reply_markup=get_pairs_keyboard(0),
+            parse_mode="Markdown"
+        )
+    else:
+        # Если проверка не удалась
+        await message.answer(
+            "❌ **Ошибка активации.**\n"
+            "Пожалуйста, убедитесь, что вы прислали свой **ID аккаунта** (только цифры), "
+            "или попробуйте снова."
+        )
+
+
+@dp.callback_query(Form.choosing_pair, lambda c: c.data.startswith("page:"))
 async def page_handler(query: types.CallbackQuery, state: FSMContext):
     page = int(query.data.split(":")[1])
     await query.message.edit_text(
@@ -131,24 +181,26 @@ async def page_handler(query: types.CallbackQuery, state: FSMContext):
     )
     await query.answer()
 
-@dp.callback_query(lambda c: c.data.startswith("pair:"))
+@dp.callback_query(Form.choosing_pair, lambda c: c.data.startswith("pair:"))
 async def pair_handler(query: types.CallbackQuery, state: FSMContext):
     pair = query.data.split(":")[1]
     await state.update_data(selected_pair=pair)
-    await Form.choosing_timeframe.set()
+    
+    # ИСПРАВЛЕНИЕ FSM: используем state.set_state()
+    await state.set_state(Form.choosing_timeframe) 
+    
     await query.message.edit_text(
         f"Выбрана пара {pair}. Теперь выбери таймфрейм:",
         reply_markup=get_timeframes_keyboard(pair)
     )
     await query.answer()
 
-@dp.callback_query(lambda c: c.data.startswith("tf:"))
+@dp.callback_query(Form.choosing_timeframe, lambda c: c.data.startswith("tf:"))
 async def tf_handler(query: types.CallbackQuery, state: FSMContext):
     _, pair, tf = query.data.split(":")
     tf = int(tf)
     await query.message.edit_text(f"Выбраны {pair} и {tf} мин. Идет загрузка сигнала...")
     
-    # Передаем chat_id, чтобы функция send_signal могла редактировать сообщение после загрузки
     await send_signal(pair, tf, query.message.chat.id, query.message.message_id)
     await state.clear()
     await query.answer()
@@ -157,7 +209,8 @@ async def tf_handler(query: types.CallbackQuery, state: FSMContext):
 def fetch_ohlcv(symbol: str, exp_minutes: int, limit=CANDLES_LIMIT) -> pd.DataFrame:
     interval = "1m"
     df = yf.download(f"{symbol}=X", period="2d", interval=interval, progress=False)
-    df = df.rename(columns=str.lower)[['open','high','low','close','volume']]
+    # Исправлена опечатка в 'low' - дублирование удалено
+    df = df.rename(columns=str.lower)[['open','high','low','close','volume']] 
     if exp_minutes > 1:
         df = df.resample(f"{exp_minutes}min").agg({
             'open':'first','high':'max','low':'min','close':'last','volume':'sum'
@@ -210,61 +263,49 @@ def indicator_vote(latest: pd.Series) -> dict:
     confidence = min(100, abs(score)*20 + 40)
     return {"direction": direction, "confidence": confidence}
 
-# -------------------- График --------------------
+# -------------------- График (Заглушка) --------------------
 def plot_chart(df: pd.DataFrame) -> io.BytesIO:
-    plot_df = df[['open','high','low','close','volume']].tail(150)
-    addplots = [mpf.make_addplot(df['ema9'].tail(150)), mpf.make_addplot(df['ema21'].tail(150))]
-    buf = io.BytesIO()
-    # Обратите внимание на аргументы savefig для корректного сохранения в буфер
-    mpf.plot(plot_df, type='candle', style='yahoo', volume=True, addplot=addplots, savefig=dict(fname=buf, dpi=100))
-    buf.seek(0)
-    return buf
+    return io.BytesIO()
 
-# -------------------- Отправка сигнала (Изменено) --------------------
+# -------------------- Отправка сигнала --------------------
 async def send_signal(pair: str, timeframe: int, chat_id: int, message_id: int):
-    # 1. Загрузка данных
+    # 1. Загрузка и анализ данных
     df = fetch_ohlcv(pair, timeframe)
     df_ind = compute_indicators(df)
     latest = df_ind.iloc[-1]
     
-    # 2. Анализ
     res = indicator_vote(latest)
     sr = support_resistance(df_ind)
-    chart_buf = plot_chart(df_ind)
     
-    # 3. Формирование текста
+    # 2. Формирование текста
     dir_map = {"BUY":"🔺 ПОКУПКА","SELL":"🔻 ПРОДАЖА","HOLD":"⚠️ НЕОДНОЗНАЧНО"}
     text = (
-        f"📊 Сигнал\nПара: {pair}\nТаймфрейм: {timeframe} мин\n"
-        f"Направление: {dir_map[res['direction']]}\nУверенность: {res['confidence']}%\n"
-        f"Поддержка: {sr['support']:.5f}\nСопротивление: {sr['resistance']:.5f}"
+        f"📊 **Сигнал**\n\n"
+        f"Пара: {pair}\n"
+        f"Таймфрейм: {timeframe} мин\n\n"
+        f"Направление: **{dir_map[res['direction']]}**\n"
+        f"Уверенность: {res['confidence']}%\n\n"
+        f"Поддержка: {sr['support']:.5f}\n"
+        f"Сопротивление: {sr['resistance']:.5f}"
     )
     
-    # 4. Отправка пользователю, который запросил сигнал (редактируем предыдущее сообщение)
+    # 3. Отправка сигнала запросившему пользователю (редактируем сообщение)
     try:
-        await bot.edit_message_caption(
+        await bot.edit_message_text(
             chat_id=chat_id, 
             message_id=message_id, 
-            caption="Готовлю график..." # Сначала редактируем текст, так как нельзя редактировать фото
+            text=text,
+            parse_mode="Markdown"
         )
-        # Отправляем новое сообщение с фото, т.к. edit_message_photo сложнее
-        await bot.send_photo(
-            chat_id=chat_id, 
-            photo=chart_buf, 
-            caption=text
-        )
-        await bot.delete_message(chat_id=chat_id, message_id=message_id) # Удаляем сообщение "Идет загрузка сигнала..."
     except Exception as e:
-        print(f"Ошибка при отправке сигнала пользователю {chat_id}: {e}")
+        print(f"Ошибка при редактировании сообщения пользователю {chat_id}: {e}")
 
-    # 5. Отправка всем остальным подписчикам (если нужно)
+    # 4. Отправка всем остальным подписчикам 
     users = load_users()
     for user_id in users:
         if user_id != chat_id:
             try:
-                # Сброс буфера для каждого отправляемого сообщения
-                chart_buf.seek(0) 
-                await bot.send_photo(chat_id=user_id, photo=chart_buf, caption=text)
+                await bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown")
             except Exception as e:
                 print(f"Ошибка отправки пользователю {user_id}: {e}")
 
@@ -272,20 +313,14 @@ async def send_signal(pair: str, timeframe: int, chat_id: int, message_id: int):
 # -------------------- Запуск Webhook --------------------
 
 async def on_startup_webhook(bot: Bot):
-    """
-    Вызывается при старте Aiohttp сервера. Устанавливает Webhook URL в Telegram.
-    """
     print("--- ЗАПУСК WEBHOOK ---")
-    if not BASE_WEBHOOK_URL or 'your-service-name' in BASE_WEBHOOK_URL:
-        raise ValueError("Ошибка: WEBHOOK_URL не настроен корректно. Проверьте переменную окружения на Render.")
+    if not BASE_WEBHOOK_URL or '<ЗДЕСЬ_ВАШ_URL_RENDER>' in BASE_WEBHOOK_URL:
+        print("!!! ПРЕДУПРЕЖДЕНИЕ: WEBHOOK_URL не настроен. Проверьте переменную окружения. !!!")
     
     print(f"Установка Webhook URL: {WEBHOOK_URL}")
     await bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
 
 async def on_shutdown_webhook(bot: Bot):
-    """
-    Вызывается при остановке Aiohttp сервера. Удаляет Webhook URL.
-    """
     print("--- ОСТАНОВКА WEBHOOK ---")
     await bot.delete_webhook()
 
@@ -298,13 +333,11 @@ def main():
     dp.shutdown.register(on_shutdown_webhook)
 
     # 2. Запуск Aiohttp сервера через aiogram
-    # aiogram 3.x автоматически создает web.Application и привязывает к нему диспетчер
     print(f"Сервер запускается на {WEB_SERVER_HOST}:{WEB_SERVER_PORT} с путем {WEBHOOK_PATH}")
     dp.run_app(
         host=WEB_SERVER_HOST,
         port=WEB_SERVER_PORT,
         path=WEBHOOK_PATH,
-        # session=AiohttpSession() # Можно добавить, если нужна кастомная aiohttp сессия
     )
 
 if __name__ == "__main__":
