@@ -1,4 +1,4 @@
-# main.py
+# advanced_trading_bot.py
 import os
 import io
 import asyncio
@@ -7,75 +7,67 @@ import yfinance as yf
 import pandas_ta as ta
 import mplfinance as mpf
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.utils import executor
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# -------------------- Конфиг --------------------
 TG_TOKEN = os.getenv("TG_TOKEN") or "ВАШ_TELEGRAM_TOKEN"
-CANDLES_LIMIT = 500
 
 PAIRS = [
-    "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X",
-    "EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X",
-    "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
+    "EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF",
+    "EURJPY","GBPJPY","AUDJPY","EURGBP","EURAUD","GBPAUD",
+    "CADJPY","CHFJPY","EURCAD","GBPCAD","AUDCAD","AUDCHF","CADCHF"
 ]
-TIMEFRAMES = [1, 3, 5, 10]  # минуты
-
-USERS_FILE = "users.txt"
+PAIRS_PER_PAGE = 6
+TIMEFRAMES = [1,3,5,10]
+CANDLES_LIMIT = 500
 
 bot = Bot(token=TG_TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher(storage=MemoryStorage())
 
-# -------------------- Пользователи --------------------
-def load_users():
-    try:
-        with open(USERS_FILE, "r") as f:
-            return set(int(line.strip()) for line in f.readlines())
-    except:
-        return set()
+# -------------------- Хранилище выбранных пар --------------------
+USER_SELECTIONS = {}  # user_id: {"pairs": [], "timeframes": []}
 
-def save_user(user_id):
-    users = load_users()
-    if user_id not in users:
-        users.add(user_id)
-        with open(USERS_FILE, "w") as f:
-            for u in users:
-                f.write(f"{u}\n")
+# -------------------- Кнопки --------------------
+def get_pairs_keyboard(page: int = 0) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    start = page * PAIRS_PER_PAGE
+    end = start + PAIRS_PER_PAGE
+    for pair in PAIRS[start:end]:
+        kb.add(InlineKeyboardButton(pair, callback_data=f"pair:{pair}"))
+    buttons = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"page:{page-1}"))
+    if end < len(PAIRS):
+        buttons.append(InlineKeyboardButton("➡️ Вперед", callback_data=f"page:{page+1}"))
+    if buttons:
+        kb.row(*buttons)
+    return kb
 
-# -------------------- Telegram Handlers --------------------
-@dp.message_handler(commands=['start'])
-async def start_handler(message: types.Message):
-    save_user(message.from_user.id)
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-    for pair in PAIRS:
-        keyboard.add(KeyboardButton(pair))
+def get_timeframes_keyboard(pair: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
     for tf in TIMEFRAMES:
-        keyboard.add(KeyboardButton(f"{tf} мин"))
-    await message.reply(
-        "Привет! Я твой торговый помощник 🤖\nВыбери валютную пару и таймфрейм, и я пришлю торговый сигнал.",
-        reply_markup=keyboard
-    )
+        kb.add(InlineKeyboardButton(f"{tf} мин", callback_data=f"tf:{pair}:{tf}"))
+    return kb
 
 # -------------------- Получение свечей --------------------
-def fetch_ohlcv(symbol: str, minutes: int, limit=CANDLES_LIMIT) -> pd.DataFrame:
-    df = yf.download(symbol, period="2d", interval="1m", progress=False)
+def fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
+    df = yf.download(symbol+"=X", period="2d", interval="1m", progress=False)
     df = df.rename(columns=str.lower)[['open','high','low','close','volume']]
-    if minutes > 1:
-        rule = f"{minutes}min"
+    if exp_minutes > 1:
+        rule = f"{exp_minutes}min"
         df = df.resample(rule).agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'})
-    return df.tail(limit)
+    return df.tail(CANDLES_LIMIT)
 
-# -------------------- Индикаторы --------------------
+# -------------------- Индикаторы и свечные паттерны --------------------
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # Трендовые
     df['ema9'] = ta.ema(df['close'], length=9)
     df['ema21'] = ta.ema(df['close'], length=21)
     df['sma50'] = ta.sma(df['close'], length=50)
     macd = ta.macd(df['close'])
     df['macd'] = macd['MACD_12_26_9']
     df['macd_signal'] = macd['MACDs_12_26_9']
-    # Осцилляторы
     df['rsi14'] = ta.rsi(df['close'], length=14)
     stoch = ta.stoch(df['high'], df['low'], df['close'])
     df['stoch_k'] = stoch['STOCHk_14_3_3']
@@ -88,10 +80,9 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['cci20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
     df['obv'] = ta.obv(df['close'], df['volume'])
     df['mom10'] = ta.mom(df['close'], length=10)
-    # Свечные паттерны
+    # свечные паттерны
     df['hammer'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['close']-df['low'])/(.001+df['high']-df['low'])>0.6)
     df['shooting_star'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['high']-df['close'])/(.001+df['high']-df['low'])>0.6)
-    df['doji'] = abs(df['close']-df['open']) < 0.1*(df['high']-df['low'])
     return df
 
 # -------------------- Поддержка/Сопротивление --------------------
@@ -104,16 +95,16 @@ def support_resistance(df: pd.DataFrame) -> dict:
 # -------------------- Голосование индикаторов --------------------
 def indicator_vote(latest: pd.Series) -> dict:
     score = 0
-    if latest['ema9'] > latest['ema21']:
-        score += 1
-    else:
-        score -=1
-    if latest['rsi14'] < 30: score += 1
-    elif latest['rsi14'] > 70: score -=1
-    if latest['hammer']: score += 1
-    if latest['shooting_star']: score -=1
-    if latest['doji']: score += 0  # нейтрально
-    direction = "BUY" if score > 0 else ("SELL" if score < 0 else "HOLD")
+    # EMA
+    score += 1 if latest['ema9']>latest['ema21'] else -1
+    # RSI
+    score += 1 if latest['rsi14']<30 else (-1 if latest['rsi14']>70 else 0)
+    # MACD
+    score += 1 if latest['macd']>latest['macd_signal'] else -1
+    # Свечные паттерны
+    score += 1 if latest['hammer'] else 0
+    score -= 1 if latest['shooting_star'] else 0
+    direction = "BUY" if score>0 else ("SELL" if score<0 else "HOLD")
     confidence = min(100, abs(score)*20 + 40)
     return {"direction": direction, "confidence": confidence}
 
@@ -126,44 +117,59 @@ def plot_chart(df: pd.DataFrame) -> io.BytesIO:
     buf.seek(0)
     return buf
 
-# -------------------- Отправка сигналов --------------------
-async def send_signal(pair, timeframe, chat_id):
-    df = fetch_ohlcv(pair, timeframe)
-    df_ind = compute_indicators(df)
-    latest = df_ind.iloc[-1]
-    vote = indicator_vote(latest)
-    sr = support_resistance(df_ind)
-    chart_buf = plot_chart(df_ind)
-    dir_map = {"BUY":"🔺 ПОКУПКА","SELL":"🔻 ПРОДАЖА","HOLD":"⚠️ НЕОДНОЗНАЧНО"}
-    text = (
-        f"📊 Сигнал\nПара: {pair}\nТаймфрейм: {timeframe} мин\n"
-        f"Направление: {dir_map[vote['direction']]}\nУверенность: {vote['confidence']}%\n"
-        f"Поддержка: {sr['support']:.5f}\nСопротивление: {sr['resistance']:.5f}"
-    )
-    await bot.send_photo(chat_id=chat_id, photo=chart_buf, caption=text)
+# -------------------- Обработчики --------------------
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer("Привет! Выбери валютную пару:", reply_markup=get_pairs_keyboard(0))
 
-# -------------------- Обработка выбора пользователя --------------------
-user_selection = {}
+@dp.callback_query(lambda c: c.data.startswith("page:") or c.data.startswith("pair:"))
+async def choose_pair(callback: types.CallbackQuery):
+    data = callback.data
+    user_id = callback.from_user.id
+    if user_id not in USER_SELECTIONS:
+        USER_SELECTIONS[user_id] = {"pairs": [], "timeframes": []}
 
-@dp.message_handler()
-async def handle_selection(message: types.Message):
-    user_id = message.from_user.id
-    text = message.text.strip()
-    if text in PAIRS:
-        user_selection[user_id] = {"pair": text}
-        await message.reply("Вы выбрали пару. Теперь выберите таймфрейм (1,3,5,10 мин).")
-    elif text.replace(" мин","").isdigit():
-        if user_id in user_selection:
-            tf = int(text.replace(" мин",""))
-            user_selection[user_id]["timeframe"] = tf
-            pair = user_selection[user_id]["pair"]
-            await message.reply(f"Отправляю сигнал для {pair} на {tf} мин...")
-            await send_signal(pair, tf, user_id)
-        else:
-            await message.reply("Сначала выберите валютную пару.")
-    else:
-        await message.reply("Выберите валютную пару или таймфрейм с клавиатуры.")
+    if data.startswith("page:"):
+        page = int(data.split(":")[1])
+        await callback.message.edit_reply_markup(reply_markup=get_pairs_keyboard(page))
+    elif data.startswith("pair:"):
+        pair = data.split(":")[1]
+        USER_SELECTIONS[user_id]["pairs"].append(pair)
+        await callback.message.edit_text(f"Выбрана пара: {pair}\nВыбери таймфрейм:", reply_markup=get_timeframes_keyboard(pair))
+
+@dp.callback_query(lambda c: c.data.startswith("tf:"))
+async def choose_timeframe(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    _, pair, tf = callback.data.split(":")
+    tf = int(tf)
+    USER_SELECTIONS[user_id]["timeframes"].append((pair, tf))
+    await callback.message.edit_text(f"Добавлено отслеживание {pair} {tf} мин.\nБот будет присылать сигналы автоматически.")
+
+# -------------------- Авто-обновление сигналов --------------------
+async def auto_signals():
+    while True:
+        for user_id, sel in USER_SELECTIONS.items():
+            for pair, tf in sel["timeframes"]:
+                try:
+                    df = fetch_ohlcv(pair, tf)
+                    df_ind = compute_indicators(df)
+                    latest = df_ind.iloc[-1]
+                    vote = indicator_vote(latest)
+                    sr = support_resistance(df_ind)
+                    chart = plot_chart(df_ind)
+                    dir_map = {"BUY":"🔺 ПОКУПКА","SELL":"🔻 ПРОДАЖА","HOLD":"⚠️ НЕОДНОЗНАЧНО"}
+                    text = (
+                        f"📊 Сигнал\nПара: {pair}\nТаймфрейм: {tf} мин\n"
+                        f"Направление: {dir_map[vote['direction']]}\nУверенность: {vote['confidence']}%\n"
+                        f"Поддержка: {sr['support']:.5f}\nСопротивление: {sr['resistance']:.5f}"
+                    )
+                    await bot.send_photo(user_id, photo=chart, caption=text)
+                except Exception as e:
+                    print(f"Ошибка при отправке сигналов {pair} {tf} для {user_id}: {e}")
+        await asyncio.sleep(60)  # проверка раз в минуту
 
 # -------------------- Запуск --------------------
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    loop = asyncio.get_event_loop()
+    loop.create_task(auto_signals())
+    loop.run_until_complete(dp.start_polling(bot))
