@@ -1,4 +1,4 @@
-# main.py - V4-FIXED: БОЕВАЯ ВЕРСИЯ (PostgreSQL + Async API + СТАБИЛЬНЫЙ WEBHOOK)
+# main.py - V5-MODIFIED: Версия с упрощенным запуском и удалением этапа рекрутмента
 
 import os
 import asyncio
@@ -15,7 +15,7 @@ import asyncpg
 from functools import lru_cache 
 
 # --- Импорты для aiogram V3 и aiohttp V2 запуска ---
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
@@ -24,14 +24,16 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder 
 from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.client.default import DefaultBotProperties
-from aiogram.webhook.aiohttp_server import setup_application
+from aiogram.webhook.aiohttp_server import setup_application, SimpleRequestHandler
 from aiohttp import web 
 from aiogram.utils.markdown import link
+from aiogram.enums import ParseMode
 
 # --- ВРЕМЕННЫЙ ИМПОРТ: Заглушка для API ---
 import yfinance as yf 
 
 # -------------------- Конфиг и Ключи --------------------
+# Используйте env-переменные для продакшена
 TG_TOKEN = os.environ.get("TG_TOKEN") 
 DATABASE_URL = os.environ.get("DATABASE_URL") 
 API_KEY = os.environ.get("API_KEY") 
@@ -49,13 +51,10 @@ if not all([TG_TOKEN, RENDER_EXTERNAL_HOSTNAME]):
     logging.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Не задан TG_TOKEN или RENDER_EXTERNAL_HOSTNAME. Выход.")
     sys.exit(1)
 
-# --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ WEBHOOK PATH ---
-# 1. Путь для установки в Telegram API (С ТОКЕНОМ)
+# --- WEBHOOK PATH ---
 WEBHOOK_PATH = f"/webhook/{TG_TOKEN}" 
 WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
-
-# 2. Путь для aiohttp роутера (ДОЛЖЕН СОВПАДАТЬ С ПУНКТ 1, чтобы избежать 404)
-WEBHOOK_BASE_PATH = WEBHOOK_PATH # ИСПРАВЛЕНО!
+WEBHOOK_BASE_PATH = WEBHOOK_PATH 
 
 # ОСТАЛЬНЫЕ КОНСТАНТЫ
 PAIRS = [
@@ -67,7 +66,7 @@ TIMEFRAMES = [1, 3, 5, 10]
 PAIRS_PER_PAGE = 6
 
 # -------------------- Бот и диспетчер --------------------
-bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
+bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
 dp = Dispatcher(storage=MemoryStorage())
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 DB_POOL: Union[asyncpg.Pool, None] = None 
@@ -79,7 +78,7 @@ async def init_db_pool():
     """Инициализирует пул подключений к PostgreSQL."""
     global DB_POOL
     if not DATABASE_URL:
-        logging.warning("⚠️ DATABASE_URL не задан. Бот будет работать без сохранения истории и авторизации (In-Memory).")
+        logging.warning("⚠️ DATABASE_URL не задан. Бот будет работать без сохранения истории (In-Memory).")
         return
     try:
         DB_POOL = await asyncpg.create_pool(DATABASE_URL)
@@ -113,9 +112,11 @@ async def init_db_tables():
 
 
 # In-Memory заглушка, если DB не работает
-AUTHORIZED_USERS: Dict[int, bool] = {}
+# Теперь не используется для авторизации, но оставлена для сохранения данных
+AUTHORIZED_USERS: Dict[int, bool] = {} 
 
 async def save_user_db(user_id: int):
+    # Теперь просто сохраняем пользователя, так как авторизация идет по факту использования
     if DB_POOL:
         async with DB_POOL.acquire() as conn:
             try:
@@ -125,16 +126,16 @@ async def save_user_db(user_id: int):
     else:
         AUTHORIZED_USERS[user_id] = True
 
+# Упрощена: теперь всегда True, так как авторизация удалена
 async def is_user_authorized_db(user_id: int) -> bool:
-    if DB_POOL:
-        async with DB_POOL.acquire() as conn:
-            result = await conn.fetchval("SELECT 1 FROM users WHERE user_id = $1", user_id)
-            return result is not None
-    else:
-        return user_id in AUTHORIZED_USERS
+    # Поскольку этап рекрутмента убран, считаем, что пользователь авторизован,
+    # если он начал работу. Вызываем save_user_db при первом действии.
+    return True 
 
 async def save_trade_db(user_id: int, pair: str, timeframe: int, direction: str) -> int:
-    # Используем заглушку, так как без DB нельзя вернуть ID сделки для дальнейшего обновления.
+    # Сохраняем пользователя при первой сделке (для FOREIGN KEY)
+    await save_user_db(user_id) 
+
     if not DB_POOL: 
         logging.warning("⚠️ DB недоступна. Сделка не сохранена.")
         return int(time.time()) 
@@ -187,7 +188,7 @@ async def get_user_stats_db(user_id: int) -> Dict[str, Any]:
 
 # -------------------- FSM и Клавиатуры --------------------
 class Form(StatesGroup):
-    waiting_for_referral = State() 
+    # Удалено: waiting_for_referral = State() 
     choosing_pair = State()
     choosing_timeframe = State()
 
@@ -243,33 +244,22 @@ def get_timeframes_keyboard(pair: str) -> InlineKeyboardMarkup:
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
+    await state.clear()
     
-    if await is_user_authorized_db(user_id):
-        await state.clear()
-        await message.answer(
-            "🏠 **Главное меню**\n\nВыберите действие:",
-            reply_markup=get_main_menu_keyboard()
-        )
-    else:
-        await state.set_state(Form.waiting_for_referral)
-        referral_link = link("НАША РЕФЕРАЛЬНАЯ ССЫЛКА", PO_REFERRAL_LINK)
-        referral_text = (
-            "🚀 **Привет! Для получения торговых сигналов тебе необходимо зарегистрироваться "
-            "по нашей реферальной ссылке Pocket Option!**\n\n"
-            f"1. Перейди по ссылке: {referral_link}\n"
-            "2. Зарегистрируйся.\n"
-            "3. **После регистрации** скопируй свой **ID аккаунта** (только цифры) "
-            "и **отправь его в этот чат** для активации бота."
-        )
-        await message.answer(referral_text)
+    # 🔴 ИСПРАВЛЕНИЕ: Новый, упрощенный приветственный текст
+    await message.answer(
+        "👋 **Привет, я твой торгующий помощник.**\n\n"
+        "📈 Выбери валютную пару, чтобы начать:",
+        reply_markup=get_pairs_keyboard(0)
+    )
+    # Переводим пользователя сразу в состояние выбора пары
+    await state.set_state(Form.choosing_pair)
 
 
 @dp.callback_query(lambda c: c.data in ["main_menu", "start_trade"])
 async def main_menu_handler(query: types.CallbackQuery, state: FSMContext):
     user_id = query.from_user.id
-    if not await is_user_authorized_db(user_id):
-        await query.answer("Сначала активируйте бота, отправив свой ID.", show_alert=True)
-        return
+    # Проверка is_user_authorized_db удалена, так как все авторизованы
         
     await state.clear()
     
@@ -292,9 +282,7 @@ async def main_menu_handler(query: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(lambda c: c.data == "show_history")
 async def show_history_handler(query: types.CallbackQuery, state: FSMContext):
     user_id = query.from_user.id
-    if not await is_user_authorized_db(user_id):
-        await query.answer("Сначала активируйте бота, отправив свой ID.", show_alert=True)
-        return
+    # Проверка is_user_authorized_db удалена
         
     stats = await get_user_stats_db(user_id) 
     
@@ -357,32 +345,12 @@ async def trade_result_handler(query: types.CallbackQuery, state: FSMContext):
 
     await query.answer(f"Результат {result} сохранен!")
 
-@dp.message(Form.waiting_for_referral)
-async def process_referral_check(message: types.Message, state: FSMContext):
-    user_input = message.text.strip()
-    user_id = message.from_user.id
-    is_valid = user_input.isdigit() and len(user_input) > 4
-
-    if is_valid:
-        await save_user_db(user_id) 
-        await state.clear()
-        
-        await message.answer(
-            "✅ **Активация успешна!**\n\n"
-            "Выберите действие:",
-            reply_markup=get_main_menu_keyboard()
-        )
-    else:
-        await message.answer(
-            "❌ **Ошибка активации.**\nПожалуйста, убедитесь, что вы прислали свой **ID аккаунта** (только цифры)."
-        )
+# Обработчик Form.waiting_for_referral УДАЛЕН, так как этот этап пропущен.
 
 @dp.callback_query(lambda c: c.data.startswith("page:"))
 async def page_handler(query: types.CallbackQuery, state: FSMContext):
     user_id = query.from_user.id
-    if not await is_user_authorized_db(user_id):
-        await query.answer("Сначала активируйте бота.", show_alert=True)
-        return
+    # Проверка is_user_authorized_db удалена
         
     page = int(query.data.split(":")[1])
     await query.message.edit_text(
@@ -394,9 +362,7 @@ async def page_handler(query: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
 async def pair_handler(query: types.CallbackQuery, state: FSMContext):
     user_id = query.from_user.id
-    if not await is_user_authorized_db(user_id):
-        await query.answer("Сначала активируйте бота.", show_alert=True)
-        return
+    # Проверка is_user_authorized_db удалена
         
     pair = query.data.split(":")[1]
     await state.update_data(selected_pair=pair)
@@ -412,9 +378,7 @@ async def pair_handler(query: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(lambda c: c.data.startswith("tf:"))
 async def tf_handler(query: types.CallbackQuery, state: FSMContext):
     user_id = query.from_user.id
-    if not await is_user_authorized_db(user_id):
-        await query.answer("Сначала активируйте бота.", show_alert=True)
-        return
+    # Проверка is_user_authorized_db удалена
         
     current_state = await state.get_state()
     if current_state != Form.choosing_timeframe:
@@ -426,6 +390,9 @@ async def tf_handler(query: types.CallbackQuery, state: FSMContext):
     _, pair, tf = query.data.split(":")
     tf = int(tf)
     
+    # Сохраняем пользователя (если еще не сохранен) перед началом торгов
+    await save_user_db(user_id) 
+
     await query.answer("Идет загрузка сигнала...", show_alert=False) 
     message_to_edit = await query.message.edit_text(f"Выбраны {pair} и {tf} мин. Идет загрузка сигнала...")
 
@@ -441,7 +408,7 @@ async def tf_handler(query: types.CallbackQuery, state: FSMContext):
         logging.error(f"Критическая ошибка в tf_handler: {e}")
         
     
-# -------------------- Получение свечей и Индикаторы --------------------
+# -------------------- Получение свечей и Индикаторы (Без изменений) --------------------
 
 # Кэш сбрасывается каждую минуту
 @lru_cache(maxsize=128)
@@ -620,7 +587,7 @@ async def on_shutdown_webhook(bot: Bot):
 
 
 async def start_webhook():
-    logging.info(f"--- ЗАПУСК WEBHOOK СЕРВЕРА V4-FIXED: {WEBHOOK_URL} ---")
+    logging.info(f"--- ЗАПУСК WEBHOOK СЕРВЕРА V5-MODIFIED: {WEBHOOK_URL} ---")
     
     dp.startup.register(on_startup_webhook)
     dp.shutdown.register(on_shutdown_webhook)
