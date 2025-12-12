@@ -18,22 +18,23 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder 
 from aiogram.methods import DeleteWebhook
 from aiogram.client.default import DefaultBotProperties
+from aiogram.methods.set_webhook import SetWebhook # Явный импорт для установки Webhook
 
 # -------------------- Конфиг (WEBHOOK) --------------------
+# УБЕДИТЕСЬ, ЧТО ВЫ ЗАМЕНИЛИ "ВАШ_ТЕЛЕГРАМ_ТОКЕН" НА ВАШ TG_TOKEN ИЗ ENV VARS
 TG_TOKEN = os.getenv("TG_TOKEN") or "ВАШ_ТЕЛЕГРАМ_ТОКЕН" 
 PO_REFERRAL_LINK = "https://m.po-tck.com/ru/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START" 
 
 # НАСТРОЙКИ WEBHOOK (Берутся из Env Vars на Render)
 WEB_SERVER_PORT = int(os.getenv("PORT", 10000)) 
 WEB_SERVER_HOST = os.getenv("WEB_SERVER_HOST", "0.0.0.0")
+# ВАЖНО: RENDER_EXTERNAL_HOSTNAME должен быть БЕЗ https://, например, kurut.onrender.com
 RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 
-# Проверка на наличие RENDER_EXTERNAL_HOSTNAME
 if RENDER_EXTERNAL_HOSTNAME:
     WEBHOOK_PATH = f"/webhook/{TG_TOKEN}"
     WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 else:
-    # Запасной вариант для локального запуска (или если Env Var не установлен)
     WEBHOOK_PATH = "/webhook"
     WEBHOOK_URL = None
 
@@ -52,7 +53,6 @@ USERS_FILE = "users.txt"
 DB_FILE = "trades.db" 
 
 # -------------------- Бот и диспетчер --------------------
-# Добавлено DefaultBotProperties для ParseMode
 bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -195,6 +195,10 @@ def get_timeframes_keyboard(pair: str) -> InlineKeyboardMarkup:
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
+    
+    # ПРИМЕЧАНИЕ: На Render (Web Service) эта функция не сработает, пока не пройдет активация!
+    # Telegram отправляет обновления на адрес Webhook, а не через getUpdates.
+    # Поэтому первое сообщение от пользователя должно приходить через Webhook.
     
     if user_id in load_users():
         await state.clear()
@@ -363,7 +367,6 @@ async def tf_handler(query: types.CallbackQuery, state: FSMContext):
 def fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
     interval = "1m"
     try:
-        # Увеличен период до 5 дней
         df = yf.download(f"{symbol}=X", period="5d", interval=interval, progress=False) 
     except Exception as e:
         logging.error(f"Ошибка загрузки данных YFinance для {symbol}: {e}")
@@ -432,7 +435,6 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['hammer'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['close']-df['low'])/(.001+df['high']-df['low'])>0.6)
     df['shooting_star'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['high']-df['close'])/(.001+df['high']-df['low'])>0.6)
     
-    # ИСПРАВЛЕНИЕ: Вместо df.dropna() удаляем NaN только в ключевых столбцах.
     critical_cols = ['ema9', 'ema21', 'macd', 'rsi14', 'stoch_k', 'adx14']
     df_cleaned = df.dropna(subset=critical_cols)
     
@@ -462,6 +464,7 @@ def indicator_vote(latest: pd.Series) -> dict:
         elif latest['ema9'] < latest['ema21'] and latest['close'] < latest['sma50']:
             score -= 2
     
+    # Строгие зоны перекупленности/перепроданности
     is_oversold = (latest['rsi14'] < 30) and (latest['stoch_k'] < 20)
     is_overbought = (latest['rsi14'] > 70) and (latest['stoch_k'] > 80)
     
@@ -504,7 +507,6 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
     res = indicator_vote(latest)
     sr = support_resistance(df_ind)
     
-    # Сохраняем новую сделку в базу данных
     trade_id = save_trade(user_id, pair, timeframe, res['direction'])
 
     dir_map = {"BUY":"🔺 ПОКУПКА","SELL":"🔻 ПРОДАЖА","HOLD":"⚠️ НЕОДНОЗНАЧНО"}
@@ -529,13 +531,20 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
     except Exception as e:
         logging.error(f"Ошибка при редактировании сообщения пользователю {chat_id}: {e}")
         
-# -------------------- Запуск (WEBHOOK) --------------------
+# -------------------- Запуск (WEBHOOK - ИСПРАВЛЕННЫЙ) --------------------
 
 async def on_startup(bot: Bot):
-    """Устанавливает webhook URL при старте."""
+    """
+    Принудительно удаляет старый webhook, а затем устанавливает новый.
+    Это решает ошибку Conflict, которую мы видели в логах.
+    """
     if WEBHOOK_URL:
-        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
-        logging.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
+        # 1. Сначала удаляем старый, висящий webhook
+        await bot(DeleteWebhook(drop_pending_updates=True))
+        
+        # 2. Устанавливаем новый
+        await bot(SetWebhook(url=WEBHOOK_URL))
+        logging.info(f"✅ Webhook успешно переустановлен: {WEBHOOK_URL}")
     else:
         logging.error("❌ RENDER_EXTERNAL_HOSTNAME не задан! Webhook не установлен.")
 
@@ -564,8 +573,8 @@ def main():
         dp.startup.register(on_startup)
         dp.shutdown.register(on_shutdown)
         
-        # Запускаем сервер Webhook
-        dp.run_polling( # В aiogram 3.x используется run_polling для запуска сервера, но с параметрами Webhook
+        # Запускаем Webhook-сервер (в aiogram 3.x используется run_polling с параметрами Webhook)
+        dp.run_polling( 
             bot, 
             web_server_host=WEB_SERVER_HOST, 
             web_server_port=WEB_SERVER_PORT, 
