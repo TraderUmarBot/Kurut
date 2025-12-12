@@ -3,3 +3,4 @@ aiohttp
 pandas
 yfinance
 pandas-ta
+asyncpg
