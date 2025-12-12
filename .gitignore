@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*. pyc
+*pyo
+*.pyd
+env/
+venv/
+. venv/
+# Bot config
+bot_config.py
+# Logs
+*.109
+# OS
+• DS_Store
