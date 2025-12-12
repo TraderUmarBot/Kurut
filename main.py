@@ -6,27 +6,27 @@ import pandas as pd
 import yfinance as yf
 import pandas_ta as ta
 import mplfinance as mpf
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
+from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.router import Router
+from aiogram.types import Message
 
 # -------------------- Конфиг --------------------
 TG_TOKEN = os.getenv("TG_TOKEN") or "ВАШ_TELEGRAM_TOKEN"
-CANDLES_LIMIT = int(os.getenv("CANDLES_LIMIT", 500))
+CANDLES_LIMIT = int(os.getenv("CANDLES_LIMIT", 500))  # по умолчанию 500 свечей
 
+# Валютные пары и таймфреймы
 PAIRS = [
     "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X",
     "EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X",
     "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
 EXPIRATIONS = [1, 3, 5, 10]  # минуты
+
+# Файл для хранения пользователей
 USERS_FILE = "users.txt"
 
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher()
-router = Router()
-dp.include_router(router)
 
 # -------------------- Пользователи --------------------
 def load_users():
@@ -45,10 +45,14 @@ def save_user(user_id):
                 f.write(f"{u}\n")
 
 # -------------------- Telegram Handlers --------------------
-@router.message(Command("start"))
 async def start_handler(message: Message):
     save_user(message.from_user.id)
-    await message.answer("Привет! Я буду присылать тебе торговые сигналы 24/7.")
+    await message.answer(
+        "Привет! Я твой торговый помощник 🤖\n"
+        "Выбери валюты и таймфреймы, и я буду присылать тебе торговые сигналы 24/7."
+    )
+
+dp.message.register(start_handler, Command(commands=["start"]))
 
 # -------------------- Получение свечей --------------------
 def fetch_ohlcv_yf(symbol: str, exp_minutes: int, limit: int = CANDLES_LIMIT) -> pd.DataFrame:
@@ -195,15 +199,14 @@ async def main_loop():
                     await send_signal_to_all(pair, timeframe)
                 except Exception as e:
                     print(f"Ошибка {pair} {timeframe} мин: {e}")
-        await asyncio.sleep(60)
+        await asyncio.sleep(60)  # проверка каждую минуту
 
 # -------------------- Запуск --------------------
 async def main():
-    # параллельный запуск polling и 24/7 цикла
-    await asyncio.gather(
-        dp.start_polling(bot),
-        main_loop()
-    )
+    # запускаем polling и одновременно основной цикл
+    task_bot = asyncio.create_task(dp.start_polling(bot))
+    task_loop = asyncio.create_task(main_loop())
+    await asyncio.gather(task_bot, task_loop)
 
 if __name__=="__main__":
     asyncio.run(main())
