@@ -1,4 +1,4 @@
-# main.py - ОКОНЧАТЕЛЬНАЯ ВЕРСИЯ БОТА KURUT TRADE (WEBHOOK)
+# main.py - ОКОНЧАТЕЛЬНАЯ ВЕРСИЯ БОТА KURUT TRADE (WEBHOOK V2 ЗАПУСК)
 
 import os
 import asyncio
@@ -10,7 +10,7 @@ import sqlite3
 import sys 
 from typing import Dict, Any, List
 
-# --- Импорты aiogram ---
+# --- Импорты для aiogram V3 и aiohttp V2 запуска ---
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
@@ -18,9 +18,10 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder 
-from aiogram.methods import DeleteWebhook
+from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.client.default import DefaultBotProperties
-from aiogram.methods.set_webhook import SetWebhook 
+from aiogram.webhook.aiohttp_server import setup_application
+from aiohttp import web # Важный импорт для ручного запуска V2
 
 # -------------------- Конфиг (WEBHOOK) --------------------
 # Переменные читаются из Env Vars. URL формируется автоматически.
@@ -366,6 +367,7 @@ async def tf_handler(query: types.CallbackQuery, state: FSMContext):
 def fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
     interval = "1m"
     try:
+        # Используем =X для получения данных форекс через Yahoo Finance
         df = yf.download(f"{symbol}=X", period="5d", interval=interval, progress=False) 
     except Exception as e:
         logging.error(f"Ошибка загрузки данных YFinance для {symbol}: {e}")
@@ -379,6 +381,7 @@ def fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
     df.columns = [col.lower() for col in required_cols]
     
     if exp_minutes > 1 and not df.empty:
+        # Ресемплирование (консолидация) минутных свечей в нужный таймфрейм
         df = df.resample(f"{exp_minutes}min").agg({
             'open':'first','high':'max','low':'min','close':'last','volume':'sum'
         }).dropna()
@@ -388,32 +391,41 @@ def fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     
+    # Скользящие средние
     df['ema9'] = ta.ema(df['close'], length=9)
     df['ema21'] = ta.ema(df['close'], length=21)
     df['sma50'] = ta.sma(df['close'], length=50)
     
+    # MACD
     macd = ta.macd(df['close'])
     df['macd'] = macd['MACD_12_26_9']
     df['macd_signal'] = macd['MACDs_12_26_9']
     
+    # RSI (Relative Strength Index)
     df['rsi14'] = ta.rsi(df['close'], length=14)
     
+    # Stochastic Oscillator
     stoch = ta.stoch(df['high'], df['low'], df['close'])
     df['stoch_k'] = stoch['STOCHk_14_3_3']
     df['stoch_d'] = stoch['STOCHd_14_3_3']
 
+    # CCI (Commodity Channel Index)
     df['cci20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
     
+    # Bollinger Bands
     bb = ta.bbands(df['close'])
     df['bb_upper'] = bb['BBU_20_2.0']
     df['bb_lower'] = bb['BBL_20_2.0']
         
+    # ADX (Average Directional Index) и ATR
     adx_df = ta.adx(df['high'], df['low'], df['close'])
     df['atr14'] = ta.atr(df['high'], df['low'], df['close'])
     df['adx14'] = adx_df['ADX_14']
     
-    # Паттерны свечей
+    # Паттерны свечей (упрощенные)
+    # Hammer
     df['hammer'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['close']-df['low'])/(.001+df['high']-df['low'])>0.6)
+    # Shooting Star
     df['shooting_star'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['high']-df['close'])/(.001+df['high']-df['low'])>0.6)
     
     critical_cols = ['ema9', 'ema21', 'macd', 'rsi14', 'stoch_k', 'adx14']
@@ -422,6 +434,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df_cleaned.tail(100)
 
 def support_resistance(df: pd.DataFrame) -> Dict[str, float]:
+    """Находит простую поддержку/сопротивление на основе последних 20 свечей."""
     levels = {}
     df_sr = df.tail(20) 
     if not df_sr.empty:
@@ -433,25 +446,30 @@ def support_resistance(df: pd.DataFrame) -> Dict[str, float]:
     return levels
 
 def indicator_vote(latest: pd.Series) -> Dict[str, Any]:
+    """Система голосования индикаторов для принятия решения."""
     score = 0
     
     is_trending = latest['adx14'] > 25
     
+    # 1. Анализ тренда (EMA и SMA)
     if is_trending:
         if latest['ema9'] > latest['ema21'] and latest['close'] > latest['sma50']:
             score += 2 # Сильный BUY
         elif latest['ema9'] < latest['ema21'] and latest['close'] < latest['sma50']:
             score -= 2 # Сильный SELL
     
+    # 2. Анализ осцилляторов (RSI и Stochastic)
     is_oversold = (latest['rsi14'] < 30) and (latest['stoch_k'] < 20)
     is_overbought = (latest['rsi14'] > 70) and (latest['stoch_k'] > 80)
     
-    if is_oversold: score += 1
-    if is_overbought: score -= 1
+    if is_oversold: score += 1 # BUY сигнал от осцилляторов
+    if is_overbought: score -= 1 # SELL сигнал от осцилляторов
 
+    # 3. Анализ паттернов
     if latest['hammer']: score += 1
     if latest['shooting_star']: score -= 1
             
+    # 4. Вывод
     if score >= 2:
         direction = "BUY"
     elif score <= -2:
@@ -459,6 +477,7 @@ def indicator_vote(latest: pd.Series) -> Dict[str, Any]:
     else:
         direction = "HOLD" 
 
+    # Расчет уверенности (простая линейная зависимость)
     confidence = min(100, abs(score) * 20 + 40)
     
     return {"direction": direction, "confidence": confidence, "score": score}
@@ -484,6 +503,7 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
     res = indicator_vote(latest)
     sr = support_resistance(df_ind)
     
+    # Сохраняем сделку в базу, чтобы потом записать результат
     trade_id = save_trade(user_id, pair, timeframe, res['direction'])
 
     dir_map = {"BUY":"🔺 ПОКУПКА","SELL":"🔻 ПРОДАЖА","HOLD":"⚠️ НЕОДНОЗНАЧНО"}
@@ -508,17 +528,20 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
     except Exception as e:
         logging.error(f"Ошибка при редактировании сообщения пользователю {chat_id}: {e}")
 
-# -------------------- БЛОК ЗАПУСКА WEBHOOK (ИСПРАВЛЕННО) --------------------
+# -------------------- БЛОК ЗАПУСКА WEBHOOK (ИСПРАВЛЕННО НА V2-СИНТАКСИС) --------------------
 
 async def on_startup_webhook(bot: Bot):
+    # При старте мы явно удаляем старый Webhook, если он есть
+    await bot(DeleteWebhook(drop_pending_updates=True))
     if WEBHOOK_URL:
-        await bot(DeleteWebhook(drop_pending_updates=True))
+        # И устанавливаем новый
         await bot(SetWebhook(url=WEBHOOK_URL))
         logging.info(f"✅ Webhook успешно переустановлен: {WEBHOOK_URL}")
     else:
         logging.error("❌ Webhook URL не определен. Невозможно установить Webhook.")
 
 async def on_shutdown_webhook(bot: Bot):
+    # При завершении работы удаляем Webhook
     try:
         await bot(DeleteWebhook(drop_pending_updates=True))
     except Exception as e:
@@ -527,6 +550,7 @@ async def on_shutdown_webhook(bot: Bot):
 
 
 async def start_webhook():
+    """Главная асинхронная функция, явно запускающая Webhook-сервер (СИНТАКСИС V2)."""
     
     if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
         logging.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Не задан TG_TOKEN или RENDER_EXTERNAL_HOSTNAME. Выход.")
@@ -535,21 +559,33 @@ async def start_webhook():
     init_db() 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    logging.info(f"--- ЗАПУСК WEBHOOK СЕРВЕРА: {WEBHOOK_URL} ---")
+    logging.info(f"--- ЗАПУСК WEBHOOK СЕРВЕРА V2: {WEBHOOK_URL} ---")
     
+    # Регистрация обработчиков Webhook
     dp.startup.register(on_startup_webhook)
     dp.shutdown.register(on_shutdown_webhook)
     
-    # Явный запуск aiohttp Web Server - ИСПРАВЛЕНО НА run_webhook
+    # -------------------------------------------------------------
+    # АЛЬТЕРНАТИВНЫЙ ЗАПУСК ДЛЯ AIOGRAM V2/V3 (ЧЕРЕЗ AIOHTTP)
+    # -------------------------------------------------------------
+    
+    # Создаем aiohttp Web Application
+    app = web.Application()
+    
+    # Настраиваем, чтобы наш Диспетчер обрабатывал запросы по пути WEBHOOK_PATH
+    setup_application(app, dp, bot=bot, path=WEBHOOK_PATH)
+    
     try:
-        await dp.run_webhook( # <--- ИСПРАВЛЕННАЯ ФУНКЦИЯ ДЛЯ AIOGRAM 3.X
-            bot=bot,
-            webhook_url=WEBHOOK_URL,
-            host=WEB_SERVER_HOST,
-            port=WEB_SERVER_PORT,
-            path=WEBHOOK_PATH,
-            allowed_updates=dp.resolve_used_update_types()
-        )
+        # Запускаем aiohttp Web Server (низкоуровневый запуск)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, host=WEB_SERVER_HOST, port=WEB_SERVER_PORT)
+        await site.start()
+        logging.info(f"🌐 Сервер запущен на {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
+        
+        # Ждем завершения работы (нужно для того, чтобы приложение Render не завершилось)
+        await asyncio.Event().wait() 
+
     except Exception as e:
         logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА ЗАПУСКА WEBHOOK-СЕРВЕРА: {e}")
         sys.exit(1) 
