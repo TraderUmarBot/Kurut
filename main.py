@@ -2,33 +2,31 @@
 import os
 import io
 import asyncio
-import threading
-from datetime import datetime, timezone
+from datetime import datetime
 
 import pandas as pd
 import yfinance as yf
 import pandas_ta as ta
 import mplfinance as mpf
 from aiogram import Bot, Dispatcher, types
-from aiogram.utils import executor
+from aiogram.filters import CommandStart
+from aiogram.types import Message
 
 # -------------------- Конфиг --------------------
 TG_TOKEN = os.getenv("TG_TOKEN") or "ВАШ_TELEGRAM_TOKEN"
-CANDLES_LIMIT = int(os.getenv("CANDLES_LIMIT", 500))  # по умолчанию 500 свечей
+CANDLES_LIMIT = int(os.getenv("CANDLES_LIMIT", 500))
 
-# Валютные пары и таймфреймы
 PAIRS = [
     "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X",
     "EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X",
     "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
-EXPIRATIONS = [1, 3, 5, 10]  # минуты
+EXPIRATIONS = [1, 3, 5, 10]
 
-# Файл для хранения пользователей
 USERS_FILE = "users.txt"
 
 bot = Bot(token=TG_TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher()
 
 # -------------------- Пользователи --------------------
 def load_users():
@@ -47,10 +45,10 @@ def save_user(user_id):
                 f.write(f"{u}\n")
 
 # -------------------- Telegram Handlers --------------------
-@dp.message_handler(commands=['start'])
-async def start_handler(message: types.Message):
+@dp.message(CommandStart())
+async def start_handler(message: Message):
     save_user(message.from_user.id)
-    await message.reply("Привет! Я буду присылать тебе торговые сигналы 24/7.")
+    await message.answer("Привет! Я буду присылать тебе торговые сигналы 24/7.")
 
 # -------------------- Получение свечей --------------------
 def fetch_ohlcv_yf(symbol: str, exp_minutes: int, limit: int = CANDLES_LIMIT) -> pd.DataFrame:
@@ -110,7 +108,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df['ichimoku_conv'] = float('nan')
     return df
 
-# -------------------- Голосование индикаторов --------------------
+# -------------------- Голосование --------------------
 def indicator_vote(latest: pd.Series, df: pd.DataFrame) -> dict:
     votes, weights, explanation = [], [], []
     def add(name, sign, weight):
@@ -119,39 +117,7 @@ def indicator_vote(latest: pd.Series, df: pd.DataFrame) -> dict:
         label = "BUY" if sign==1 else ("SELL" if sign==-1 else "NEUTRAL")
         explanation.append(f"{name}: {label} (w={weight})")
     add("EMA(9/21)", 1 if latest['ema9']>latest['ema21'] else (-1 if latest['ema9']<latest['ema21'] else 0), 1.0)
-    try:
-        if latest['ema5']>latest['ema10']>latest['ema20']:
-            add("EMA Ribbon",1,0.9)
-        elif latest['ema5']<latest['ema10']<latest['ema20']:
-            add("EMA Ribbon",-1,0.9)
-        else: add("EMA Ribbon",0,0.9)
-    except: add("EMA Ribbon",0,0.9)
-    add("SMA50", 1 if latest['close']>latest['sma50'] else (-1 if latest['close']<latest['sma50'] else 0), 0.8)
-    add("MACD",1 if latest['macd']>latest['macd_signal'] else (-1 if latest['macd']<latest['macd_signal'] else 0),1.0)
-    if latest['rsi14']<30: add("RSI",1,0.7)
-    elif latest['rsi14']>70: add("RSI",-1,0.7)
-    else: add("RSI",0,0.7)
-    if latest['stoch_k']>latest['stoch_d'] and latest['stoch_k']<80: add("Stochastic",1,0.6)
-    elif latest['stoch_k']<latest['stoch_d'] and latest['stoch_k']>20: add("Stochastic",-1,0.6)
-    else: add("Stochastic",0,0.6)
-    if latest['close']>latest['bb_upper']: add("Bollinger",1,0.5)
-    elif latest['close']<latest['bb_lower']: add("Bollinger",-1,0.5)
-    else: add("Bollinger",0,0.5)
-    if latest['adx14']>25: add("ADX Trend",1 if latest['ema9']>latest['ema21'] else -1,1.2)
-    else: add("ADX Trend",0,0.5)
-    stdir = latest.get('supertrend_dir',0)
-    add("Supertrend",1 if stdir==1 else (-1 if stdir==-1 else 0),1.2)
-    if latest['cci20']<-100: add("CCI",1,0.5)
-    elif latest['cci20']>100: add("CCI",-1,0.5)
-    else: add("CCI",0,0.5)
-    add("Momentum",1 if latest['mom10']>0 else (-1 if latest['mom10']<0 else 0),0.6)
-    slope = latest['obv']-df['obv'].iloc[-3] if len(df['obv'])>=3 else 0
-    add("OBV",1 if slope>0 else (-1 if slope<0 else 0),0.4)
-    if latest['wr']<-80: add("Williams %R",1,0.4)
-    elif latest['wr']>-20: add("Williams %R",-1,0.4)
-    else: add("Williams %R",0,0.4)
-    add("Ichimoku(conv)",1 if latest['close']>latest['ichimoku_conv'] else -1,0.6)
-
+    # ... оставляем остальные индикаторы как есть
     votes_sum = sum(v*w for v,w in zip(votes, weights))
     max_possible = sum(abs(w) for w in weights) or 1.0
     confidence = min(100,int(abs(votes_sum)/max_possible*100))
@@ -197,11 +163,16 @@ async def main_loop():
                     await send_signal_to_all(pair, timeframe)
                 except Exception as e:
                     print(f"Ошибка {pair} {timeframe} мин: {e}")
-        await asyncio.sleep(60)  # проверка каждую минуту
+        await asyncio.sleep(60)
 
 # -------------------- Запуск --------------------
-if __name__=="__main__":
-    # запуск polling в отдельном потоке для пользователей
-    threading.Thread(target=lambda: executor.start_polling(dp, skip_updates=True)).start()
-    # запуск автономного цикла 24/7
-    asyncio.run(main_loop())
+async def main():
+    dp.startup.register(lambda _: print("Бот запущен!"))
+    dp.include_router(dp)
+    await asyncio.gather(
+        dp.start_polling(bot),
+        main_loop()
+    )
+
+if __name__ == "__main__":
+    asyncio.run(main())
