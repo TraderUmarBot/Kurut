@@ -1,4 +1,4 @@
-# main.py - V5-MODIFIED: Версия с упрощенным запуском и удалением этапа рекрутмента
+# main.py - V6-FINAL: Включена История Сделок и Статистика из PostgreSQL
 
 import os
 import asyncio
@@ -91,38 +91,39 @@ async def init_db_pool():
 async def init_db_tables():
     """Создает необходимые таблицы (users и trades)."""
     if not DB_POOL: return
-    async with DB_POOL.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS trades (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL REFERENCES users(user_id),
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                pair TEXT NOT NULL,
-                timeframe INTEGER NOT NULL,
-                result TEXT, 
-                direction TEXT
-            );
-        """)
-    logging.info("✅ Таблицы users и trades успешно созданы/проверены.")
-
+    try:
+        async with DB_POOL.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS trades (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES users(user_id),
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    pair TEXT NOT NULL,
+                    timeframe INTEGER NOT NULL,
+                    result TEXT, 
+                    direction TEXT
+                );
+            """)
+        logging.info("✅ Таблицы users и trades успешно созданы/проверены.")
+    except Exception as e:
+        logging.error(f"❌ Ошибка при создании/проверке таблиц БД: {e}")
 
 # In-Memory заглушка, если DB не работает
-# Теперь не используется для авторизации, но оставлена для сохранения данных
 AUTHORIZED_USERS: Dict[int, bool] = {} 
 
 async def save_user_db(user_id: int):
     # Теперь просто сохраняем пользователя, так как авторизация идет по факту использования
     if DB_POOL:
-        async with DB_POOL.acquire() as conn:
-            try:
+        try:
+            async with DB_POOL.acquire() as conn:
                 await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
-            except Exception as e:
-                logging.error(f"Ошибка сохранения пользователя {user_id} в DB: {e}")
+        except Exception as e:
+            logging.error(f"Ошибка сохранения пользователя {user_id} в DB: {e}")
     else:
         AUTHORIZED_USERS[user_id] = True
 
@@ -133,69 +134,80 @@ async def is_user_authorized_db(user_id: int) -> bool:
     return True 
 
 async def save_trade_db(user_id: int, pair: str, timeframe: int, direction: str) -> int:
-    # Сохраняем пользователя при первой сделке (для FOREIGN KEY)
+    # Сохраняем пользователя (если еще не сохранен) перед сделкой
     await save_user_db(user_id) 
 
     if not DB_POOL: 
         logging.warning("⚠️ DB недоступна. Сделка не сохранена.")
         return int(time.time()) 
 
-    async with DB_POOL.acquire() as conn:
-        return await conn.fetchval("""
-            INSERT INTO trades (user_id, pair, timeframe, direction) 
-            VALUES ($1, $2, $3, $4)
-            RETURNING id
-        """, user_id, pair, timeframe, direction)
+    try:
+        async with DB_POOL.acquire() as conn:
+            return await conn.fetchval("""
+                INSERT INTO trades (user_id, pair, timeframe, direction) 
+                VALUES ($1, $2, $3, $4)
+                RETURNING id
+            """, user_id, pair, timeframe, direction)
+    except Exception as e:
+        logging.error(f"Ошибка сохранения сделки в DB: {e}")
+        return int(time.time())
 
 async def update_trade_result_db(trade_id: int, result: str):
     if not DB_POOL: return
-    async with DB_POOL.acquire() as conn:
-        await conn.execute("""
-            UPDATE trades SET result = $1 WHERE id = $2
-        """, result, trade_id)
+    try:
+        async with DB_POOL.acquire() as conn:
+            await conn.execute("""
+                UPDATE trades SET result = $1 WHERE id = $2
+            """, result, trade_id)
+    except Exception as e:
+        logging.error(f"Ошибка обновления результата сделки {trade_id} в DB: {e}")
 
 async def get_user_stats_db(user_id: int) -> Dict[str, Any]:
     if not DB_POOL:
-        return {'total_plus': 0, 'total_minus': 0, 'pair_stats': {}}
+        return {'total_plus': 0, 'total_minus': 0, 'pair_stats': {}, 'db_active': False}
 
-    async with DB_POOL.acquire() as conn:
-        stats_rows = await conn.fetch("""
-            SELECT result, COUNT(*) FROM trades 
-            WHERE user_id = $1 AND result IS NOT NULL 
-            GROUP BY result
-        """, user_id)
-        stats = dict(stats_rows)
+    try:
+        async with DB_POOL.acquire() as conn:
+            stats_rows = await conn.fetch("""
+                SELECT result, COUNT(*) FROM trades 
+                WHERE user_id = $1 AND result IS NOT NULL 
+                GROUP BY result
+            """, user_id)
+            stats = dict(stats_rows)
 
-        pair_rows = await conn.fetch("""
-            SELECT pair, result, COUNT(*) FROM trades 
-            WHERE user_id = $1 AND result IS NOT NULL 
-            GROUP BY pair, result
-        """, user_id)
-    
-    formatted_pair_stats: Dict[str, Dict[str, int]] = {}
-    for pair, result, count in pair_rows:
-        if pair not in formatted_pair_stats:
-            formatted_pair_stats[pair] = {'PLUS': 0, 'MINUS': 0}
-        if result in formatted_pair_stats[pair]:
-            formatted_pair_stats[pair][result] = count
+            pair_rows = await conn.fetch("""
+                SELECT pair, result, COUNT(*) FROM trades 
+                WHERE user_id = $1 AND result IS NOT NULL 
+                GROUP BY pair, result
+            """, user_id)
+        
+        formatted_pair_stats: Dict[str, Dict[str, int]] = {}
+        for pair, result, count in pair_rows:
+            if pair not in formatted_pair_stats:
+                formatted_pair_stats[pair] = {'PLUS': 0, 'MINUS': 0}
+            if result in formatted_pair_stats[pair]:
+                formatted_pair_stats[pair][result] = count
 
-    return {
-        'total_plus': stats.get('PLUS', 0),
-        'total_minus': stats.get('MINUS', 0),
-        'pair_stats': formatted_pair_stats
-    }
+        return {
+            'total_plus': stats.get('PLUS', 0),
+            'total_minus': stats.get('MINUS', 0),
+            'pair_stats': formatted_pair_stats,
+            'db_active': True
+        }
+    except Exception as e:
+        logging.error(f"Ошибка получения статистики из DB: {e}")
+        return {'total_plus': 0, 'total_minus': 0, 'pair_stats': {}, 'db_active': False}
 
 
 # -------------------- FSM и Клавиатуры --------------------
 class Form(StatesGroup):
-    # Удалено: waiting_for_referral = State() 
     choosing_pair = State()
     choosing_timeframe = State()
 
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="📈 Выбрать пару", callback_data="start_trade")
-    builder.button(text="📜 История сделок", callback_data="show_history")
+    builder.button(text="📜 История сделок", callback_data="show_history") # КНОПКА ИСТОРИИ
     builder.adjust(1)
     return builder.as_markup()
 
@@ -246,7 +258,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     await state.clear()
     
-    # 🔴 ИСПРАВЛЕНИЕ: Новый, упрощенный приветственный текст
     await message.answer(
         "👋 **Привет, я твой торгующий помощник.**\n\n"
         "📈 Выбери валютную пару, чтобы начать:",
@@ -259,7 +270,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
 @dp.callback_query(lambda c: c.data in ["main_menu", "start_trade"])
 async def main_menu_handler(query: types.CallbackQuery, state: FSMContext):
     user_id = query.from_user.id
-    # Проверка is_user_authorized_db удалена, так как все авторизованы
         
     await state.clear()
     
@@ -281,10 +291,13 @@ async def main_menu_handler(query: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data == "show_history")
 async def show_history_handler(query: types.CallbackQuery, state: FSMContext):
+    # *********************************************
+    # ********* НОВЫЙ ОБРАБОТЧИК ИСТОРИИ **********
+    # *********************************************
     user_id = query.from_user.id
-    # Проверка is_user_authorized_db удалена
         
     stats = await get_user_stats_db(user_id) 
+    db_active = stats.pop('db_active')
     
     total_trades = stats['total_plus'] + stats['total_minus']
     
@@ -299,7 +312,7 @@ async def show_history_handler(query: types.CallbackQuery, state: FSMContext):
             f"✅ Плюсовых: **{stats['total_plus']}**\n"
             f"❌ Минусовых: **{stats['total_minus']}**\n"
             f"🎯 Процент побед (Win Rate): **{win_rate:.2f}%**\n\n"
-            "--- Статистика по парам ---"
+            "--- Статистика по парам ---\n"
         )
         
         for pair, data in stats['pair_stats'].items():
@@ -311,8 +324,8 @@ async def show_history_handler(query: types.CallbackQuery, state: FSMContext):
                 f"\n**{pair}**: {plus} ✅ / {minus} ❌ ({pair_win_rate:.1f}%)"
             )
         
-        if not DB_POOL:
-            text += "\n\n⚠️ **Примечание:** История сохраняется только до перезапуска, так как DATABASE_URL не задан или не работает."
+        if not db_active:
+            text += "\n\n⚠️ **Примечание:** База данных PostgreSQL недоступна. История может быть неполной."
 
     await query.message.edit_text(
         text,
@@ -345,12 +358,9 @@ async def trade_result_handler(query: types.CallbackQuery, state: FSMContext):
 
     await query.answer(f"Результат {result} сохранен!")
 
-# Обработчик Form.waiting_for_referral УДАЛЕН, так как этот этап пропущен.
-
 @dp.callback_query(lambda c: c.data.startswith("page:"))
 async def page_handler(query: types.CallbackQuery, state: FSMContext):
     user_id = query.from_user.id
-    # Проверка is_user_authorized_db удалена
         
     page = int(query.data.split(":")[1])
     await query.message.edit_text(
@@ -362,7 +372,6 @@ async def page_handler(query: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
 async def pair_handler(query: types.CallbackQuery, state: FSMContext):
     user_id = query.from_user.id
-    # Проверка is_user_authorized_db удалена
         
     pair = query.data.split(":")[1]
     await state.update_data(selected_pair=pair)
@@ -378,7 +387,6 @@ async def pair_handler(query: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(lambda c: c.data.startswith("tf:"))
 async def tf_handler(query: types.CallbackQuery, state: FSMContext):
     user_id = query.from_user.id
-    # Проверка is_user_authorized_db удалена
         
     current_state = await state.get_state()
     if current_state != Form.choosing_timeframe:
@@ -587,7 +595,7 @@ async def on_shutdown_webhook(bot: Bot):
 
 
 async def start_webhook():
-    logging.info(f"--- ЗАПУСК WEBHOOK СЕРВЕРА V5-MODIFIED: {WEBHOOK_URL} ---")
+    logging.info(f"--- ЗАПУСК WEBHOOK СЕРВЕРА V6-FINAL: {WEBHOOK_URL} ---")
     
     dp.startup.register(on_startup_webhook)
     dp.shutdown.register(on_shutdown_webhook)
