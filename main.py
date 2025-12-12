@@ -1,4 +1,4 @@
-# main.py - V6-FINAL: Включена История Сделок и Статистика из PostgreSQL
+# main.py - V6-FINAL-FIXED: Включена История Сделок, Статистика и ИСПРАВЛЕНЫ ОШИБКИ 404
 
 import os
 import asyncio
@@ -24,7 +24,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder 
 from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.client.default import DefaultBotProperties
-from aiogram.webhook.aiohttp_server import setup_application, SimpleRequestHandler
+# ВАЖНО: Импортируем SimpleRequestHandler для явной регистрации роута Webhook
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web 
 from aiogram.utils.markdown import link
 from aiogram.enums import ParseMode
@@ -72,7 +73,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 DB_POOL: Union[asyncpg.Pool, None] = None 
 
 
-# -------------------- PostgreSQL Логика (ОБЯЗАТЕЛЬНАЯ) --------------------
+# -------------------- PostgreSQL Логика --------------------
 
 async def init_db_pool():
     """Инициализирует пул подключений к PostgreSQL."""
@@ -117,7 +118,6 @@ async def init_db_tables():
 AUTHORIZED_USERS: Dict[int, bool] = {} 
 
 async def save_user_db(user_id: int):
-    # Теперь просто сохраняем пользователя, так как авторизация идет по факту использования
     if DB_POOL:
         try:
             async with DB_POOL.acquire() as conn:
@@ -127,14 +127,7 @@ async def save_user_db(user_id: int):
     else:
         AUTHORIZED_USERS[user_id] = True
 
-# Упрощена: теперь всегда True, так как авторизация удалена
-async def is_user_authorized_db(user_id: int) -> bool:
-    # Поскольку этап рекрутмента убран, считаем, что пользователь авторизован,
-    # если он начал работу. Вызываем save_user_db при первом действии.
-    return True 
-
 async def save_trade_db(user_id: int, pair: str, timeframe: int, direction: str) -> int:
-    # Сохраняем пользователя (если еще не сохранен) перед сделкой
     await save_user_db(user_id) 
 
     if not DB_POOL: 
@@ -207,7 +200,7 @@ class Form(StatesGroup):
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="📈 Выбрать пару", callback_data="start_trade")
-    builder.button(text="📜 История сделок", callback_data="show_history") # КНОПКА ИСТОРИИ
+    builder.button(text="📜 История сделок", callback_data="show_history")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -263,7 +256,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
         "📈 Выбери валютную пару, чтобы начать:",
         reply_markup=get_pairs_keyboard(0)
     )
-    # Переводим пользователя сразу в состояние выбора пары
     await state.set_state(Form.choosing_pair)
 
 
@@ -291,9 +283,6 @@ async def main_menu_handler(query: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data == "show_history")
 async def show_history_handler(query: types.CallbackQuery, state: FSMContext):
-    # *********************************************
-    # ********* НОВЫЙ ОБРАБОТЧИК ИСТОРИИ **********
-    # *********************************************
     user_id = query.from_user.id
         
     stats = await get_user_stats_db(user_id) 
@@ -398,7 +387,6 @@ async def tf_handler(query: types.CallbackQuery, state: FSMContext):
     _, pair, tf = query.data.split(":")
     tf = int(tf)
     
-    # Сохраняем пользователя (если еще не сохранен) перед началом торгов
     await save_user_db(user_id) 
 
     await query.answer("Идет загрузка сигнала...", show_alert=False) 
@@ -418,7 +406,6 @@ async def tf_handler(query: types.CallbackQuery, state: FSMContext):
     
 # -------------------- Получение свечей и Индикаторы (Без изменений) --------------------
 
-# Кэш сбрасывается каждую минуту
 @lru_cache(maxsize=128)
 def get_cache_key(symbol: str, exp_minutes: int, current_minute: int) -> str:
     return f"{symbol}_{exp_minutes}_{current_minute}"
@@ -430,7 +417,6 @@ async def async_fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
     
     def sync_fetch_data():
         try:
-            # Используем yfinance как заглушку, так как ключи Alpaca не предоставлены.
             df = yf.download(f"{symbol}=X", period="5d", interval="1m", progress=False, show_errors=False) 
         except Exception as e:
             logging.error(f"Ошибка загрузки данных YFinance для {symbol}: {e}")
@@ -542,7 +528,6 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
     res = indicator_vote(latest)
     sr = support_resistance(df_ind)
     
-    # Сохраняем сделку в PostgreSQL (или получаем временный ID)
     trade_id = await save_trade_db(user_id, pair, timeframe, res['direction'])
 
     dir_map = {"BUY":"🔺 ПОКУПКА","SELL":"🔻 ПРОДАЖА","HOLD":"⚠️ НЕОДНОЗНАЧНО"}
@@ -569,13 +554,17 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
 
 # -------------------- БЛОК ЗАПУСКА WEBHOOK (ФИНАЛЬНЫЙ С FIX) --------------------
 
+# --- НОВАЯ ФУНКЦИЯ ДЛЯ ПРОВЕРКИ РАБОТОСПОСОБНОСТИ ---
+async def health_check(request):
+    """Корневая конечная точка для проверки работоспособности Render/UptimeRobot."""
+    return web.Response(text="Bot is running!", status=200)
+
 async def on_startup_webhook(bot: Bot):
-    await init_db_pool() # Инициализация пула DB при старте
+    await init_db_pool()
     
     try:
         await bot(DeleteWebhook(drop_pending_updates=True))
         if WEBHOOK_URL:
-            # Устанавливаем Webhook с полным путем (с токеном)
             await bot(SetWebhook(url=WEBHOOK_URL)) 
             logging.info(f"✅ Webhook успешно переустановлен: {WEBHOOK_URL}")
         else:
@@ -595,15 +584,23 @@ async def on_shutdown_webhook(bot: Bot):
 
 
 async def start_webhook():
-    logging.info(f"--- ЗАПУСК WEBHOOK СЕРВЕРА V6-FINAL: {WEBHOOK_URL} ---")
+    logging.info(f"--- ЗАПУСК WEBHOOK СЕРВЕРА V6-FINAL-FIXED: {WEBHOOK_URL} ---")
     
     dp.startup.register(on_startup_webhook)
     dp.shutdown.register(on_shutdown_webhook)
     
     app = web.Application()
     
-    # Используем WEBHOOK_BASE_PATH, который теперь включает токен!
-    setup_application(app, dp, bot=bot, path=WEBHOOK_BASE_PATH) 
+    # 🟢 1. ЯВНАЯ РЕГИСТРАЦИЯ РОУТА ДЛЯ ПРОВЕРКИ РАБОТОСПОСОБНОСТИ (FIX 404)
+    app.router.add_get('/', health_check) 
+    
+    # 🟢 2. ОСНОВНОЙ РОУТ ДЛЯ WEBHOOK (FIX 404)
+    webhook_request_handler = SimpleRequestHandler(
+        dispatcher=dp, 
+        bot=bot, 
+        handle_in_background=False
+    )
+    webhook_request_handler.register(app, path=WEBHOOK_BASE_PATH)
     
     try:
         runner = web.AppRunner(app)
