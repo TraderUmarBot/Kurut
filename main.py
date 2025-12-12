@@ -2,15 +2,14 @@
 import os
 import io
 import asyncio
-import threading
 from datetime import datetime
-
 import pandas as pd
 import yfinance as yf
 import pandas_ta as ta
 import mplfinance as mpf
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
+from aiogram.filters import Command
 
 # -------------------- Конфиг --------------------
 TG_TOKEN = os.getenv("TG_TOKEN") or "ВАШ_TELEGRAM_TOKEN"
@@ -26,7 +25,7 @@ EXPIRATIONS = [1, 3, 5, 10]
 USERS_FILE = "users.txt"
 
 bot = Bot(token=TG_TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher()
 
 # -------------------- Пользователи --------------------
 def load_users():
@@ -45,52 +44,43 @@ def save_user(user_id):
                 f.write(f"{u}\n")
 
 # -------------------- Telegram Handlers --------------------
-@dp.message_handler(commands=['start'])
+@dp.message(Command("start"))
 async def start_handler(message: types.Message):
     save_user(message.from_user.id)
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=pair) for pair in PAIRS[:3]],
+                  [KeyboardButton(text=pair) for pair in PAIRS[3:6]]],
+        resize_keyboard=True
+    )
     await message.answer(
         "Привет! Я твой торговый помощник 🤖\n"
-        "Выбери валюты и таймфреймы, и я буду присылать тебе торговые сигналы 24/7."
+        "Выбери валюты и таймфреймы, и я буду присылать тебе торговые сигналы 24/7.",
+        reply_markup=keyboard
     )
-    
-    keyboard = InlineKeyboardMarkup(row_width=3)
-    buttons = [InlineKeyboardButton(text=p, callback_data=f"pair:{p}") for p in PAIRS]
-    keyboard.add(*buttons)
-    await message.answer("Выбери валютную пару:", reply_markup=keyboard)
-
-@dp.callback_query_handler(lambda c: c.data.startswith("pair:"))
-async def pair_chosen(callback: types.CallbackQuery):
-    pair = callback.data.split(":")[1]
-    keyboard = InlineKeyboardMarkup(row_width=4)
-    buttons = [InlineKeyboardButton(text=f"{t} мин", callback_data=f"time:{pair}:{t}") for t in EXPIRATIONS]
-    keyboard.add(*buttons)
-    await callback.message.answer(f"Вы выбрали {pair}. Теперь выбери таймфрейм:", reply_markup=keyboard)
-
-@dp.callback_query_handler(lambda c: c.data.startswith("time:"))
-async def timeframe_chosen(callback: types.CallbackQuery):
-    _, pair, t = callback.data.split(":")
-    t = int(t)
-    await callback.message.answer(f"Выбрана пара {pair} и таймфрейм {t} мин. Сигналы будут присылаться автоматически!")
 
 # -------------------- Получение свечей --------------------
 def fetch_ohlcv_yf(symbol: str, exp_minutes: int, limit: int = CANDLES_LIMIT) -> pd.DataFrame:
-    if exp_minutes == 1:
-        interval = "1m"
-        df = yf.download(tickers=symbol, period="2d", interval=interval, progress=False)
-        df = df.rename(columns=str.lower)[['open','high','low','close','volume']]
-        return df.tail(limit)
-    else:
-        df1 = yf.download(tickers=symbol, period="2d", interval="1m", progress=False)
-        df1 = df1.rename(columns=str.lower)[['open','high','low','close','volume']]
-        rule = f"{exp_minutes}T"
-        df_res = pd.DataFrame()
-        df_res['open'] = df1['open'].resample(rule).first()
-        df_res['high'] = df1['high'].resample(rule).max()
-        df_res['low'] = df1['low'].resample(rule).min()
-        df_res['close'] = df1['close'].resample(rule).last()
-        df_res['volume'] = df1['volume'].resample(rule).sum()
-        df_res.dropna(inplace=True)
-        return df_res.tail(limit)
+    try:
+        if exp_minutes == 1:
+            interval = "1m"
+            df = yf.download(tickers=symbol, period="2d", interval=interval, progress=False)
+            df = df.rename(columns=str.lower)[['open','high','low','close','volume']]
+            return df.tail(limit)
+        else:
+            df1 = yf.download(tickers=symbol, period="2d", interval="1m", progress=False)
+            df1 = df1.rename(columns=str.lower)[['open','high','low','close','volume']]
+            rule = f"{exp_minutes}min"
+            df_res = pd.DataFrame()
+            df_res['open'] = df1['open'].resample(rule).first()
+            df_res['high'] = df1['high'].resample(rule).max()
+            df_res['low'] = df1['low'].resample(rule).min()
+            df_res['close'] = df1['close'].resample(rule).last()
+            df_res['volume'] = df1['volume'].resample(rule).sum()
+            df_res.dropna(inplace=True)
+            return df_res.tail(limit)
+    except Exception as e:
+        print(f"Ошибка загрузки {symbol} {exp_minutes} мин: {e}")
+        return pd.DataFrame()
 
 # -------------------- Индикаторы --------------------
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -113,7 +103,6 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['adx14'] = ta.adx(df['high'], df['low'], df['close']).iloc[:,0]
     df['cci20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
     df['obv'] = ta.obv(df['close'], df['volume'])
-    df['wr'] = ta.wr(df['high'], df['low'], df['close'])
     df['ema5'] = ta.ema(df['close'], length=5)
     df['ema10'] = ta.ema(df['close'], length=10)
     df['ema20'] = ta.ema(df['close'], length=20)
@@ -167,9 +156,6 @@ def indicator_vote(latest: pd.Series, df: pd.DataFrame) -> dict:
     add("Momentum",1 if latest['mom10']>0 else (-1 if latest['mom10']<0 else 0),0.6)
     slope = latest['obv']-df['obv'].iloc[-3] if len(df['obv'])>=3 else 0
     add("OBV",1 if slope>0 else (-1 if slope<0 else 0),0.4)
-    if latest['wr']<-80: add("Williams %R",1,0.4)
-    elif latest['wr']>-20: add("Williams %R",-1,0.4)
-    else: add("Williams %R",0,0.4)
     add("Ichimoku(conv)",1 if latest['close']>latest['ichimoku_conv'] else -1,0.6)
 
     votes_sum = sum(v*w for v,w in zip(votes, weights))
@@ -193,6 +179,8 @@ def plot_chart(df: pd.DataFrame) -> io.BytesIO:
 # -------------------- Автономная рассылка --------------------
 async def send_signal_to_all(pair, timeframe):
     df = fetch_ohlcv_yf(pair, timeframe)
+    if df.empty:
+        return
     df_ind = compute_indicators(df)
     latest = df_ind.iloc[-1]
     res = indicator_vote(latest, df_ind)
@@ -220,6 +208,11 @@ async def main_loop():
         await asyncio.sleep(60)
 
 # -------------------- Запуск --------------------
+async def main():
+    from aiogram import F
+    from aiogram.client.session.aiohttp import AiohttpSession
+    # запуск бота
+    await dp.start_polling(bot)
+
 if __name__=="__main__":
-    threading.Thread(target=lambda: dp.start_polling()).start()
-    asyncio.run(main_loop())
+    asyncio.run(main())
