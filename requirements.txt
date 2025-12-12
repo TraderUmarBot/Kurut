@@ -1,6 +1,5 @@
-aiogram==3.4.1
+aiogram
 aiohttp
 pandas
 yfinance
 pandas-ta
-sqlite3
