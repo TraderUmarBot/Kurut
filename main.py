@@ -2,30 +2,29 @@
 import os
 import io
 import asyncio
-from datetime import datetime
 import pandas as pd
 import yfinance as yf
 import pandas_ta as ta
 import mplfinance as mpf
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
-from aiogram.filters import Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.utils import executor
 
 # -------------------- Конфиг --------------------
 TG_TOKEN = os.getenv("TG_TOKEN") or "ВАШ_TELEGRAM_TOKEN"
-CANDLES_LIMIT = int(os.getenv("CANDLES_LIMIT", 500))
+CANDLES_LIMIT = 500
 
 PAIRS = [
     "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X",
     "EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X",
     "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
-EXPIRATIONS = [1, 3, 5, 10]
+TIMEFRAMES = [1, 3, 5, 10]  # минуты
 
 USERS_FILE = "users.txt"
 
 bot = Bot(token=TG_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(bot)
 
 # -------------------- Пользователи --------------------
 def load_users():
@@ -44,175 +43,127 @@ def save_user(user_id):
                 f.write(f"{u}\n")
 
 # -------------------- Telegram Handlers --------------------
-@dp.message(Command("start"))
+@dp.message_handler(commands=['start'])
 async def start_handler(message: types.Message):
     save_user(message.from_user.id)
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=pair) for pair in PAIRS[:3]],
-                  [KeyboardButton(text=pair) for pair in PAIRS[3:6]]],
-        resize_keyboard=True
-    )
-    await message.answer(
-        "Привет! Я твой торговый помощник 🤖\n"
-        "Выбери валюты и таймфреймы, и я буду присылать тебе торговые сигналы 24/7.",
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    for pair in PAIRS:
+        keyboard.add(KeyboardButton(pair))
+    for tf in TIMEFRAMES:
+        keyboard.add(KeyboardButton(f"{tf} мин"))
+    await message.reply(
+        "Привет! Я твой торговый помощник 🤖\nВыбери валютную пару и таймфрейм, и я пришлю торговый сигнал.",
         reply_markup=keyboard
     )
 
 # -------------------- Получение свечей --------------------
-def fetch_ohlcv_yf(symbol: str, exp_minutes: int, limit: int = CANDLES_LIMIT) -> pd.DataFrame:
-    try:
-        if exp_minutes == 1:
-            interval = "1m"
-            df = yf.download(tickers=symbol, period="2d", interval=interval, progress=False)
-            df = df.rename(columns=str.lower)[['open','high','low','close','volume']]
-            return df.tail(limit)
-        else:
-            df1 = yf.download(tickers=symbol, period="2d", interval="1m", progress=False)
-            df1 = df1.rename(columns=str.lower)[['open','high','low','close','volume']]
-            rule = f"{exp_minutes}min"
-            df_res = pd.DataFrame()
-            df_res['open'] = df1['open'].resample(rule).first()
-            df_res['high'] = df1['high'].resample(rule).max()
-            df_res['low'] = df1['low'].resample(rule).min()
-            df_res['close'] = df1['close'].resample(rule).last()
-            df_res['volume'] = df1['volume'].resample(rule).sum()
-            df_res.dropna(inplace=True)
-            return df_res.tail(limit)
-    except Exception as e:
-        print(f"Ошибка загрузки {symbol} {exp_minutes} мин: {e}")
-        return pd.DataFrame()
+def fetch_ohlcv(symbol: str, minutes: int, limit=CANDLES_LIMIT) -> pd.DataFrame:
+    df = yf.download(symbol, period="2d", interval="1m", progress=False)
+    df = df.rename(columns=str.lower)[['open','high','low','close','volume']]
+    if minutes > 1:
+        rule = f"{minutes}min"
+        df = df.resample(rule).agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'})
+    return df.tail(limit)
 
 # -------------------- Индикаторы --------------------
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df[['open','high','low','close','volume']] = df[['open','high','low','close','volume']].astype(float)
+    # Трендовые
     df['ema9'] = ta.ema(df['close'], length=9)
     df['ema21'] = ta.ema(df['close'], length=21)
     df['sma50'] = ta.sma(df['close'], length=50)
     macd = ta.macd(df['close'])
-    df['macd'] = macd.iloc[:,0]
-    df['macd_signal'] = macd.iloc[:,1]
+    df['macd'] = macd['MACD_12_26_9']
+    df['macd_signal'] = macd['MACDs_12_26_9']
+    # Осцилляторы
     df['rsi14'] = ta.rsi(df['close'], length=14)
-    st = ta.stoch(df['high'], df['low'], df['close'])
-    df['stoch_k'] = st.iloc[:,0]
-    df['stoch_d'] = st.iloc[:,1]
+    stoch = ta.stoch(df['high'], df['low'], df['close'])
+    df['stoch_k'] = stoch['STOCHk_14_3_3']
+    df['stoch_d'] = stoch['STOCHd_14_3_3']
     bb = ta.bbands(df['close'])
-    df['bb_upper'] = bb.iloc[:,0]
-    df['bb_lower'] = bb.iloc[:,2]
-    df['atr14'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-    df['adx14'] = ta.adx(df['high'], df['low'], df['close']).iloc[:,0]
+    df['bb_upper'] = bb['BBU_20_2.0']
+    df['bb_lower'] = bb['BBL_20_2.0']
+    df['atr14'] = ta.atr(df['high'], df['low'], df['close'])
+    df['adx14'] = ta.adx(df['high'], df['low'], df['close'])['ADX_14']
     df['cci20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
     df['obv'] = ta.obv(df['close'], df['volume'])
-    df['ema5'] = ta.ema(df['close'], length=5)
-    df['ema10'] = ta.ema(df['close'], length=10)
-    df['ema20'] = ta.ema(df['close'], length=20)
-    try:
-        stt = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3.0)
-        df['supertrend_dir'] = stt.iloc[:,2]
-    except:
-        df['supertrend_dir'] = 0
     df['mom10'] = ta.mom(df['close'], length=10)
-    try:
-        ichi = ta.ichimoku(df['high'], df['low'], df['close'])
-        df['ichimoku_conv'] = ichi.iloc[:,0]
-    except:
-        df['ichimoku_conv'] = float('nan')
+    # Свечные паттерны
+    df['hammer'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['close']-df['low'])/(.001+df['high']-df['low'])>0.6)
+    df['shooting_star'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['high']-df['close'])/(.001+df['high']-df['low'])>0.6)
+    df['doji'] = abs(df['close']-df['open']) < 0.1*(df['high']-df['low'])
     return df
 
-# -------------------- Голосование индикаторов --------------------
-def indicator_vote(latest: pd.Series, df: pd.DataFrame) -> dict:
-    votes, weights, explanation = [], [], []
-    def add(name, sign, weight):
-        votes.append(sign)
-        weights.append(weight)
-        label = "BUY" if sign==1 else ("SELL" if sign==-1 else "NEUTRAL")
-        explanation.append(f"{name}: {label} (w={weight})")
-    add("EMA(9/21)", 1 if latest['ema9']>latest['ema21'] else (-1 if latest['ema9']<latest['ema21'] else 0), 1.0)
-    try:
-        if latest['ema5']>latest['ema10']>latest['ema20']:
-            add("EMA Ribbon",1,0.9)
-        elif latest['ema5']<latest['ema10']<latest['ema20']:
-            add("EMA Ribbon",-1,0.9)
-        else: add("EMA Ribbon",0,0.9)
-    except: add("EMA Ribbon",0,0.9)
-    add("SMA50", 1 if latest['close']>latest['sma50'] else (-1 if latest['close']<latest['sma50'] else 0), 0.8)
-    add("MACD",1 if latest['macd']>latest['macd_signal'] else (-1 if latest['macd']<latest['macd_signal'] else 0),1.0)
-    if latest['rsi14']<30: add("RSI",1,0.7)
-    elif latest['rsi14']>70: add("RSI",-1,0.7)
-    else: add("RSI",0,0.7)
-    if latest['stoch_k']>latest['stoch_d'] and latest['stoch_k']<80: add("Stochastic",1,0.6)
-    elif latest['stoch_k']<latest['stoch_d'] and latest['stoch_k']>20: add("Stochastic",-1,0.6)
-    else: add("Stochastic",0,0.6)
-    if latest['close']>latest['bb_upper']: add("Bollinger",1,0.5)
-    elif latest['close']<latest['bb_lower']: add("Bollinger",-1,0.5)
-    else: add("Bollinger",0,0.5)
-    if latest['adx14']>25: add("ADX Trend",1 if latest['ema9']>latest['ema21'] else -1,1.2)
-    else: add("ADX Trend",0,0.5)
-    stdir = latest.get('supertrend_dir',0)
-    add("Supertrend",1 if stdir==1 else (-1 if stdir==-1 else 0),1.2)
-    if latest['cci20']<-100: add("CCI",1,0.5)
-    elif latest['cci20']>100: add("CCI",-1,0.5)
-    else: add("CCI",0,0.5)
-    add("Momentum",1 if latest['mom10']>0 else (-1 if latest['mom10']<0 else 0),0.6)
-    slope = latest['obv']-df['obv'].iloc[-3] if len(df['obv'])>=3 else 0
-    add("OBV",1 if slope>0 else (-1 if slope<0 else 0),0.4)
-    add("Ichimoku(conv)",1 if latest['close']>latest['ichimoku_conv'] else -1,0.6)
+# -------------------- Поддержка/Сопротивление --------------------
+def support_resistance(df: pd.DataFrame) -> dict:
+    return {
+        'support': df['low'].rolling(20).min().iloc[-1],
+        'resistance': df['high'].rolling(20).max().iloc[-1]
+    }
 
-    votes_sum = sum(v*w for v,w in zip(votes, weights))
-    max_possible = sum(abs(w) for w in weights) or 1.0
-    confidence = min(100,int(abs(votes_sum)/max_possible*100))
-    direction = "HOLD" if abs(votes_sum)<0.15*max_possible else ("BUY" if votes_sum>0 else "SELL")
-    return {"score":votes_sum,"max_score":max_possible,"confidence":confidence,"direction":direction,"explanation":explanation}
+# -------------------- Голосование индикаторов --------------------
+def indicator_vote(latest: pd.Series) -> dict:
+    score = 0
+    if latest['ema9'] > latest['ema21']:
+        score += 1
+    else:
+        score -=1
+    if latest['rsi14'] < 30: score += 1
+    elif latest['rsi14'] > 70: score -=1
+    if latest['hammer']: score += 1
+    if latest['shooting_star']: score -=1
+    if latest['doji']: score += 0  # нейтрально
+    direction = "BUY" if score > 0 else ("SELL" if score < 0 else "HOLD")
+    confidence = min(100, abs(score)*20 + 40)
+    return {"direction": direction, "confidence": confidence}
 
 # -------------------- График --------------------
 def plot_chart(df: pd.DataFrame) -> io.BytesIO:
     plot_df = df[['open','high','low','close','volume']].tail(150)
     addplots = [mpf.make_addplot(df['ema9'].tail(150)), mpf.make_addplot(df['ema21'].tail(150))]
-    if 'bb_upper' in df and 'bb_lower' in df:
-        addplots.append(mpf.make_addplot(df['bb_upper'].tail(150)))
-        addplots.append(mpf.make_addplot(df['bb_lower'].tail(150)))
     buf = io.BytesIO()
-    mpf.plot(plot_df,type='candle',style='yahoo',volume=True,addplot=addplots,savefig=buf,tight_layout=True)
+    mpf.plot(plot_df, type='candle', style='yahoo', volume=True, addplot=addplots, savefig=buf)
     buf.seek(0)
     return buf
 
-# -------------------- Автономная рассылка --------------------
-async def send_signal_to_all(pair, timeframe):
-    df = fetch_ohlcv_yf(pair, timeframe)
-    if df.empty:
-        return
+# -------------------- Отправка сигналов --------------------
+async def send_signal(pair, timeframe, chat_id):
+    df = fetch_ohlcv(pair, timeframe)
     df_ind = compute_indicators(df)
     latest = df_ind.iloc[-1]
-    res = indicator_vote(latest, df_ind)
-    if res["confidence"] < 60:
-        return
+    vote = indicator_vote(latest)
+    sr = support_resistance(df_ind)
     chart_buf = plot_chart(df_ind)
     dir_map = {"BUY":"🔺 ПОКУПКА","SELL":"🔻 ПРОДАЖА","HOLD":"⚠️ НЕОДНОЗНАЧНО"}
-    text = (f"📊 Торговый сигнал\nПара: {pair}\nТаймфрейм: {timeframe} мин\n"
-            f"Направление: {dir_map[res['direction']]}\nУверенность: {res['confidence']}%")
-    users = load_users()
-    for user_id in users:
-        try:
-            await bot.send_photo(chat_id=user_id, photo=chart_buf, caption=text)
-        except Exception as e:
-            print(f"Ошибка при отправке {user_id}: {e}")
+    text = (
+        f"📊 Сигнал\nПара: {pair}\nТаймфрейм: {timeframe} мин\n"
+        f"Направление: {dir_map[vote['direction']]}\nУверенность: {vote['confidence']}%\n"
+        f"Поддержка: {sr['support']:.5f}\nСопротивление: {sr['resistance']:.5f}"
+    )
+    await bot.send_photo(chat_id=chat_id, photo=chart_buf, caption=text)
 
-async def main_loop():
-    while True:
-        for pair in PAIRS:
-            for timeframe in EXPIRATIONS:
-                try:
-                    await send_signal_to_all(pair, timeframe)
-                except Exception as e:
-                    print(f"Ошибка {pair} {timeframe} мин: {e}")
-        await asyncio.sleep(60)
+# -------------------- Обработка выбора пользователя --------------------
+user_selection = {}
+
+@dp.message_handler()
+async def handle_selection(message: types.Message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    if text in PAIRS:
+        user_selection[user_id] = {"pair": text}
+        await message.reply("Вы выбрали пару. Теперь выберите таймфрейм (1,3,5,10 мин).")
+    elif text.replace(" мин","").isdigit():
+        if user_id in user_selection:
+            tf = int(text.replace(" мин",""))
+            user_selection[user_id]["timeframe"] = tf
+            pair = user_selection[user_id]["pair"]
+            await message.reply(f"Отправляю сигнал для {pair} на {tf} мин...")
+            await send_signal(pair, tf, user_id)
+        else:
+            await message.reply("Сначала выберите валютную пару.")
+    else:
+        await message.reply("Выберите валютную пару или таймфрейм с клавиатуры.")
 
 # -------------------- Запуск --------------------
-async def main():
-    from aiogram import F
-    from aiogram.client.session.aiohttp import AiohttpSession
-    # запуск бота
-    await dp.start_polling(bot)
-
-if __name__=="__main__":
-    asyncio.run(main())
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True)
