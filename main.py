@@ -5,6 +5,7 @@ import pandas as pd
 import yfinance as yf
 import pandas_ta as ta
 import logging
+import mplfinance as mpf # Импорт оставлен, если вы захотите добавить графики
 
 # --- Импорты aiogram ---
 from aiogram import Bot, Dispatcher, types
@@ -34,7 +35,6 @@ PAIRS_PER_PAGE = 6
 USERS_FILE = "users.txt"
 
 # -------------------- Бот и диспетчер --------------------
-# Используем MemoryStorage, так как мы используем Polling
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -99,14 +99,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     
     if user_id in load_users():
-        # Пользователь уже активирован
         await state.set_state(Form.choosing_pair)
         await message.answer(
             "С возвращением! Выбери валютную пару:",
             reply_markup=get_pairs_keyboard(0)
         )
     else:
-        # Пользователь не активирован, отправляем реферальную ссылку
         await state.set_state(Form.waiting_for_referral)
         
         referral_text = (
@@ -131,7 +129,6 @@ async def process_referral_check(message: types.Message, state: FSMContext):
 
     is_valid = False
     
-    # Заглушка: если прислано число больше 4 цифр, считаем это ID
     if user_input.isdigit() and len(user_input) > 4:
         is_valid = True
     
@@ -180,45 +177,49 @@ async def pair_handler(query: types.CallbackQuery, state: FSMContext):
 async def tf_handler(query: types.CallbackQuery, state: FSMContext):
     _, pair, tf = query.data.split(":")
     tf = int(tf)
-    await query.message.edit_text(f"Выбраны {pair} и {tf} мин. Идет загрузка сигнала...")
     
+    # Сначала отвечаем на query, чтобы не получить TelegramBadRequest, 
+    # так как загрузка данных может быть долгой.
+    await query.answer("Идет загрузка сигнала...", show_alert=False) 
+    
+    # Редактируем сообщение, чтобы показать процесс
+    message_to_edit = await query.message.edit_text(f"Выбраны {pair} и {tf} мин. Идет загрузка сигнала...")
+
     try:
-        await send_signal(pair, tf, query.message.chat.id, query.message.message_id)
+        # Передаем message_to_edit для редактирования
+        await send_signal(pair, tf, message_to_edit.chat.id, message_to_edit.message_id)
     except Exception as e:
-        # Критическая ошибка, которую не обработал send_signal
         error_text = f"❌ **Критическая ошибка.** Не удалось обработать сигнал. Пожалуйста, попробуйте снова или выберите другую пару."
         await bot.edit_message_text(
-            chat_id=query.message.chat.id, 
-            message_id=query.message.message_id, 
+            chat_id=message_to_edit.chat.id, 
+            message_id=message_to_edit.message_id, 
             text=error_text, 
             parse_mode="Markdown"
         )
         logging.error(f"Критическая ошибка в tf_handler: {e}")
         
     await state.clear()
-    await query.answer()
+
 
 # -------------------- Получение свечей --------------------
 def fetch_ohlcv(symbol: str, exp_minutes: int, limit=CANDLES_LIMIT) -> pd.DataFrame:
     interval = "1m"
     try:
-        # YFinance использует котировки Forex через символ=X (например, EURUSD=X)
         df = yf.download(f"{symbol}=X", period="2d", interval=interval, progress=False)
     except Exception as e:
         logging.error(f"Ошибка загрузки данных YFinance для {symbol}: {e}")
         return pd.DataFrame() 
 
-    # Проверка, что YFinance вернул полный набор OHLCV
     required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+    # Проверка на наличие нужных колонок
     if not all(col in df.columns for col in required_cols):
-        logging.warning(f"Не все OHLCV столбцы найдены для {symbol}. Загрузка не удалась.")
+        logging.warning(f"Не все OHLCV столбцы найдены для {symbol}.")
         return pd.DataFrame()
 
-    # Перевод столбцов в нижний регистр для Pandas-TA
+    # Перевод столбцов в нижний регистр 
     df = df[required_cols] 
     df.columns = [col.lower() for col in required_cols]
     
-    # Ресэмплинг для более высоких таймфреймов
     if exp_minutes > 1 and not df.empty:
         df = df.resample(f"{exp_minutes}min").agg({
             'open':'first','high':'max','low':'min','close':'last','volume':'sum'
@@ -235,9 +236,9 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['ema21'] = ta.ema(df['close'], length=21)
     df['sma50'] = ta.sma(df['close'], length=50)
     
-    # Исправление: Проверка на None для MACD, STOCH, BBANDS
+    # MACD (Усиленная проверка)
     macd = ta.macd(df['close'])
-    if macd is not None:
+    if macd is not None and 'MACD_12_26_9' in macd.columns:
         df['macd'] = macd['MACD_12_26_9']
         df['macd_signal'] = macd['MACDs_12_26_9']
     else:
@@ -247,7 +248,8 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # Осцилляторы
     df['rsi14'] = ta.rsi(df['close'], length=14)
     stoch = ta.stoch(df['high'], df['low'], df['close'])
-    if stoch is not None:
+    # STOCH (Усиленная проверка)
+    if stoch is not None and 'STOCHk_14_3_3' in stoch.columns:
         df['stoch_k'] = stoch['STOCHk_14_3_3']
         df['stoch_d'] = stoch['STOCHd_14_3_3']
     else:
@@ -257,28 +259,34 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['cci20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
     df['mom10'] = ta.mom(df['close'], length=10)
     
-    # Волатильность
+    # Волатильность (Боллинджер - Усиленная проверка)
     bb = ta.bbands(df['close'])
-    if bb is not None:
+    if bb is not None and 'BBU_20_2.0' in bb.columns: 
         df['bb_upper'] = bb['BBU_20_2.0']
         df['bb_lower'] = bb['BBL_20_2.0']
     else:
         df['bb_upper'] = float('nan')
         df['bb_lower'] = float('nan')
+        
+    # ATR и ADX (Обертываем в try/except на случай ошибок индексации)
+    try:
+        df['atr14'] = ta.atr(df['high'], df['low'], df['close'])
+        df['adx14'] = ta.adx(df['high'], df['low'], df['close'])['ADX_14']
+    except Exception:
+        df['atr14'] = float('nan')
+        df['adx14'] = float('nan')
 
-    df['atr14'] = ta.atr(df['high'], df['low'], df['close'])
-    df['adx14'] = ta.adx(df['high'], df['low'], df['close'])['ADX_14']
     df['obv'] = ta.obv(df['close'], df['volume'])
     
     # Свечные паттерны
     df['hammer'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['close']-df['low'])/(.001+df['high']-df['low'])>0.6)
     df['shooting_star'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['high']-df['close'])/(.001+df['high']-df['low'])>0.6)
     
+    # Возвращаем только полностью рассчитанные строки
     return df.dropna()
 
 # -------------------- Поддержка/Сопротивление --------------------
 def support_resistance(df: pd.DataFrame) -> dict:
-    """Расчет простых уровней S/R."""
     levels = {}
     levels['support'] = df['low'].rolling(20).min().iloc[-1]
     levels['resistance'] = df['high'].rolling(20).max().iloc[-1]
@@ -286,7 +294,6 @@ def support_resistance(df: pd.DataFrame) -> dict:
 
 # -------------------- Голосование индикаторов --------------------
 def indicator_vote(latest: pd.Series) -> dict:
-    """Простейшая логика голосования для определения направления и уверенности."""
     score = 0
     
     # Трендовые
@@ -294,8 +301,8 @@ def indicator_vote(latest: pd.Series) -> dict:
     else: score -=1
     
     # Осцилляторы
-    if latest['rsi14'] < 30: score += 1 # Перепроданность -> BUY
-    elif latest['rsi14'] > 70: score -=1 # Перекупленность -> SELL
+    if latest['rsi14'] < 30: score += 1 
+    elif latest['rsi14'] > 70: score -=1 
     
     # Паттерны
     if latest['hammer']: score += 1
@@ -308,7 +315,6 @@ def indicator_vote(latest: pd.Series) -> dict:
 # -------------------- Отправка сигнала --------------------
 async def send_signal(pair: str, timeframe: int, chat_id: int, message_id: int):
     
-    # 1. Загрузка и анализ данных
     df = fetch_ohlcv(pair, timeframe)
     
     # Проверка 1: Получили ли мы достаточно данных?
@@ -326,7 +332,7 @@ async def send_signal(pair: str, timeframe: int, chat_id: int, message_id: int):
     
     # Проверка 2: Получили ли мы рассчитанные индикаторы?
     if df_ind.empty:
-        error_text = f"❌ **Ошибка.** Индикаторы не рассчитаны (недостаточно полных данных после очистки)."
+        error_text = f"❌ **Ошибка.** Индикаторы не рассчитаны (недостаточно полных данных после очистки). Попробуйте меньший таймфрейм."
         await bot.edit_message_text(
             chat_id=chat_id, 
             message_id=message_id, 
@@ -380,9 +386,10 @@ def main():
 
     logging.info("--- ЗАПУСК В РЕЖИМЕ ПОЛЛИНГА ---")
     
-    # Используем asyncio.run для запуска Polling
     try:
-        asyncio.run(dp.start_polling(bot))
+        # Установка флага drop_pending_updates=True гарантирует, что 
+        # бот не будет обрабатывать старые, накопившиеся сообщения
+        asyncio.run(dp.start_polling(bot, drop_pending_updates=True))
     except KeyboardInterrupt:
         logging.info("Бот остановлен вручную.")
     except Exception as e:
