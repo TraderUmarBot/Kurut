@@ -18,10 +18,10 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder 
-from aiogram.methods import DeleteWebhook, SetWebhook
+from aiogram.methods import DeleteWebhook, SetWebhook # SetWebhook добавлен явно
 from aiogram.client.default import DefaultBotProperties
 from aiogram.webhook.aiohttp_server import setup_application
-from aiohttp import web # Важный импорт для ручного запуска V2
+from aiohttp import web 
 
 # -------------------- Конфиг (WEBHOOK) --------------------
 # Переменные читаются из Env Vars. URL формируется автоматически.
@@ -33,9 +33,14 @@ WEB_SERVER_PORT = int(os.environ.get("PORT", 10000))
 WEB_SERVER_HOST = os.environ.get("WEB_SERVER_HOST", "0.0.0.0") 
 RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME") 
 
-# Формирование URL для Webhook
-WEBHOOK_PATH = f"/webhook/{TG_TOKEN}" if TG_TOKEN else "/webhook"
-WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}" if RENDER_EXTERNAL_HOSTNAME else None
+# --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ ПУТИ WEBHOOK ---
+# Путь Webhook должен начинаться с косой черты (/)
+if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
+    logging.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Не задан TG_TOKEN или RENDER_EXTERNAL_HOSTNAME. Выход.")
+    sys.exit(1)
+
+WEBHOOK_PATH = f"/webhook/{TG_TOKEN}" 
+WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 
 # ОСТАЛЬНЫЕ КОНСТАНТЫ
 PAIRS = [
@@ -53,6 +58,7 @@ DB_FILE = "trades.db"
 # -------------------- Бот и диспетчер --------------------
 bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher(storage=MemoryStorage())
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # -------------------- FSM (Состояния) --------------------
 class Form(StatesGroup):
@@ -63,22 +69,26 @@ class Form(StatesGroup):
 # -------------------- База данных (SQLite) --------------------
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            pair TEXT NOT NULL,
-            timeframe INTEGER NOT NULL,
-            result TEXT, -- 'PLUS' или 'MINUS'
-            direction TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                pair TEXT NOT NULL,
+                timeframe INTEGER NOT NULL,
+                result TEXT, -- 'PLUS' или 'MINUS'
+                direction TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"Ошибка инициализации БД: {e}")
 
+# Функции save_trade, update_trade_result, get_user_stats (без изменений)
 def save_trade(user_id: int, pair: str, timeframe: int, direction: str) -> int:
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -116,7 +126,6 @@ def get_user_stats(user_id: int) -> Dict[str, Any]:
     for pair, result, count in pair_stats:
         if pair not in formatted_pair_stats:
             formatted_pair_stats[pair] = {'PLUS': 0, 'MINUS': 0}
-        # Убедимся, что ключ существует, прежде чем увеличивать
         if result in formatted_pair_stats[pair]:
             formatted_pair_stats[pair][result] = count
 
@@ -125,6 +134,7 @@ def get_user_stats(user_id: int) -> Dict[str, Any]:
         'total_minus': stats.get('MINUS', 0),
         'pair_stats': formatted_pair_stats
     }
+
 
 # -------------------- Пользователи (для проверки реферала) --------------------
 def load_users() -> set:
@@ -138,10 +148,12 @@ def save_user(user_id: int):
     users = load_users()
     if user_id not in users:
         users.add(user_id)
-        with open(USERS_FILE, "a") as f: 
-            f.write(f"{user_id}\n")
+        # Используем "w" (write) с перезаписью, чтобы избежать дубликатов в логах
+        # Если файл большой, лучше использовать "a" (append), но для этого проекта "w" безопаснее.
+        with open(USERS_FILE, "w") as f: 
+            f.writelines(f"{uid}\n" for uid in users)
 
-# -------------------- Клавиатуры --------------------
+# -------------------- Клавиатуры (без изменений) --------------------
 
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -196,7 +208,6 @@ def get_timeframes_keyboard(pair: str) -> InlineKeyboardMarkup:
 async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     
-    # Проверка пользователя
     if user_id in load_users():
         await state.clear()
         await message.answer(
@@ -204,7 +215,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
             reply_markup=get_main_menu_keyboard()
         )
     else:
-        # Требуется реферальная проверка
         await state.set_state(Form.waiting_for_referral)
         referral_text = (
             "🚀 **Привет! Для получения торговых сигналов тебе необходимо зарегистрироваться "
@@ -282,7 +292,6 @@ async def trade_result_handler(query: types.CallbackQuery, state: FSMContext):
     
     icon = "✅" if result == "PLUS" else "❌"
     
-    # Редактируем сообщение, чтобы убрать кнопки и показать результат
     await query.message.edit_reply_markup(reply_markup=None)
     
     keyboard = InlineKeyboardBuilder()
@@ -303,6 +312,7 @@ async def trade_result_handler(query: types.CallbackQuery, state: FSMContext):
 async def process_referral_check(message: types.Message, state: FSMContext):
     user_input = message.text.strip()
     user_id = message.from_user.id
+    # Простая проверка на то, что это цифры и похоже на ID
     is_valid = user_input.isdigit() and len(user_input) > 4
 
     if is_valid:
@@ -362,12 +372,11 @@ async def tf_handler(query: types.CallbackQuery, state: FSMContext):
         
     await state.clear() 
 
-# -------------------- Получение свечей и Индикаторы --------------------
+# -------------------- Получение свечей и Индикаторы (без изменений) --------------------
 
 def fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
     interval = "1m"
     try:
-        # Используем =X для получения данных форекс через Yahoo Finance
         df = yf.download(f"{symbol}=X", period="5d", interval=interval, progress=False) 
     except Exception as e:
         logging.error(f"Ошибка загрузки данных YFinance для {symbol}: {e}")
@@ -381,7 +390,6 @@ def fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
     df.columns = [col.lower() for col in required_cols]
     
     if exp_minutes > 1 and not df.empty:
-        # Ресемплирование (консолидация) минутных свечей в нужный таймфрейм
         df = df.resample(f"{exp_minutes}min").agg({
             'open':'first','high':'max','low':'min','close':'last','volume':'sum'
         }).dropna()
@@ -391,41 +399,31 @@ def fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     
-    # Скользящие средние
     df['ema9'] = ta.ema(df['close'], length=9)
     df['ema21'] = ta.ema(df['close'], length=21)
     df['sma50'] = ta.sma(df['close'], length=50)
     
-    # MACD
     macd = ta.macd(df['close'])
     df['macd'] = macd['MACD_12_26_9']
     df['macd_signal'] = macd['MACDs_12_26_9']
     
-    # RSI (Relative Strength Index)
     df['rsi14'] = ta.rsi(df['close'], length=14)
     
-    # Stochastic Oscillator
     stoch = ta.stoch(df['high'], df['low'], df['close'])
     df['stoch_k'] = stoch['STOCHk_14_3_3']
     df['stoch_d'] = stoch['STOCHd_14_3_3']
 
-    # CCI (Commodity Channel Index)
     df['cci20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
     
-    # Bollinger Bands
     bb = ta.bbands(df['close'])
     df['bb_upper'] = bb['BBU_20_2.0']
     df['bb_lower'] = bb['BBL_20_2.0']
         
-    # ADX (Average Directional Index) и ATR
     adx_df = ta.adx(df['high'], df['low'], df['close'])
     df['atr14'] = ta.atr(df['high'], df['low'], df['close'])
     df['adx14'] = adx_df['ADX_14']
     
-    # Паттерны свечей (упрощенные)
-    # Hammer
     df['hammer'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['close']-df['low'])/(.001+df['high']-df['low'])>0.6)
-    # Shooting Star
     df['shooting_star'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['high']-df['close'])/(.001+df['high']-df['low'])>0.6)
     
     critical_cols = ['ema9', 'ema21', 'macd', 'rsi14', 'stoch_k', 'adx14']
@@ -434,7 +432,6 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df_cleaned.tail(100)
 
 def support_resistance(df: pd.DataFrame) -> Dict[str, float]:
-    """Находит простую поддержку/сопротивление на основе последних 20 свечей."""
     levels = {}
     df_sr = df.tail(20) 
     if not df_sr.empty:
@@ -446,24 +443,22 @@ def support_resistance(df: pd.DataFrame) -> Dict[str, float]:
     return levels
 
 def indicator_vote(latest: pd.Series) -> Dict[str, Any]:
-    """Система голосования индикаторов для принятия решения."""
     score = 0
-    
     is_trending = latest['adx14'] > 25
     
     # 1. Анализ тренда (EMA и SMA)
     if is_trending:
         if latest['ema9'] > latest['ema21'] and latest['close'] > latest['sma50']:
-            score += 2 # Сильный BUY
+            score += 2 
         elif latest['ema9'] < latest['ema21'] and latest['close'] < latest['sma50']:
-            score -= 2 # Сильный SELL
+            score -= 2 
     
     # 2. Анализ осцилляторов (RSI и Stochastic)
     is_oversold = (latest['rsi14'] < 30) and (latest['stoch_k'] < 20)
     is_overbought = (latest['rsi14'] > 70) and (latest['stoch_k'] > 80)
     
-    if is_oversold: score += 1 # BUY сигнал от осцилляторов
-    if is_overbought: score -= 1 # SELL сигнал от осцилляторов
+    if is_oversold: score += 1 
+    if is_overbought: score -= 1 
 
     # 3. Анализ паттернов
     if latest['hammer']: score += 1
@@ -477,7 +472,6 @@ def indicator_vote(latest: pd.Series) -> Dict[str, Any]:
     else:
         direction = "HOLD" 
 
-    # Расчет уверенности (простая линейная зависимость)
     confidence = min(100, abs(score) * 20 + 40)
     
     return {"direction": direction, "confidence": confidence, "score": score}
@@ -503,7 +497,6 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
     res = indicator_vote(latest)
     sr = support_resistance(df_ind)
     
-    # Сохраняем сделку в базу, чтобы потом записать результат
     trade_id = save_trade(user_id, pair, timeframe, res['direction'])
 
     dir_map = {"BUY":"🔺 ПОКУПКА","SELL":"🔻 ПРОДАЖА","HOLD":"⚠️ НЕОДНОЗНАЧНО"}
@@ -528,20 +521,21 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
     except Exception as e:
         logging.error(f"Ошибка при редактировании сообщения пользователю {chat_id}: {e}")
 
-# -------------------- БЛОК ЗАПУСКА WEBHOOK (ИСПРАВЛЕННО НА V2-СИНТАКСИС) --------------------
+# -------------------- БЛОК ЗАПУСКА WEBHOOK (ФИНАЛЬНЫЙ) --------------------
 
 async def on_startup_webhook(bot: Bot):
-    # При старте мы явно удаляем старый Webhook, если он есть
-    await bot(DeleteWebhook(drop_pending_updates=True))
-    if WEBHOOK_URL:
-        # И устанавливаем новый
-        await bot(SetWebhook(url=WEBHOOK_URL))
-        logging.info(f"✅ Webhook успешно переустановлен: {WEBHOOK_URL}")
-    else:
-        logging.error("❌ Webhook URL не определен. Невозможно установить Webhook.")
+    # Явно удаляем и устанавливаем Webhook
+    try:
+        await bot(DeleteWebhook(drop_pending_updates=True))
+        if WEBHOOK_URL:
+            await bot(SetWebhook(url=WEBHOOK_URL))
+            logging.info(f"✅ Webhook успешно переустановлен: {WEBHOOK_URL}")
+        else:
+            logging.error("❌ Webhook URL не определен. Невозможно установить Webhook.")
+    except Exception as e:
+        logging.error(f"Ошибка в on_startup_webhook: {e}")
 
 async def on_shutdown_webhook(bot: Bot):
-    # При завершении работы удаляем Webhook
     try:
         await bot(DeleteWebhook(drop_pending_updates=True))
     except Exception as e:
@@ -550,43 +544,34 @@ async def on_shutdown_webhook(bot: Bot):
 
 
 async def start_webhook():
-    """Главная асинхронная функция, явно запускающая Webhook-сервер (СИНТАКСИС V2)."""
+    """Главная асинхронная функция для запуска Webhook-сервера aiohttp."""
     
-    if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
-        logging.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Не задан TG_TOKEN или RENDER_EXTERNAL_HOSTNAME. Выход.")
-        sys.exit(1)
-        
     init_db() 
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
+    
     logging.info(f"--- ЗАПУСК WEBHOOK СЕРВЕРА V2: {WEBHOOK_URL} ---")
     
-    # Регистрация обработчиков Webhook
     dp.startup.register(on_startup_webhook)
     dp.shutdown.register(on_shutdown_webhook)
-    
-    # -------------------------------------------------------------
-    # АЛЬТЕРНАТИВНЫЙ ЗАПУСК ДЛЯ AIOGRAM V2/V3 (ЧЕРЕЗ AIOHTTP)
-    # -------------------------------------------------------------
     
     # Создаем aiohttp Web Application
     app = web.Application()
     
-    # Настраиваем, чтобы наш Диспетчер обрабатывал запросы по пути WEBHOOK_PATH
+    # Настраиваем Диспетчер для обработки запросов по пути WEBHOOK_PATH
     setup_application(app, dp, bot=bot, path=WEBHOOK_PATH)
     
     try:
-        # Запускаем aiohttp Web Server (низкоуровневый запуск)
+        # Запускаем aiohttp Web Server
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, host=WEB_SERVER_HOST, port=WEB_SERVER_PORT)
         await site.start()
         logging.info(f"🌐 Сервер запущен на {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
         
-        # Ждем завершения работы (нужно для того, чтобы приложение Render не завершилось)
+        # Ждем, пока сервис не будет остановлен Render
         await asyncio.Event().wait() 
 
     except Exception as e:
+        # Это должно быть устранено, но оставляем на случай непредвиденных проблем
         logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА ЗАПУСКА WEBHOOK-СЕРВЕРА: {e}")
         sys.exit(1) 
 
@@ -599,4 +584,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
