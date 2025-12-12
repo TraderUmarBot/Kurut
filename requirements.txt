@@ -1,4 +1,6 @@
-aiogram
+aiogram==3.4.1 # Фиксируем версию 3.x
+aiohttp
 pandas
-yfinance 
+yfinance
 pandas-ta
+sqlite3
