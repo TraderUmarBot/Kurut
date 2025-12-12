@@ -1,4 +1,4 @@
-# main.py - ФИНАЛЬНЫЙ, ПОЛНОСТЬЮ ФУНКЦИОНАЛЬНЫЙ КОД (WEBHOOK Mode)
+# main.py - ОКОНЧАТЕЛЬНАЯ ВЕРСИЯ (ИСПРАВЛЕННЫЙ WEBHOOK)
 
 import os
 import asyncio
@@ -515,7 +515,7 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
     except Exception as e:
         logging.error(f"Ошибка при редактировании сообщения пользователю {chat_id}: {e}")
 
-# -------------------- БЛОК ЗАПУСКА WEBHOOK (УСТОЙЧИВЫЙ) --------------------
+# -------------------- БЛОК ЗАПУСКА WEBHOOK (УСТОЙЧИВЫЙ И ИСПРАВЛЕННЫЙ) --------------------
 
 async def on_startup_webhook(bot: Bot):
     """
@@ -553,9 +553,9 @@ async def start_webhook():
     dp.startup.register(on_startup_webhook)
     dp.shutdown.register(on_shutdown_webhook)
     
-    # Явный запуск aiohttp Web Server (самый устойчивый метод)
+    # Явный запуск aiohttp Web Server - ИСПРАВЛЕНО НА run_webhook
     try:
-        await dp.start_webhook(
+        await dp.run_webhook( # <--- ИСПРАВЛЕНО
             bot=bot,
             webhook_url=WEBHOOK_URL,
             host=WEB_SERVER_HOST,
