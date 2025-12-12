@@ -1,4 +1,4 @@
-aiogram==3.4.1 # Фиксируем версию 3.x
+aiogram
 aiohttp
 pandas
 yfinance
