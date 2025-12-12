@@ -1,4 +1,4 @@
-# main.py - ОКОНЧАТЕЛЬНАЯ ВЕРСИЯ (ИСПРАВЛЕННЫЙ WEBHOOK)
+# main.py - ОКОНЧАТЕЛЬНАЯ ВЕРСИЯ БОТА KURUT TRADE (WEBHOOK)
 
 import os
 import asyncio
@@ -8,6 +8,7 @@ import pandas_ta as ta
 import logging
 import sqlite3 
 import sys 
+from typing import Dict, Any, List
 
 # --- Импорты aiogram ---
 from aiogram import Bot, Dispatcher, types
@@ -77,7 +78,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-def save_trade(user_id: int, pair: str, timeframe: int, direction: str):
+def save_trade(user_id: int, pair: str, timeframe: int, direction: str) -> int:
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("""
@@ -98,7 +99,7 @@ def update_trade_result(trade_id: int, result: str):
     conn.commit()
     conn.close()
 
-def get_user_stats(user_id: int) -> dict:
+def get_user_stats(user_id: int) -> Dict[str, Any]:
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
@@ -110,11 +111,13 @@ def get_user_stats(user_id: int) -> dict:
 
     conn.close()
     
-    formatted_pair_stats = {}
+    formatted_pair_stats: Dict[str, Dict[str, int]] = {}
     for pair, result, count in pair_stats:
         if pair not in formatted_pair_stats:
             formatted_pair_stats[pair] = {'PLUS': 0, 'MINUS': 0}
-        formatted_pair_stats[pair][result] = count
+        # Убедимся, что ключ существует, прежде чем увеличивать
+        if result in formatted_pair_stats[pair]:
+            formatted_pair_stats[pair][result] = count
 
     return {
         'total_plus': stats.get('PLUS', 0),
@@ -123,14 +126,14 @@ def get_user_stats(user_id: int) -> dict:
     }
 
 # -------------------- Пользователи (для проверки реферала) --------------------
-def load_users():
+def load_users() -> set:
     try:
         with open(USERS_FILE, "r") as f:
             return set(int(line.strip()) for line in f.readlines())
     except:
         return set()
 
-def save_user(user_id):
+def save_user(user_id: int):
     users = load_users()
     if user_id not in users:
         users.add(user_id)
@@ -139,7 +142,7 @@ def save_user(user_id):
 
 # -------------------- Клавиатуры --------------------
 
-def get_main_menu_keyboard():
+def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="📈 Выбрать пару", callback_data="start_trade")
     builder.button(text="📜 История сделок", callback_data="show_history")
@@ -192,6 +195,7 @@ def get_timeframes_keyboard(pair: str) -> InlineKeyboardMarkup:
 async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     
+    # Проверка пользователя
     if user_id in load_users():
         await state.clear()
         await message.answer(
@@ -199,6 +203,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
             reply_markup=get_main_menu_keyboard()
         )
     else:
+        # Требуется реферальная проверка
         await state.set_state(Form.waiting_for_referral)
         referral_text = (
             "🚀 **Привет! Для получения торговых сигналов тебе необходимо зарегистрироваться "
@@ -253,8 +258,8 @@ async def show_history_handler(query: types.CallbackQuery, state: FSMContext):
         )
         
         for pair, data in stats['pair_stats'].items():
-            plus = data['PLUS']
-            minus = data['MINUS']
+            plus = data.get('PLUS', 0)
+            minus = data.get('MINUS', 0)
             total = plus + minus
             pair_win_rate = (plus / total) * 100 if total > 0 else 0
             text += (
@@ -357,12 +362,10 @@ async def tf_handler(query: types.CallbackQuery, state: FSMContext):
     await state.clear() 
 
 # -------------------- Получение свечей и Индикаторы --------------------
-# Используется yfinance, pandas и pandas-ta (они должны быть в requirements.txt)
 
 def fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
     interval = "1m"
     try:
-        # Добавляем '=X' для корректной работы с yfinance для Forex
         df = yf.download(f"{symbol}=X", period="5d", interval=interval, progress=False) 
     except Exception as e:
         logging.error(f"Ошибка загрузки данных YFinance для {symbol}: {e}")
@@ -376,7 +379,6 @@ def fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
     df.columns = [col.lower() for col in required_cols]
     
     if exp_minutes > 1 and not df.empty:
-        # Пересчет на нужный таймфрейм
         df = df.resample(f"{exp_minutes}min").agg({
             'open':'first','high':'max','low':'min','close':'last','volume':'sum'
         }).dropna()
@@ -390,26 +392,22 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['ema21'] = ta.ema(df['close'], length=21)
     df['sma50'] = ta.sma(df['close'], length=50)
     
-    # MACD (Устойчивый расчет)
     macd = ta.macd(df['close'])
     df['macd'] = macd['MACD_12_26_9']
     df['macd_signal'] = macd['MACDs_12_26_9']
     
     df['rsi14'] = ta.rsi(df['close'], length=14)
     
-    # Stochastic (Устойчивый расчет)
     stoch = ta.stoch(df['high'], df['low'], df['close'])
     df['stoch_k'] = stoch['STOCHk_14_3_3']
     df['stoch_d'] = stoch['STOCHd_14_3_3']
 
     df['cci20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
     
-    # Bollinger Bands
     bb = ta.bbands(df['close'])
     df['bb_upper'] = bb['BBU_20_2.0']
     df['bb_lower'] = bb['BBL_20_2.0']
         
-    # ADX/ATR
     adx_df = ta.adx(df['high'], df['low'], df['close'])
     df['atr14'] = ta.atr(df['high'], df['low'], df['close'])
     df['adx14'] = adx_df['ADX_14']
@@ -418,13 +416,12 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['hammer'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['close']-df['low'])/(.001+df['high']-df['low'])>0.6)
     df['shooting_star'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['high']-df['close'])/(.001+df['high']-df['low'])>0.6)
     
-    # Чистим от NaN и берем только последние данные
     critical_cols = ['ema9', 'ema21', 'macd', 'rsi14', 'stoch_k', 'adx14']
     df_cleaned = df.dropna(subset=critical_cols)
     
     return df_cleaned.tail(100)
 
-def support_resistance(df: pd.DataFrame) -> dict:
+def support_resistance(df: pd.DataFrame) -> Dict[str, float]:
     levels = {}
     df_sr = df.tail(20) 
     if not df_sr.empty:
@@ -435,26 +432,23 @@ def support_resistance(df: pd.DataFrame) -> dict:
         levels['resistance'] = float('nan')
     return levels
 
-def indicator_vote(latest: pd.Series) -> dict:
+def indicator_vote(latest: pd.Series) -> Dict[str, Any]:
     score = 0
     
     is_trending = latest['adx14'] > 25
     
-    # Трендовая стратегия
     if is_trending:
         if latest['ema9'] > latest['ema21'] and latest['close'] > latest['sma50']:
             score += 2 # Сильный BUY
         elif latest['ema9'] < latest['ema21'] and latest['close'] < latest['sma50']:
             score -= 2 # Сильный SELL
     
-    # Контртрендовые условия (Перекупленность/Перепроданность)
     is_oversold = (latest['rsi14'] < 30) and (latest['stoch_k'] < 20)
     is_overbought = (latest['rsi14'] > 70) and (latest['stoch_k'] > 80)
     
     if is_oversold: score += 1
     if is_overbought: score -= 1
 
-    # Паттерны свечей
     if latest['hammer']: score += 1
     if latest['shooting_star']: score -= 1
             
@@ -463,9 +457,9 @@ def indicator_vote(latest: pd.Series) -> dict:
     elif score <= -2:
         direction = "SELL"
     else:
-        direction = "HOLD" # Если нет явного сигнала
+        direction = "HOLD" 
 
-    confidence = min(100, abs(score) * 20 + 40) # Расчет уверенности
+    confidence = min(100, abs(score) * 20 + 40)
     
     return {"direction": direction, "confidence": confidence, "score": score}
 
@@ -474,14 +468,14 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
     df = fetch_ohlcv(pair, timeframe)
     
     if df.empty or len(df) < 50: 
-        error_text = f"❌ **Ошибка.** Не удалось загрузить достаточно свечей (нужно >50) для {pair} {timeframe} мин. Попробуйте позже."
+        error_text = f"❌ **Ошибка.** Не удалось загрузить достаточно свечей для {pair} {timeframe} мин. Попробуйте позже."
         await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=error_text)
         return
         
     df_ind = compute_indicators(df)
     
     if df_ind.empty:
-        error_text = f"❌ **Ошибка.** Индикаторы не рассчитаны (недостаточно полных данных после очистки). Попробуйте меньший таймфрейм."
+        error_text = f"❌ **Ошибка.** Индикаторы не рассчитаны. Попробуйте меньший таймфрейм."
         await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=error_text)
         return
         
@@ -490,7 +484,6 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
     res = indicator_vote(latest)
     sr = support_resistance(df_ind)
     
-    # Сохраняем сделку в базу данных
     trade_id = save_trade(user_id, pair, timeframe, res['direction'])
 
     dir_map = {"BUY":"🔺 ПОКУПКА","SELL":"🔻 ПРОДАЖА","HOLD":"⚠️ НЕОДНОЗНАЧНО"}
@@ -515,12 +508,9 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
     except Exception as e:
         logging.error(f"Ошибка при редактировании сообщения пользователю {chat_id}: {e}")
 
-# -------------------- БЛОК ЗАПУСКА WEBHOOK (УСТОЙЧИВЫЙ И ИСПРАВЛЕННЫЙ) --------------------
+# -------------------- БЛОК ЗАПУСКА WEBHOOK (ИСПРАВЛЕННО) --------------------
 
 async def on_startup_webhook(bot: Bot):
-    """
-    Принудительно устанавливает Webhook перед запуском сервера.
-    """
     if WEBHOOK_URL:
         await bot(DeleteWebhook(drop_pending_updates=True))
         await bot(SetWebhook(url=WEBHOOK_URL))
@@ -529,7 +519,6 @@ async def on_startup_webhook(bot: Bot):
         logging.error("❌ Webhook URL не определен. Невозможно установить Webhook.")
 
 async def on_shutdown_webhook(bot: Bot):
-    """Удаляет webhook URL при завершении работы."""
     try:
         await bot(DeleteWebhook(drop_pending_updates=True))
     except Exception as e:
@@ -538,9 +527,7 @@ async def on_shutdown_webhook(bot: Bot):
 
 
 async def start_webhook():
-    """Главная асинхронная функция, явно запускающая Webhook-сервер."""
     
-    # Проверка обязательных переменных
     if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
         logging.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Не задан TG_TOKEN или RENDER_EXTERNAL_HOSTNAME. Выход.")
         sys.exit(1)
@@ -555,7 +542,7 @@ async def start_webhook():
     
     # Явный запуск aiohttp Web Server - ИСПРАВЛЕНО НА run_webhook
     try:
-        await dp.run_webhook( # <--- ИСПРАВЛЕНО
+        await dp.run_webhook( # <--- ИСПРАВЛЕННАЯ ФУНКЦИЯ ДЛЯ AIOGRAM 3.X
             bot=bot,
             webhook_url=WEBHOOK_URL,
             host=WEB_SERVER_HOST,
@@ -568,7 +555,6 @@ async def start_webhook():
         sys.exit(1) 
 
 def main():
-    """Точка входа в программу."""
     try:
         asyncio.run(start_webhook())
     except Exception as e:
