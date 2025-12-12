@@ -1,4 +1,4 @@
-# main.py (Исправленная версия)
+# main.py
 import os
 import io
 import asyncio
@@ -8,18 +8,19 @@ import yfinance as yf
 import pandas_ta as ta
 import mplfinance as mpf
 
+# --- Импорты aiogram и aiohttp ---
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-# ИМПОРТИРУЕМ НОВЫЙ КЛАСС ДЛЯ УДОБНОГО ПОСТРОЕНИЯ КЛАВИАТУР В AIOGRAM 3.X
-from aiogram.utils.keyboard import InlineKeyboardBuilder 
+from aiogram.utils.keyboard import InlineKeyboardBuilder # <-- Исправление Pydantic ошибки
+# from aiohttp import web # aiogram 3.x может запустить Aiohttp через dp.run_app
 
 # -------------------- Конфиг --------------------
-# Я оставляю токен как есть, предполагая, что он будет загружен из переменной среды на Render
-TG_TOKEN = os.getenv("TG_TOKEN") or "ВАШ_TELEGRAM_TOKEN" 
+# Используйте переменные окружения Render
+TG_TOKEN = os.getenv("TG_TOKEN") or "ВАШ_TELEGRAM_TOKEN"
 CANDLES_LIMIT = 500
 
 PAIRS = [
@@ -32,6 +33,22 @@ TIMEFRAMES = [1, 3, 5, 10]  # минуты
 PAIRS_PER_PAGE = 6
 
 USERS_FILE = "users.txt"
+
+# -------------------- Конфиг Webhook для Render --------------------
+
+# Render автоматически устанавливает PORT. Нам нужно его использовать.
+WEB_SERVER_HOST = "0.0.0.0"
+WEB_SERVER_PORT = int(os.environ.get("PORT", 8080))
+
+# ВАЖНО: Установите эту переменную окружения (WEBHOOK_URL) на Render
+# Пример: https://your-service-name.onrender.com
+BASE_WEBHOOK_URL = os.environ.get("WEBHOOK_URL") 
+if not BASE_WEBHOOK_URL:
+    print("!!! ВНИМАНИЕ: Переменная WEBHOOK_URL не установлена. Замените заглушку в коде. !!!")
+    BASE_WEBHOOK_URL = "https://<ЗДЕСЬ_ВАШ_URL_RENDER>.onrender.com" 
+
+WEBHOOK_PATH = f"/webhook/{TG_TOKEN}"
+WEBHOOK_URL = BASE_WEBHOOK_URL + WEBHOOK_PATH
 
 # -------------------- Бот и диспетчер --------------------
 bot = Bot(token=TG_TOKEN)
@@ -58,51 +75,44 @@ def save_user(user_id):
             for u in users:
                 f.write(f"{u}\n")
 
-# -------------------- Клавиатуры --------------------
-
-# ИСПРАВЛЕННАЯ ФУНКЦИЯ ДЛЯ КЛАВИАТУРЫ ПАР
+# -------------------- Клавиатуры (Исправлено) --------------------
 def get_pairs_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     start = page * PAIRS_PER_PAGE
     end = start + PAIRS_PER_PAGE
     
-    # Используем Builder для удобной и правильной инициализации в aiogram 3.x
+    # Используем Builder для корректной валидации Pydantic
     builder = InlineKeyboardBuilder() 
     
     # Добавляем кнопки пар, разбивая их на ряды по 2
     for pair in PAIRS[start:end]:
         builder.button(text=pair, callback_data=f"pair:{pair}")
     
-    # Устанавливаем макет (layout) для кнопок: 2 кнопки в ряд
-    builder.adjust(2) 
+    builder.adjust(2) # Устанавливаем макет: 2 кнопки в ряд
     
-    # Навигационные кнопки
     nav_buttons = []
     if page > 0:
         nav_buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"page:{page-1}"))
     if end < len(PAIRS):
         nav_buttons.append(InlineKeyboardButton(text="➡️ Вперед", callback_data=f"page:{page+1}"))
     
-    # Добавляем навигационный ряд, если он есть
     if nav_buttons:
         builder.row(*nav_buttons) 
     
     return builder.as_markup() # Возвращаем готовый объект InlineKeyboardMarkup
 
-# ИСПРАВЛЕННАЯ ФУНКЦИЯ ДЛЯ КЛАВИАТУРЫ ТАЙМФРЕЙМОВ
 def get_timeframes_keyboard(pair: str) -> InlineKeyboardMarkup:
+    # Используем Builder для корректной валидации Pydantic
     builder = InlineKeyboardBuilder()
     
     # Добавляем кнопки таймфреймов
     for tf in TIMEFRAMES:
         builder.button(text=f"{tf} мин", callback_data=f"tf:{pair}:{tf}")
     
-    # Разбиваем на ряды по 2 кнопки
-    builder.adjust(2) 
+    builder.adjust(2) # Разбиваем на ряды по 2 кнопки
 
-    return builder.as_markup() # Возвращаем готовый объект InlineKeyboardMarkup
+    return builder.as_markup()
 
-
-# -------------------- Обработчики (остаются без изменений) --------------------
+# -------------------- Обработчики --------------------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     save_user(message.from_user.id)
@@ -137,16 +147,16 @@ async def tf_handler(query: types.CallbackQuery, state: FSMContext):
     _, pair, tf = query.data.split(":")
     tf = int(tf)
     await query.message.edit_text(f"Выбраны {pair} и {tf} мин. Идет загрузка сигнала...")
-    await send_signal(pair, tf)
+    
+    # Передаем chat_id, чтобы функция send_signal могла редактировать сообщение после загрузки
+    await send_signal(pair, tf, query.message.chat.id, query.message.message_id)
     await state.clear()
     await query.answer()
 
-# -------------------- Получение свечей (без изменений) --------------------
+# -------------------- Получение свечей --------------------
 def fetch_ohlcv(symbol: str, exp_minutes: int, limit=CANDLES_LIMIT) -> pd.DataFrame:
     interval = "1m"
-    # yfinance использует формат 'X' для FOREX, что может вызвать проблемы на некоторых парах, 
-    # но я оставлю как есть, предполагая, что он работает для вас.
-    df = yf.download(f"{symbol}=X", period="2d", interval=interval, progress=False) 
+    df = yf.download(f"{symbol}=X", period="2d", interval=interval, progress=False)
     df = df.rename(columns=str.lower)[['open','high','low','close','volume']]
     if exp_minutes > 1:
         df = df.resample(f"{exp_minutes}min").agg({
@@ -154,7 +164,7 @@ def fetch_ohlcv(symbol: str, exp_minutes: int, limit=CANDLES_LIMIT) -> pd.DataFr
         })
     return df.tail(limit)
 
-# -------------------- Индикаторы (без изменений) --------------------
+# -------------------- Индикаторы --------------------
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df['ema9'] = ta.ema(df['close'], length=9)
@@ -180,14 +190,14 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['shooting_star'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['high']-df['close'])/(.001+df['high']-df['low'])>0.6)
     return df
 
-# -------------------- Поддержка/Сопротивление (без изменений) --------------------
+# -------------------- Поддержка/Сопротивление --------------------
 def support_resistance(df: pd.DataFrame) -> dict:
     levels = {}
     levels['support'] = df['low'].rolling(20).min().iloc[-1]
     levels['resistance'] = df['high'].rolling(20).max().iloc[-1]
     return levels
 
-# -------------------- Голосование индикаторов (без изменений) --------------------
+# -------------------- Голосование индикаторов --------------------
 def indicator_vote(latest: pd.Series) -> dict:
     score = 0
     if latest['ema9'] > latest['ema21']: score += 1
@@ -200,33 +210,18 @@ def indicator_vote(latest: pd.Series) -> dict:
     confidence = min(100, abs(score)*20 + 40)
     return {"direction": direction, "confidence": confidence}
 
-# -------------------- График (без изменений) --------------------
+# -------------------- График --------------------
 def plot_chart(df: pd.DataFrame) -> io.BytesIO:
     plot_df = df[['open','high','low','close','volume']].tail(150)
-    # Добавление индикаторов для отображения на графике
-    addplots = [
-        mpf.make_addplot(df['ema9'].tail(150), color='blue', panel=0, title='EMA9'), 
-        mpf.make_addplot(df['ema21'].tail(150), color='orange', panel=0, title='EMA21')
-    ]
-    # Добавление RSI и MACD (пример)
-    # rsi_plot = mpf.make_addplot(df['rsi14'].tail(150), panel=1, ylabel='RSI')
-    # macd_plot = mpf.make_addplot(df['macd'].tail(150), panel=2, type='bar', ylabel='MACD')
-    # addplots.extend([rsi_plot, macd_plot])
-    
+    addplots = [mpf.make_addplot(df['ema9'].tail(150)), mpf.make_addplot(df['ema21'].tail(150))]
     buf = io.BytesIO()
-    # Обратите внимание: mpf.plot может быть медленным, особенно на Render
+    # Обратите внимание на аргументы savefig для корректного сохранения в буфер
     mpf.plot(plot_df, type='candle', style='yahoo', volume=True, addplot=addplots, savefig=dict(fname=buf, dpi=100))
     buf.seek(0)
     return buf
 
-# -------------------- Отправка сигнала (без изменений) --------------------
-async def send_signal(pair: str, timeframe: int):
-    # Ваш код, который сейчас использует `query.message.edit_text` для статуса, 
-    # не сможет отправить фотографию в тот же чат, поскольку у вас нет объекта 
-    # `query` или `message` здесь.
-    # Вам нужно будет передать `chat_id` сюда или использовать FSMContext.
-    # Поскольку логика пока отправляет всем пользователям, я оставляю ее как есть:
-    
+# -------------------- Отправка сигнала (Изменено) --------------------
+async def send_signal(pair: str, timeframe: int, chat_id: int, message_id: int):
     # 1. Загрузка данных
     df = fetch_ohlcv(pair, timeframe)
     df_ind = compute_indicators(df)
@@ -245,22 +240,72 @@ async def send_signal(pair: str, timeframe: int):
         f"Поддержка: {sr['support']:.5f}\nСопротивление: {sr['resistance']:.5f}"
     )
     
-    # 4. Отправка всем пользователям
+    # 4. Отправка пользователю, который запросил сигнал (редактируем предыдущее сообщение)
+    try:
+        await bot.edit_message_caption(
+            chat_id=chat_id, 
+            message_id=message_id, 
+            caption="Готовлю график..." # Сначала редактируем текст, так как нельзя редактировать фото
+        )
+        # Отправляем новое сообщение с фото, т.к. edit_message_photo сложнее
+        await bot.send_photo(
+            chat_id=chat_id, 
+            photo=chart_buf, 
+            caption=text
+        )
+        await bot.delete_message(chat_id=chat_id, message_id=message_id) # Удаляем сообщение "Идет загрузка сигнала..."
+    except Exception as e:
+        print(f"Ошибка при отправке сигнала пользователю {chat_id}: {e}")
+
+    # 5. Отправка всем остальным подписчикам (если нужно)
     users = load_users()
     for user_id in users:
-        try:
-            # Отправка фото
-            await bot.send_photo(chat_id=user_id, photo=chart_buf, caption=text)
-        except Exception as e:
-            print(f"Ошибка отправки пользователю {user_id}: {e}")
+        if user_id != chat_id:
+            try:
+                # Сброс буфера для каждого отправляемого сообщения
+                chart_buf.seek(0) 
+                await bot.send_photo(chat_id=user_id, photo=chart_buf, caption=text)
+            except Exception as e:
+                print(f"Ошибка отправки пользователю {user_id}: {e}")
 
-# -------------------- Запуск --------------------
-if __name__ == "__main__":
+
+# -------------------- Запуск Webhook --------------------
+
+async def on_startup_webhook(bot: Bot):
+    """
+    Вызывается при старте Aiohttp сервера. Устанавливает Webhook URL в Telegram.
+    """
+    print("--- ЗАПУСК WEBHOOK ---")
+    if not BASE_WEBHOOK_URL or 'your-service-name' in BASE_WEBHOOK_URL:
+        raise ValueError("Ошибка: WEBHOOK_URL не настроен корректно. Проверьте переменную окружения на Render.")
+    
+    print(f"Установка Webhook URL: {WEBHOOK_URL}")
+    await bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+
+async def on_shutdown_webhook(bot: Bot):
+    """
+    Вызывается при остановке Aiohttp сервера. Удаляет Webhook URL.
+    """
+    print("--- ОСТАНОВКА WEBHOOK ---")
+    await bot.delete_webhook()
+
+def main():
     import logging
     logging.basicConfig(level=logging.INFO)
-    
-    # ВНИМАНИЕ: Для работы на Render.com (Web Service), 
-    # вам НУЖНО перейти на Webhook, а не Polling.
-    # Если вы хотите использовать Polling, измените тип сервиса на Render на "Background Worker" (Фоновый работник).
-    
-    asyncio.run(dp.start_polling(bot))
+
+    # 1. Добавление функций старта/завершения к диспетчеру
+    dp.startup.register(on_startup_webhook)
+    dp.shutdown.register(on_shutdown_webhook)
+
+    # 2. Запуск Aiohttp сервера через aiogram
+    # aiogram 3.x автоматически создает web.Application и привязывает к нему диспетчер
+    print(f"Сервер запускается на {WEB_SERVER_HOST}:{WEB_SERVER_PORT} с путем {WEBHOOK_PATH}")
+    dp.run_app(
+        host=WEB_SERVER_HOST,
+        port=WEB_SERVER_PORT,
+        path=WEBHOOK_PATH,
+        # session=AiohttpSession() # Можно добавить, если нужна кастомная aiohttp сессия
+    )
+
+if __name__ == "__main__":
+    main()
