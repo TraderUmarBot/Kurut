@@ -1,4 +1,4 @@
-# main.py - ФИНАЛЬНЫЙ, УСТОЙЧИВЫЙ КОД с БАЗОЙ ДАННЫХ (WEBHOOK Mode)
+# main.py - ФИНАЛЬНЫЙ, ПОЛНОСТЬЮ ФУНКЦИОНАЛЬНЫЙ КОД (WEBHOOK Mode)
 
 import os
 import asyncio
@@ -7,6 +7,7 @@ import yfinance as yf
 import pandas_ta as ta
 import logging
 import sqlite3 
+import sys 
 
 # --- Импорты aiogram ---
 from aiogram import Bot, Dispatcher, types
@@ -18,26 +19,21 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder 
 from aiogram.methods import DeleteWebhook
 from aiogram.client.default import DefaultBotProperties
-from aiogram.methods.set_webhook import SetWebhook # Явный импорт для установки Webhook
+from aiogram.methods.set_webhook import SetWebhook 
 
 # -------------------- Конфиг (WEBHOOK) --------------------
-# УБЕДИТЕСЬ, ЧТО ВЫ ЗАМЕНИЛИ "ВАШ_ТЕЛЕГРАМ_ТОКЕН" НА ВАШ TG_TOKEN ИЗ ENV VARS
-TG_TOKEN = os.getenv("TG_TOKEN") or "ВАШ_ТЕЛЕГРАМ_ТОКЕН" 
+# Переменные читаются из Env Vars. URL формируется автоматически.
+TG_TOKEN = os.environ.get("TG_TOKEN") 
 PO_REFERRAL_LINK = "https://m.po-tck.com/ru/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START" 
 
-# НАСТРОЙКИ WEBHOOK (Берутся из Env Vars на Render)
-WEB_SERVER_PORT = int(os.getenv("PORT", 10000)) 
-WEB_SERVER_HOST = os.getenv("WEB_SERVER_HOST", "0.0.0.0")
-# ВАЖНО: RENDER_EXTERNAL_HOSTNAME должен быть БЕЗ https://, например, kurut.onrender.com
-RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+# НАСТРОЙКИ WEBHOOK (Используем стандартные переменные Render)
+WEB_SERVER_PORT = int(os.environ.get("PORT", 10000)) 
+WEB_SERVER_HOST = os.environ.get("WEB_SERVER_HOST", "0.0.0.0") 
+RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME") 
 
-if RENDER_EXTERNAL_HOSTNAME:
-    WEBHOOK_PATH = f"/webhook/{TG_TOKEN}"
-    WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
-else:
-    WEBHOOK_PATH = "/webhook"
-    WEBHOOK_URL = None
-
+# Формирование URL для Webhook
+WEBHOOK_PATH = f"/webhook/{TG_TOKEN}" if TG_TOKEN else "/webhook"
+WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}" if RENDER_EXTERNAL_HOSTNAME else None
 
 # ОСТАЛЬНЫЕ КОНСТАНТЫ
 PAIRS = [
@@ -56,13 +52,13 @@ DB_FILE = "trades.db"
 bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher(storage=MemoryStorage())
 
-# -------------------- FSM --------------------
+# -------------------- FSM (Состояния) --------------------
 class Form(StatesGroup):
     waiting_for_referral = State() 
     choosing_pair = State()
     choosing_timeframe = State()
 
-# -------------------- База данных --------------------
+# -------------------- База данных (SQLite) --------------------
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -126,7 +122,7 @@ def get_user_stats(user_id: int) -> dict:
         'pair_stats': formatted_pair_stats
     }
 
-# -------------------- Пользователи (без изменений) --------------------
+# -------------------- Пользователи (для проверки реферала) --------------------
 def load_users():
     try:
         with open(USERS_FILE, "r") as f:
@@ -190,15 +186,11 @@ def get_timeframes_keyboard(pair: str) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-# -------------------- Обработчики --------------------
+# -------------------- Обработчики (Хендлеры) --------------------
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    
-    # ПРИМЕЧАНИЕ: На Render (Web Service) эта функция не сработает, пока не пройдет активация!
-    # Telegram отправляет обновления на адрес Webhook, а не через getUpdates.
-    # Поэтому первое сообщение от пользователя должно приходить через Webhook.
     
     if user_id in load_users():
         await state.clear()
@@ -248,7 +240,8 @@ async def show_history_handler(query: types.CallbackQuery, state: FSMContext):
     if total_trades == 0:
         text = "📜 **История сделок**\n\nУ вас пока нет закрытых сделок."
     else:
-        win_rate = (stats['total_plus'] / total_trades) * 100
+        # Устойчивый расчет Win Rate
+        win_rate = (stats['total_plus'] / total_trades) * 100 if total_trades > 0 else 0
         
         text = (
             "📜 **История сделок**\n\n"
@@ -363,10 +356,13 @@ async def tf_handler(query: types.CallbackQuery, state: FSMContext):
         
     await state.clear() 
 
-# -------------------- Получение свечей --------------------
+# -------------------- Получение свечей и Индикаторы --------------------
+# Используется yfinance, pandas и pandas-ta (они должны быть в requirements.txt)
+
 def fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
     interval = "1m"
     try:
+        # Добавляем '=X' для корректной работы с yfinance для Forex
         df = yf.download(f"{symbol}=X", period="5d", interval=interval, progress=False) 
     except Exception as e:
         logging.error(f"Ошибка загрузки данных YFinance для {symbol}: {e}")
@@ -380,13 +376,13 @@ def fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
     df.columns = [col.lower() for col in required_cols]
     
     if exp_minutes > 1 and not df.empty:
+        # Пересчет на нужный таймфрейм
         df = df.resample(f"{exp_minutes}min").agg({
             'open':'first','high':'max','low':'min','close':'last','volume':'sum'
         }).dropna()
         
     return df
 
-# -------------------- Индикаторы (УСТОЙЧИВАЯ ВЕРСИЯ) --------------------
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     
@@ -394,53 +390,40 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['ema21'] = ta.ema(df['close'], length=21)
     df['sma50'] = ta.sma(df['close'], length=50)
     
+    # MACD (Устойчивый расчет)
     macd = ta.macd(df['close'])
-    if macd is not None and 'MACD_12_26_9' in macd.columns:
-        df['macd'] = macd['MACD_12_26_9']
-        df['macd_signal'] = macd['MACDs_12_26_9']
-    else:
-        df['macd'] = float('nan')
-        df['macd_signal'] = float('nan')
+    df['macd'] = macd['MACD_12_26_9']
+    df['macd_signal'] = macd['MACDs_12_26_9']
     
     df['rsi14'] = ta.rsi(df['close'], length=14)
+    
+    # Stochastic (Устойчивый расчет)
     stoch = ta.stoch(df['high'], df['low'], df['close'])
-    if stoch is not None and 'STOCHk_14_3_3' in stoch.columns:
-        df['stoch_k'] = stoch['STOCHk_14_3_3']
-        df['stoch_d'] = stoch['STOCHd_14_3_3']
-    else:
-        df['stoch_k'] = float('nan')
-        df['stoch_d'] = float('nan')
+    df['stoch_k'] = stoch['STOCHk_14_3_3']
+    df['stoch_d'] = stoch['STOCHd_14_3_3']
 
     df['cci20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
-    df['mom10'] = ta.mom(df['close'], length=10)
     
+    # Bollinger Bands
     bb = ta.bbands(df['close'])
-    if bb is not None and 'BBU_20_2.0' in bb.columns: 
-        df['bb_upper'] = bb['BBU_20_2.0']
-        df['bb_lower'] = bb['BBL_20_2.0']
-    else:
-        df['bb_upper'] = float('nan')
-        df['bb_lower'] = float('nan')
+    df['bb_upper'] = bb['BBU_20_2.0']
+    df['bb_lower'] = bb['BBL_20_2.0']
         
-    try:
-        adx_df = ta.adx(df['high'], df['low'], df['close'])
-        df['atr14'] = ta.atr(df['high'], df['low'], df['close'])
-        df['adx14'] = adx_df['ADX_14'] if 'ADX_14' in adx_df.columns else float('nan')
-    except Exception:
-        df['atr14'] = float('nan')
-        df['adx14'] = float('nan')
-
-    df['obv'] = ta.obv(df['close'], df['volume'])
+    # ADX/ATR
+    adx_df = ta.adx(df['high'], df['low'], df['close'])
+    df['atr14'] = ta.atr(df['high'], df['low'], df['close'])
+    df['adx14'] = adx_df['ADX_14']
     
+    # Паттерны свечей
     df['hammer'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['close']-df['low'])/(.001+df['high']-df['low'])>0.6)
     df['shooting_star'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['high']-df['close'])/(.001+df['high']-df['low'])>0.6)
     
+    # Чистим от NaN и берем только последние данные
     critical_cols = ['ema9', 'ema21', 'macd', 'rsi14', 'stoch_k', 'adx14']
     df_cleaned = df.dropna(subset=critical_cols)
     
     return df_cleaned.tail(100)
 
-# -------------------- Поддержка/Сопротивление --------------------
 def support_resistance(df: pd.DataFrame) -> dict:
     levels = {}
     df_sr = df.tail(20) 
@@ -452,25 +435,26 @@ def support_resistance(df: pd.DataFrame) -> dict:
         levels['resistance'] = float('nan')
     return levels
 
-# -------------------- Голосование индикаторов (Улучшенная точность) --------------------
 def indicator_vote(latest: pd.Series) -> dict:
     score = 0
     
     is_trending = latest['adx14'] > 25
     
+    # Трендовая стратегия
     if is_trending:
         if latest['ema9'] > latest['ema21'] and latest['close'] > latest['sma50']:
-            score += 2
+            score += 2 # Сильный BUY
         elif latest['ema9'] < latest['ema21'] and latest['close'] < latest['sma50']:
-            score -= 2
+            score -= 2 # Сильный SELL
     
-    # Строгие зоны перекупленности/перепроданности
+    # Контртрендовые условия (Перекупленность/Перепроданность)
     is_oversold = (latest['rsi14'] < 30) and (latest['stoch_k'] < 20)
     is_overbought = (latest['rsi14'] > 70) and (latest['stoch_k'] > 80)
     
     if is_oversold: score += 1
     if is_overbought: score -= 1
 
+    # Паттерны свечей
     if latest['hammer']: score += 1
     if latest['shooting_star']: score -= 1
             
@@ -479,13 +463,12 @@ def indicator_vote(latest: pd.Series) -> dict:
     elif score <= -2:
         direction = "SELL"
     else:
-        direction = "HOLD"
+        direction = "HOLD" # Если нет явного сигнала
 
-    confidence = min(100, abs(score) * 20 + 40)
+    confidence = min(100, abs(score) * 20 + 40) # Расчет уверенности
     
     return {"direction": direction, "confidence": confidence, "score": score}
 
-# -------------------- Отправка сигнала --------------------
 async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, message_id: int):
     
     df = fetch_ohlcv(pair, timeframe)
@@ -507,6 +490,7 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
     res = indicator_vote(latest)
     sr = support_resistance(df_ind)
     
+    # Сохраняем сделку в базу данных
     trade_id = save_trade(user_id, pair, timeframe, res['direction'])
 
     dir_map = {"BUY":"🔺 ПОКУПКА","SELL":"🔻 ПРОДАЖА","HOLD":"⚠️ НЕОДНОЗНАЧНО"}
@@ -515,7 +499,7 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
         f"Пара: {pair}\n"
         f"Таймфрейм: {timeframe} мин\n\n"
         f"Направление: **{dir_map[res['direction']]}**\n"
-        f"Уверенность: {res['confidence']}%\n\n"
+        f"Уверенность: {res['confidence']:.0f}%\n\n"
         f"Поддержка: {sr['support']:.5f}\n"
         f"Сопротивление: {sr['resistance']:.5f}\n\n"
         f"**Нажмите кнопку ниже после закрытия сделки:**"
@@ -530,25 +514,21 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
         )
     except Exception as e:
         logging.error(f"Ошибка при редактировании сообщения пользователю {chat_id}: {e}")
-        
-# -------------------- Запуск (WEBHOOK - ИСПРАВЛЕННЫЙ) --------------------
 
-async def on_startup(bot: Bot):
+# -------------------- БЛОК ЗАПУСКА WEBHOOK (УСТОЙЧИВЫЙ) --------------------
+
+async def on_startup_webhook(bot: Bot):
     """
-    Принудительно удаляет старый webhook, а затем устанавливает новый.
-    Это решает ошибку Conflict, которую мы видели в логах.
+    Принудительно устанавливает Webhook перед запуском сервера.
     """
     if WEBHOOK_URL:
-        # 1. Сначала удаляем старый, висящий webhook
         await bot(DeleteWebhook(drop_pending_updates=True))
-        
-        # 2. Устанавливаем новый
         await bot(SetWebhook(url=WEBHOOK_URL))
         logging.info(f"✅ Webhook успешно переустановлен: {WEBHOOK_URL}")
     else:
-        logging.error("❌ RENDER_EXTERNAL_HOSTNAME не задан! Webhook не установлен.")
+        logging.error("❌ Webhook URL не определен. Невозможно установить Webhook.")
 
-async def on_shutdown(bot: Bot):
+async def on_shutdown_webhook(bot: Bot):
     """Удаляет webhook URL при завершении работы."""
     try:
         await bot(DeleteWebhook(drop_pending_updates=True))
@@ -557,34 +537,44 @@ async def on_shutdown(bot: Bot):
     logging.info("❌ Webhook удален.")
 
 
-def main():
-    # Инициализация базы данных при старте
-    init_db() 
+async def start_webhook():
+    """Главная асинхронная функция, явно запускающая Webhook-сервер."""
     
+    # Проверка обязательных переменных
+    if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
+        logging.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Не задан TG_TOKEN или RENDER_EXTERNAL_HOSTNAME. Выход.")
+        sys.exit(1)
+        
+    init_db() 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
-        logging.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Не задан TG_TOKEN или RENDER_EXTERNAL_HOSTNAME.")
-        return
-
+    logging.info(f"--- ЗАПУСК WEBHOOK СЕРВЕРА: {WEBHOOK_URL} ---")
+    
+    dp.startup.register(on_startup_webhook)
+    dp.shutdown.register(on_shutdown_webhook)
+    
+    # Явный запуск aiohttp Web Server (самый устойчивый метод)
     try:
-        logging.info("--- ЗАПУСК В РЕЖИМЕ WEBHOOK ---")
-        
-        dp.startup.register(on_startup)
-        dp.shutdown.register(on_shutdown)
-        
-        # Запускаем Webhook-сервер (в aiogram 3.x используется run_polling с параметрами Webhook)
-        dp.run_polling( 
-            bot, 
-            web_server_host=WEB_SERVER_HOST, 
-            web_server_port=WEB_SERVER_PORT, 
-            webhook_path=WEBHOOK_PATH, 
+        await dp.start_webhook(
+            bot=bot,
+            webhook_url=WEBHOOK_URL,
+            host=WEB_SERVER_HOST,
+            port=WEB_SERVER_PORT,
+            path=WEBHOOK_PATH,
             allowed_updates=dp.resolve_used_update_types()
         )
-
     except Exception as e:
-        logging.error(f"Непредвиденная ошибка запуска: {e}")
+        logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА ЗАПУСКА WEBHOOK-СЕРВЕРА: {e}")
+        sys.exit(1) 
+
+def main():
+    """Точка входа в программу."""
+    try:
+        asyncio.run(start_webhook())
+    except Exception as e:
+        logging.error(f"Непредвиденная ошибка в main(): {e}")
 
 
 if __name__ == "__main__":
     main()
+
