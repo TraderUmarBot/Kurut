@@ -1,4 +1,4 @@
-# main.py - ФИНАЛЬНЫЙ, УСТОЙЧИВЫЙ КОД с БАЗОЙ ДАННЫХ (Polling Mode)
+# main.py - ФИНАЛЬНЫЙ, УСТОЙЧИВЫЙ КОД с БАЗОЙ ДАННЫХ (WEBHOOK Mode)
 
 import os
 import asyncio
@@ -6,7 +6,7 @@ import pandas as pd
 import yfinance as yf
 import pandas_ta as ta
 import logging
-import sqlite3 # НОВЫЙ ИМПОРТ
+import sqlite3 
 
 # --- Импорты aiogram ---
 from aiogram import Bot, Dispatcher, types
@@ -16,11 +16,29 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder 
+from aiogram.methods import DeleteWebhook
+from aiogram.client.default import DefaultBotProperties
 
-# -------------------- Конфиг --------------------
+# -------------------- Конфиг (WEBHOOK) --------------------
 TG_TOKEN = os.getenv("TG_TOKEN") or "ВАШ_ТЕЛЕГРАМ_ТОКЕН" 
 PO_REFERRAL_LINK = "https://m.po-tck.com/ru/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START" 
 
+# НАСТРОЙКИ WEBHOOK (Берутся из Env Vars на Render)
+WEB_SERVER_PORT = int(os.getenv("PORT", 10000)) 
+WEB_SERVER_HOST = os.getenv("WEB_SERVER_HOST", "0.0.0.0")
+RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+
+# Проверка на наличие RENDER_EXTERNAL_HOSTNAME
+if RENDER_EXTERNAL_HOSTNAME:
+    WEBHOOK_PATH = f"/webhook/{TG_TOKEN}"
+    WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
+else:
+    # Запасной вариант для локального запуска (или если Env Var не установлен)
+    WEBHOOK_PATH = "/webhook"
+    WEBHOOK_URL = None
+
+
+# ОСТАЛЬНЫЕ КОНСТАНТЫ
 PAIRS = [
     "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF",
     "EURJPY", "GBPJPY", "AUDJPY", "EURGBP", "EURAUD", "GBPAUD",
@@ -31,10 +49,11 @@ TIMEFRAMES = [1, 3, 5, 10]
 PAIRS_PER_PAGE = 6
 
 USERS_FILE = "users.txt"
-DB_FILE = "trades.db" # Файл базы данных SQLite
+DB_FILE = "trades.db" 
 
 # -------------------- Бот и диспетчер --------------------
-bot = Bot(token=TG_TOKEN)
+# Добавлено DefaultBotProperties для ParseMode
+bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher(storage=MemoryStorage())
 
 # -------------------- FSM --------------------
@@ -46,7 +65,6 @@ class Form(StatesGroup):
 # -------------------- База данных --------------------
 
 def init_db():
-    """Инициализация базы данных сделок."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("""
@@ -64,7 +82,6 @@ def init_db():
     conn.close()
 
 def save_trade(user_id: int, pair: str, timeframe: int, direction: str):
-    """Сохранение новой сделки (без результата)."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("""
@@ -77,7 +94,6 @@ def save_trade(user_id: int, pair: str, timeframe: int, direction: str):
     return trade_id
 
 def update_trade_result(trade_id: int, result: str):
-    """Обновление результата сделки."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("""
@@ -87,21 +103,17 @@ def update_trade_result(trade_id: int, result: str):
     conn.close()
 
 def get_user_stats(user_id: int) -> dict:
-    """Получение статистики пользователя."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # Общая статистика
     cursor.execute("SELECT result, COUNT(*) FROM trades WHERE user_id = ? AND result IS NOT NULL GROUP BY result", (user_id,))
     stats = dict(cursor.fetchall())
     
-    # Статистика по парам
     cursor.execute("SELECT pair, result, COUNT(*) FROM trades WHERE user_id = ? AND result IS NOT NULL GROUP BY pair, result", (user_id,))
     pair_stats = cursor.fetchall()
 
     conn.close()
     
-    # Форматирование статистики по парам
     formatted_pair_stats = {}
     for pair, result, count in pair_stats:
         if pair not in formatted_pair_stats:
@@ -132,7 +144,6 @@ def save_user(user_id):
 # -------------------- Клавиатуры --------------------
 
 def get_main_menu_keyboard():
-    """Главное меню"""
     builder = InlineKeyboardBuilder()
     builder.button(text="📈 Выбрать пару", callback_data="start_trade")
     builder.button(text="📜 История сделок", callback_data="show_history")
@@ -140,14 +151,12 @@ def get_main_menu_keyboard():
     return builder.as_markup()
 
 def get_trade_result_keyboard(trade_id: int) -> InlineKeyboardMarkup:
-    """Кнопки Плюс/Минус для сохранения результата"""
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ ПЛЮС", callback_data=f"result:{trade_id}:PLUS")
     builder.button(text="❌ МИНУС", callback_data=f"result:{trade_id}:MINUS")
     builder.adjust(2)
     return builder.as_markup()
 
-# Остальные клавиатуры (get_pairs_keyboard, get_timeframes_keyboard) остаются без изменений.
 def get_pairs_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     start = page * PAIRS_PER_PAGE
     end = start + PAIRS_PER_PAGE
@@ -166,7 +175,6 @@ def get_pairs_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     if nav_buttons:
         builder.row(*nav_buttons) 
     
-    # Добавляем кнопку "Назад в меню"
     builder.row(InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu"))
     
     return builder.as_markup()
@@ -177,7 +185,6 @@ def get_timeframes_keyboard(pair: str) -> InlineKeyboardMarkup:
         builder.button(text=f"{tf} мин", callback_data=f"tf:{pair}:{tf}")
     builder.adjust(2) 
     
-    # Добавляем кнопку "Назад в меню"
     builder.row(InlineKeyboardButton(text="◀️ Назад к парам", callback_data="start_trade"))
     
     return builder.as_markup()
@@ -190,15 +197,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     
     if user_id in load_users():
-        # Если активирован, сразу показываем главное меню
         await state.clear()
         await message.answer(
             "🏠 **Главное меню**\n\nВыберите действие:",
-            reply_markup=get_main_menu_keyboard(),
-            parse_mode="Markdown"
+            reply_markup=get_main_menu_keyboard()
         )
     else:
-        # Старая логика активации (без изменений)
         await state.set_state(Form.waiting_for_referral)
         referral_text = (
             "🚀 **Привет! Для получения торговых сигналов тебе необходимо зарегистрироваться "
@@ -208,9 +212,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
             "3. **После регистрации** скопируй свой **ID аккаунта** (только цифры) "
             "и **отправь его в этот чат** для активации бота."
         )
-        await message.answer(referral_text, parse_mode="Markdown")
+        await message.answer(referral_text)
 
-# НОВЫЙ обработчик для главного меню и сброса состояния
+
 @dp.callback_query(lambda c: c.data in ["main_menu", "start_trade"])
 async def main_menu_handler(query: types.CallbackQuery, state: FSMContext):
     await state.clear()
@@ -218,8 +222,7 @@ async def main_menu_handler(query: types.CallbackQuery, state: FSMContext):
     if query.data == "main_menu":
         await query.message.edit_text(
             "🏠 **Главное меню**\n\nВыберите действие:",
-            reply_markup=get_main_menu_keyboard(),
-            parse_mode="Markdown"
+            reply_markup=get_main_menu_keyboard()
         )
         
     elif query.data == "start_trade":
@@ -231,7 +234,6 @@ async def main_menu_handler(query: types.CallbackQuery, state: FSMContext):
         
     await query.answer()
 
-# НОВЫЙ обработчик для вывода истории
 @dp.callback_query(lambda c: c.data == "show_history")
 async def show_history_handler(query: types.CallbackQuery, state: FSMContext):
     user_id = query.from_user.id
@@ -253,7 +255,6 @@ async def show_history_handler(query: types.CallbackQuery, state: FSMContext):
             "--- Статистика по парам ---"
         )
         
-        # Добавляем статистику по парам
         for pair, data in stats['pair_stats'].items():
             plus = data['PLUS']
             minus = data['MINUS']
@@ -265,12 +266,10 @@ async def show_history_handler(query: types.CallbackQuery, state: FSMContext):
 
     await query.message.edit_text(
         text,
-        reply_markup=get_main_menu_keyboard(),
-        parse_mode="Markdown"
+        reply_markup=get_main_menu_keyboard()
     )
     await query.answer()
 
-# НОВЫЙ обработчик для сохранения результата
 @dp.callback_query(lambda c: c.data.startswith("result:"))
 async def trade_result_handler(query: types.CallbackQuery, state: FSMContext):
     _, trade_id_str, result = query.data.split(":")
@@ -283,26 +282,22 @@ async def trade_result_handler(query: types.CallbackQuery, state: FSMContext):
     # Редактируем сообщение, чтобы убрать кнопки и показать результат
     await query.message.edit_reply_markup(reply_markup=None)
     
-    # Добавляем кнопку "Главное меню"
     keyboard = InlineKeyboardBuilder()
     keyboard.button(text="🏠 Главное меню", callback_data="main_menu")
     
     await query.message.answer(
         f"{icon} **Результат сделки сохранен: {result}**\n\n"
         "Выберите следующее действие:",
-        reply_markup=keyboard.as_markup(),
-        parse_mode="Markdown"
+        reply_markup=keyboard.as_markup()
     )
 
     await query.answer(f"Результат {result} сохранен!")
-    # Переходим в главное меню после сохранения
     await state.clear()
-    await state.set_state(None) # Сброс состояния для cmd_start
+    await state.set_state(None)
 
 
 @dp.message(Form.waiting_for_referral)
 async def process_referral_check(message: types.Message, state: FSMContext):
-    # Логика активации...
     user_input = message.text.strip()
     user_id = message.from_user.id
     is_valid = user_input.isdigit() and len(user_input) > 4
@@ -314,18 +309,15 @@ async def process_referral_check(message: types.Message, state: FSMContext):
         await message.answer(
             "✅ **Активация успешна!**\n\n"
             "Выберите действие:",
-            reply_markup=get_main_menu_keyboard(),
-            parse_mode="Markdown"
+            reply_markup=get_main_menu_keyboard()
         )
     else:
         await message.answer(
             "❌ **Ошибка активации.**\nПожалуйста, убедитесь, что вы прислали свой **ID аккаунта** (только цифры)."
         )
 
-# Обработчики выбора пары и таймфрейма (теперь используют состояние Form.choosing_pair)
 @dp.callback_query(lambda c: c.data.startswith("page:"))
 async def page_handler(query: types.CallbackQuery, state: FSMContext):
-    # ... логика переключения страниц ...
     page = int(query.data.split(":")[1])
     await query.message.edit_text(
         "Выбери валютную пару:",
@@ -361,22 +353,17 @@ async def tf_handler(query: types.CallbackQuery, state: FSMContext):
         await bot.edit_message_text(
             chat_id=message_to_edit.chat.id, 
             message_id=message_to_edit.message_id, 
-            text=error_text, 
-            parse_mode="Markdown"
+            text=error_text
         )
         logging.error(f"Критическая ошибка в tf_handler: {e}")
         
-    await state.clear() # Сбрасываем состояние после отправки сигнала
+    await state.clear() 
 
-
-# -------------------- Получение свечей, Индикаторы (Используем последнюю, устойчивую версию) --------------------
-# ... (Код fetch_ohlcv, compute_indicators, support_resistance, indicator_vote остаются как в предыдущем сообщении)
-# В целях экономии места в этом ответе, я опускаю их, но ВЫ должны вставить их сюда!
-
-# ... (ОПУЩЕННЫЙ КОД fetch_ohlcv)
+# -------------------- Получение свечей --------------------
 def fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
     interval = "1m"
     try:
+        # Увеличен период до 5 дней
         df = yf.download(f"{symbol}=X", period="5d", interval=interval, progress=False) 
     except Exception as e:
         logging.error(f"Ошибка загрузки данных YFinance для {symbol}: {e}")
@@ -384,7 +371,6 @@ def fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
 
     required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
     if not all(col in df.columns for col in required_cols):
-        logging.warning(f"Не все OHLCV столбцы найдены для {symbol}.")
         return pd.DataFrame()
 
     df = df[required_cols] 
@@ -397,7 +383,7 @@ def fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
         
     return df
 
-# ... (ОПУЩЕННЫЙ КОД compute_indicators)
+# -------------------- Индикаторы (УСТОЙЧИВАЯ ВЕРСИЯ) --------------------
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     
@@ -446,12 +432,13 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['hammer'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['close']-df['low'])/(.001+df['high']-df['low'])>0.6)
     df['shooting_star'] = ((df['high']-df['low'])>3*(df['open']-df['close'])) & ((df['high']-df['close'])/(.001+df['high']-df['low'])>0.6)
     
+    # ИСПРАВЛЕНИЕ: Вместо df.dropna() удаляем NaN только в ключевых столбцах.
     critical_cols = ['ema9', 'ema21', 'macd', 'rsi14', 'stoch_k', 'adx14']
     df_cleaned = df.dropna(subset=critical_cols)
     
     return df_cleaned.tail(100)
 
-# ... (ОПУЩЕННЫЙ КОД support_resistance)
+# -------------------- Поддержка/Сопротивление --------------------
 def support_resistance(df: pd.DataFrame) -> dict:
     levels = {}
     df_sr = df.tail(20) 
@@ -463,7 +450,7 @@ def support_resistance(df: pd.DataFrame) -> dict:
         levels['resistance'] = float('nan')
     return levels
 
-# ... (ОПУЩЕННЫЙ КОД indicator_vote)
+# -------------------- Голосование индикаторов (Улучшенная точность) --------------------
 def indicator_vote(latest: pd.Series) -> dict:
     score = 0
     
@@ -495,22 +482,21 @@ def indicator_vote(latest: pd.Series) -> dict:
     
     return {"direction": direction, "confidence": confidence, "score": score}
 
-# -------------------- Отправка сигнала (МОДИФИЦИРОВАНА) --------------------
-# Добавлен параметр user_id
+# -------------------- Отправка сигнала --------------------
 async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, message_id: int):
     
     df = fetch_ohlcv(pair, timeframe)
     
     if df.empty or len(df) < 50: 
         error_text = f"❌ **Ошибка.** Не удалось загрузить достаточно свечей (нужно >50) для {pair} {timeframe} мин. Попробуйте позже."
-        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=error_text, parse_mode="Markdown")
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=error_text)
         return
         
     df_ind = compute_indicators(df)
     
     if df_ind.empty:
         error_text = f"❌ **Ошибка.** Индикаторы не рассчитаны (недостаточно полных данных после очистки). Попробуйте меньший таймфрейм."
-        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=error_text, parse_mode="Markdown")
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=error_text)
         return
         
     latest = df_ind.iloc[-1]
@@ -518,7 +504,7 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
     res = indicator_vote(latest)
     sr = support_resistance(df_ind)
     
-    # Сохраняем новую сделку в базу данных, чтобы получить trade_id
+    # Сохраняем новую сделку в базу данных
     trade_id = save_trade(user_id, pair, timeframe, res['direction'])
 
     dir_map = {"BUY":"🔺 ПОКУПКА","SELL":"🔻 ПРОДАЖА","HOLD":"⚠️ НЕОДНОЗНАЧНО"}
@@ -534,18 +520,33 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
     )
     
     try:
-        # Редактируем сообщение, прикрепляя кнопки Плюс/Минус
         await bot.edit_message_text(
             chat_id=chat_id, 
             message_id=message_id, 
             text=text, 
-            reply_markup=get_trade_result_keyboard(trade_id), # НОВАЯ КЛАВИАТУРА
-            parse_mode="Markdown"
+            reply_markup=get_trade_result_keyboard(trade_id)
         )
     except Exception as e:
         logging.error(f"Ошибка при редактировании сообщения пользователю {chat_id}: {e}")
         
-# -------------------- Запуск (ПОЛЛИНГ) --------------------
+# -------------------- Запуск (WEBHOOK) --------------------
+
+async def on_startup(bot: Bot):
+    """Устанавливает webhook URL при старте."""
+    if WEBHOOK_URL:
+        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+        logging.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
+    else:
+        logging.error("❌ RENDER_EXTERNAL_HOSTNAME не задан! Webhook не установлен.")
+
+async def on_shutdown(bot: Bot):
+    """Удаляет webhook URL при завершении работы."""
+    try:
+        await bot(DeleteWebhook(drop_pending_updates=True))
+    except Exception as e:
+        logging.error(f"Ошибка при удалении Webhook: {e}")
+    logging.info("❌ Webhook удален.")
+
 
 def main():
     # Инициализация базы данных при старте
@@ -553,16 +554,25 @@ def main():
     
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    logging.info("--- ЗАПУСК В РЕЖИМЕ ПОЛЛИНГА ---")
-    
-    if not TG_TOKEN or TG_TOKEN == "ВАШ_ТЕЛЕГРАМ_ТОКЕН":
-        logging.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Не задан TG_TOKEN.")
+    if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
+        logging.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Не задан TG_TOKEN или RENDER_EXTERNAL_HOSTNAME.")
         return
 
     try:
-        asyncio.run(dp.start_polling(bot, drop_pending_updates=True))
-    except KeyboardInterrupt:
-        logging.info("Бот остановлен вручную.")
+        logging.info("--- ЗАПУСК В РЕЖИМЕ WEBHOOK ---")
+        
+        dp.startup.register(on_startup)
+        dp.shutdown.register(on_shutdown)
+        
+        # Запускаем сервер Webhook
+        dp.run_polling( # В aiogram 3.x используется run_polling для запуска сервера, но с параметрами Webhook
+            bot, 
+            web_server_host=WEB_SERVER_HOST, 
+            web_server_port=WEB_SERVER_PORT, 
+            webhook_path=WEBHOOK_PATH, 
+            allowed_updates=dp.resolve_used_update_types()
+        )
+
     except Exception as e:
         logging.error(f"Непредвиденная ошибка запуска: {e}")
 
