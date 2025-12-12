@@ -1,4 +1,4 @@
-aiogram==3.1.1
+aiogram
 pandas
-yfinance pandas-ta
-aiohttp
+yfinance 
+pandas-ta
