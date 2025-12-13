@@ -1,4 +1,4 @@
-# main.py — AI TECH SIGNAL BOT (Pocket Option + aiogram v3 + webhook + 10 индикаторов + подписка на канал)
+# main.py — AI TECH SIGNAL BOT (Render + aiogram v3 + webhook + 10 индикаторов + подписка)
 
 import os
 import sys
@@ -31,8 +31,8 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 PORT = int(os.environ.get("PORT", 10000))
 HOST = "0.0.0.0"
 RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-
-CHANNEL_USERNAME = "@KURUTTRADING"  # канал для подписки
+CHANNEL_URL = "https://t.me/KURUTTRADING"
+CHANNEL_USERNAME = "KURUTTRADING"
 
 if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
     print("❌ TG_TOKEN или RENDER_EXTERNAL_HOSTNAME не заданы")
@@ -116,17 +116,11 @@ async def get_trade_history(user_id: int):
 # ===================== FSM =====================
 
 class Form(StatesGroup):
+    checking_subscription = State()
     choosing_pair = State()
     choosing_tf = State()
 
 # ===================== KEYBOARDS =====================
-
-def main_kb():
-    b = InlineKeyboardBuilder()
-    b.button(text="📈 Валютные пары", callback_data="choose_pair")
-    b.button(text="📜 История сделок", callback_data="history")
-    b.adjust(2)
-    return b.as_markup()
 
 def pairs_kb(page=0):
     b = InlineKeyboardBuilder()
@@ -152,17 +146,14 @@ def result_kb(trade_id):
     b = InlineKeyboardBuilder()
     b.button(text="✅ ПЛЮС", callback_data=f"res:{trade_id}:PLUS")
     b.button(text="❌ МИНУС", callback_data=f"res:{trade_id}:MINUS")
+    b.button(text="📜 История", callback_data=f"history")
     b.adjust(2)
     return b.as_markup()
 
-# ===================== SUBSCRIPTION =====================
-
-async def check_subscription(user_id: int):
-    try:
-        member = await bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        return member.status not in ["left", "kicked"]
-    except:
-        return False
+def subscribe_kb():
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Подписаться на канал", url=CHANNEL_URL)
+    return b.as_markup()
 
 # ===================== ANALYSIS =====================
 
@@ -188,7 +179,10 @@ def get_signal(df: pd.DataFrame):
 
     # 4. MACD
     macd = ta.macd(df['Close'])
-    signals.append("BUY" if macd["MACD_12_26_9"].iloc[-1] > macd["MACDs_12_26_9"].iloc[-1] else "SELL")
+    if macd["MACD_12_26_9"].iloc[-1] > macd["MACDs_12_26_9"].iloc[-1]:
+        signals.append("BUY")
+    else:
+        signals.append("SELL")
 
     # 5. Stochastic
     stoch = ta.stoch(df['High'], df['Low'], df['Close'])
@@ -224,30 +218,32 @@ def get_signal(df: pd.DataFrame):
     atr = ta.atr(df['High'], df['Low'], df['Close'])
     signals.append("BUY" if df['Close'].iloc[-1] > df['Close'].iloc[-2] else "SELL")
 
-    # Консенсус
     from collections import Counter
     final_signal = Counter(signals).most_common(1)[0][0]
     return final_signal
 
 # ===================== HANDLERS =====================
 
+async def check_subscription(user_id: int):
+    try:
+        member = await bot(GetChatMember(chat_id=CHANNEL_USERNAME, user_id=user_id))
+        return member.status in ["member", "administrator", "creator"]
+    except:
+        return False
+
 @dp.message(Command("start"))
 async def start_cmd(msg: types.Message, state: FSMContext):
     await state.clear()
-    if not await check_subscription(msg.from_user.id):
-        kb = InlineKeyboardBuilder()
-        kb.button(text="✅ Подписаться на канал", url=CHANNEL_USERNAME)
-        kb.adjust(1)
-        await msg.answer("📢 Чтобы использовать бота, подпишитесь на канал", reply_markup=kb.as_markup())
-        return
     await save_user(msg.from_user.id)
-    await msg.answer("Добро пожаловать! Выберите опцию:", reply_markup=main_kb())
-
-@dp.callback_query(lambda c: c.data=="choose_pair")
-async def choose_pair_cb(cb: types.CallbackQuery, state: FSMContext):
+    subscribed = await check_subscription(msg.from_user.id)
+    if not subscribed:
+        await msg.answer(
+            "📢 Чтобы использовать бота, подпишитесь на канал",
+            reply_markup=subscribe_kb()
+        )
+        return
+    await msg.answer("📈 Выбери валютную пару:", reply_markup=pairs_kb())
     await state.set_state(Form.choosing_pair)
-    await cb.message.edit_text("📈 Выбери валютную пару:", reply_markup=pairs_kb())
-    await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("page:"))
 async def page_cb(cb: types.CallbackQuery):
@@ -267,9 +263,8 @@ async def pair_cb(cb: types.CallbackQuery, state: FSMContext):
 async def tf_cb(cb: types.CallbackQuery, state: FSMContext):
     _, pair, tf = cb.data.split(":")
     tf = int(tf)
-    await cb.answer("⏳ Анализ...")
+    await cb.answer("⏳ Анализ рынка...")
 
-    # Получаем данные через yfinance
     df = yf.download(pair, period="1d", interval=f"{tf}m")
     if df.empty:
         await cb.message.edit_text("❌ Ошибка получения данных")
@@ -286,12 +281,11 @@ async def tf_cb(cb: types.CallbackQuery, state: FSMContext):
 async def res_cb(cb: types.CallbackQuery):
     _, trade_id, result = cb.data.split(":")
     await update_trade(int(trade_id), result)
-    await cb.message.answer("✅ Результат сохранён")
-    # Возврат в главное меню
-    await cb.message.answer("Выберите опцию:", reply_markup=main_kb())
+    await cb.message.edit_text("✅ Результат сохранён")
     await cb.answer()
+    await cb.message.answer("📈 Выбери валютную пару:", reply_markup=pairs_kb())
 
-@dp.callback_query(lambda c: c.data=="history")
+@dp.callback_query(lambda c: c.data.startswith("history"))
 async def history_cb(cb: types.CallbackQuery):
     trades = await get_trade_history(cb.from_user.id)
     if not trades:
@@ -302,7 +296,6 @@ async def history_cb(cb: types.CallbackQuery):
             ts = t["timestamp"].strftime("%Y-%m-%d %H:%M")
             text += f"{ts} | {t['pair']} | {t['timeframe']} мин | {t['direction']} | {t['result']}\n"
         await cb.message.answer(text)
-    await cb.answer()
 
 # ===================== WEBHOOK =====================
 
