@@ -1,4 +1,4 @@
-# main.py — AI TECH SIGNAL BOT (Render + aiogram v3 + webhook + 10 индикаторов + подписка)
+# main.py — AI TECH SIGNAL BOT (Render + aiogram v3 + webhook + 10 индикаторов)
 
 import os
 import sys
@@ -19,7 +19,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.methods import DeleteWebhook, SetWebhook, GetChatMember
+from aiogram.methods import DeleteWebhook, SetWebhook
 
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
@@ -31,8 +31,6 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 PORT = int(os.environ.get("PORT", 10000))
 HOST = "0.0.0.0"
 RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-CHANNEL_URL = "https://t.me/KURUTTRADING"
-CHANNEL_USERNAME = "KURUTTRADING"
 
 if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
     print("❌ TG_TOKEN или RENDER_EXTERNAL_HOSTNAME не заданы")
@@ -116,7 +114,6 @@ async def get_trade_history(user_id: int):
 # ===================== FSM =====================
 
 class Form(StatesGroup):
-    checking_subscription = State()
     choosing_pair = State()
     choosing_tf = State()
 
@@ -150,71 +147,46 @@ def result_kb(trade_id):
     b.adjust(2)
     return b.as_markup()
 
-def subscribe_kb():
-    b = InlineKeyboardBuilder()
-    b.button(text="✅ Подписаться на канал", url=CHANNEL_URL)
-    return b.as_markup()
-
 # ===================== ANALYSIS =====================
 
 def get_signal(df: pd.DataFrame):
     signals = []
 
-    # 1. SMA
+    # 10 индикаторов
     sma_short = ta.sma(df['Close'], length=5)
     sma_long = ta.sma(df['Close'], length=20)
     signals.append("BUY" if sma_short.iloc[-1] > sma_long.iloc[-1] else "SELL")
 
-    # 2. EMA
     ema_short = ta.ema(df['Close'], length=5)
     ema_long = ta.ema(df['Close'], length=20)
     signals.append("BUY" if ema_short.iloc[-1] > ema_long.iloc[-1] else "SELL")
 
-    # 3. RSI
     rsi = ta.rsi(df['Close'], length=14)
-    if rsi.iloc[-1] < 30:
-        signals.append("BUY")
-    elif rsi.iloc[-1] > 70:
-        signals.append("SELL")
+    if rsi.iloc[-1] < 30: signals.append("BUY")
+    elif rsi.iloc[-1] > 70: signals.append("SELL")
 
-    # 4. MACD
     macd = ta.macd(df['Close'])
-    if macd["MACD_12_26_9"].iloc[-1] > macd["MACDs_12_26_9"].iloc[-1]:
-        signals.append("BUY")
-    else:
-        signals.append("SELL")
+    if macd["MACD_12_26_9"].iloc[-1] > macd["MACDs_12_26_9"].iloc[-1]: signals.append("BUY")
+    else: signals.append("SELL")
 
-    # 5. Stochastic
     stoch = ta.stoch(df['High'], df['Low'], df['Close'])
-    if stoch["STOCHk_14_3_3"].iloc[-1] < 20:
-        signals.append("BUY")
-    elif stoch["STOCHk_14_3_3"].iloc[-1] > 80:
-        signals.append("SELL")
+    if stoch["STOCHk_14_3_3"].iloc[-1] < 20: signals.append("BUY")
+    elif stoch["STOCHk_14_3_3"].iloc[-1] > 80: signals.append("SELL")
 
-    # 6. Bollinger Bands
     bb = ta.bbands(df['Close'])
-    if df['Close'].iloc[-1] < bb['BBL_5_2.0'].iloc[-1]:
-        signals.append("BUY")
-    elif df['Close'].iloc[-1] > bb['BBU_5_2.0'].iloc[-1]:
-        signals.append("SELL")
+    if df['Close'].iloc[-1] < bb['BBL_5_2.0'].iloc[-1]: signals.append("BUY")
+    elif df['Close'].iloc[-1] > bb['BBU_5_2.0'].iloc[-1]: signals.append("SELL")
 
-    # 7. ADX
     adx = ta.adx(df['High'], df['Low'], df['Close'])
-    if adx['ADX_14'].iloc[-1] > 25:
-        signals.append("BUY" if df['Close'].iloc[-1] > df['Close'].iloc[-2] else "SELL")
+    if adx['ADX_14'].iloc[-1] > 25: signals.append("BUY" if df['Close'].iloc[-1] > df['Close'].iloc[-2] else "SELL")
 
-    # 8. CCI
     cci = ta.cci(df['High'], df['Low'], df['Close'])
-    if cci.iloc[-1] < -100:
-        signals.append("BUY")
-    elif cci.iloc[-1] > 100:
-        signals.append("SELL")
+    if cci.iloc[-1] < -100: signals.append("BUY")
+    elif cci.iloc[-1] > 100: signals.append("SELL")
 
-    # 9. OBV
     obv = ta.obv(df['Close'], df['Volume'])
     signals.append("BUY" if obv.iloc[-1] > obv.iloc[-2] else "SELL")
 
-    # 10. ATR trend
     atr = ta.atr(df['High'], df['Low'], df['Close'])
     signals.append("BUY" if df['Close'].iloc[-1] > df['Close'].iloc[-2] else "SELL")
 
@@ -224,24 +196,10 @@ def get_signal(df: pd.DataFrame):
 
 # ===================== HANDLERS =====================
 
-async def check_subscription(user_id: int):
-    try:
-        member = await bot(GetChatMember(chat_id=CHANNEL_USERNAME, user_id=user_id))
-        return member.status in ["member", "administrator", "creator"]
-    except:
-        return False
-
 @dp.message(Command("start"))
 async def start_cmd(msg: types.Message, state: FSMContext):
     await state.clear()
     await save_user(msg.from_user.id)
-    subscribed = await check_subscription(msg.from_user.id)
-    if not subscribed:
-        await msg.answer(
-            "📢 Чтобы использовать бота, подпишитесь на канал",
-            reply_markup=subscribe_kb()
-        )
-        return
     await msg.answer("📈 Выбери валютную пару:", reply_markup=pairs_kb())
     await state.set_state(Form.choosing_pair)
 
@@ -263,7 +221,7 @@ async def pair_cb(cb: types.CallbackQuery, state: FSMContext):
 async def tf_cb(cb: types.CallbackQuery, state: FSMContext):
     _, pair, tf = cb.data.split(":")
     tf = int(tf)
-    await cb.answer("⏳ Анализ рынка...")
+    await cb.answer("⏳ Анализ...")
 
     df = yf.download(pair, period="1d", interval=f"{tf}m")
     if df.empty:
@@ -283,6 +241,7 @@ async def res_cb(cb: types.CallbackQuery):
     await update_trade(int(trade_id), result)
     await cb.message.edit_text("✅ Результат сохранён")
     await cb.answer()
+    # Возврат к выбору пары
     await cb.message.answer("📈 Выбери валютную пару:", reply_markup=pairs_kb())
 
 @dp.callback_query(lambda c: c.data.startswith("history"))
