@@ -15,7 +15,7 @@ import asyncpg
 from functools import lru_cache 
 
 # --- Импорты для aiogram V3 и aiohttp V2 запуска ---
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
@@ -24,23 +24,18 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder 
 from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.client.default import DefaultBotProperties
-# ВАЖНО: Импортируем SimpleRequestHandler для явной регистрации роута Webhook
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web 
-from aiogram.utils.markdown import link
 from aiogram.enums import ParseMode
 
 # --- ВРЕМЕННЫЙ ИМПОРТ: Заглушка для API ---
 import yfinance as yf 
 
 # -------------------- Конфиг и Ключи --------------------
-# Используйте env-переменные для продакшена
+
 TG_TOKEN = os.environ.get("TG_TOKEN") 
 DATABASE_URL = os.environ.get("DATABASE_URL") 
-API_KEY = os.environ.get("API_KEY") 
-SECRET_KEY = os.environ.get("SECRET_KEY") 
-
-PO_REFERRAL_LINK = "https://m.po-tck.com/ru/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START" 
+# API_KEY, SECRET_KEY, PO_REFERRAL_LINK (не используются в текущей версии)
 
 # НАСТРОЙКИ WEBHOOK
 WEB_SERVER_PORT = int(os.environ.get("PORT", 10000)) 
@@ -67,6 +62,7 @@ TIMEFRAMES = [1, 3, 5, 10]
 PAIRS_PER_PAGE = 6
 
 # -------------------- Бот и диспетчер --------------------
+# Использование ParseMode.MARKDOWN для жирного текста
 bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
 dp = Dispatcher(storage=MemoryStorage())
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -87,18 +83,19 @@ async def init_db_pool():
         await init_db_tables()
     except Exception as e:
         logging.error(f"❌ Ошибка подключения или создания пула PostgreSQL: {e}")
-        # Не выходим, чтобы бот работал хотя бы в In-Memory режиме, если DB упала.
 
 async def init_db_tables():
     """Создает необходимые таблицы (users и trades)."""
     if not DB_POOL: return
     try:
         async with DB_POOL.acquire() as conn:
+            # Убеждаемся, что таблица users существует
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY
                 );
             """)
+            # Таблица trades с внешним ключом
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
                     id SERIAL PRIMARY KEY,
@@ -115,7 +112,7 @@ async def init_db_tables():
         logging.error(f"❌ Ошибка при создании/проверке таблиц БД: {e}")
 
 # In-Memory заглушка, если DB не работает
-AUTHORIZED_USERS: Dict[int, bool] = {} 
+# AUTHORIZED_USERS: Dict[int, bool] = {} # Не используется, можно удалить
 
 async def save_user_db(user_id: int):
     if DB_POOL:
@@ -124,13 +121,12 @@ async def save_user_db(user_id: int):
                 await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
         except Exception as e:
             logging.error(f"Ошибка сохранения пользователя {user_id} в DB: {e}")
-    else:
-        AUTHORIZED_USERS[user_id] = True
 
 async def save_trade_db(user_id: int, pair: str, timeframe: int, direction: str) -> int:
     await save_user_db(user_id) 
 
     if not DB_POOL: 
+        # Возвращаем временный ID для in-memory логики (или просто время)
         logging.warning("⚠️ DB недоступна. Сделка не сохранена.")
         return int(time.time()) 
 
@@ -175,11 +171,12 @@ async def get_user_stats_db(user_id: int) -> Dict[str, Any]:
             """, user_id)
         
         formatted_pair_stats: Dict[str, Dict[str, int]] = {}
-        for pair, result, count in pair_rows:
-            if pair not in formatted_pair_stats:
-                formatted_pair_stats[pair] = {'PLUS': 0, 'MINUS': 0}
-            if result in formatted_pair_stats[pair]:
-                formatted_pair_stats[pair][result] = count
+        if pair_rows: # Проверка на пустой результат
+            for pair, result, count in pair_rows:
+                if pair not in formatted_pair_stats:
+                    formatted_pair_stats[pair] = {'PLUS': 0, 'MINUS': 0}
+                if result in formatted_pair_stats[pair]:
+                    formatted_pair_stats[pair][result] = count
 
         return {
             'total_plus': stats.get('PLUS', 0),
@@ -248,8 +245,10 @@ def get_timeframes_keyboard(pair: str) -> InlineKeyboardMarkup:
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
     await state.clear()
+    
+    # Сразу пытаемся сохранить пользователя, если DB доступна
+    await save_user_db(message.from_user.id)
     
     await message.answer(
         "👋 **Привет, я твой торгующий помощник.**\n\n"
@@ -261,13 +260,18 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data in ["main_menu", "start_trade"])
 async def main_menu_handler(query: types.CallbackQuery, state: FSMContext):
-    user_id = query.from_user.id
-        
+    
     await state.clear()
     
     if query.data == "main_menu":
-        if query.message:
+        # Используем try/except для предотвращения ошибки, если сообщение уже изменено
+        try:
             await query.message.edit_text(
+                "🏠 **Главное меню**\n\nВыберите действие:",
+                reply_markup=get_main_menu_keyboard()
+            )
+        except Exception:
+            await query.message.answer(
                 "🏠 **Главное меню**\n\nВыберите действие:",
                 reply_markup=get_main_menu_keyboard()
             )
@@ -282,7 +286,7 @@ async def main_menu_handler(query: types.CallbackQuery, state: FSMContext):
     await query.answer()
 
 @dp.callback_query(lambda c: c.data == "show_history")
-async def show_history_handler(query: types.CallbackQuery, state: FSMContext):
+async def show_history_handler(query: types.CallbackQuery):
     user_id = query.from_user.id
         
     stats = await get_user_stats_db(user_id) 
@@ -292,6 +296,8 @@ async def show_history_handler(query: types.CallbackQuery, state: FSMContext):
     
     if total_trades == 0:
         text = "📜 **История сделок**\n\nУ вас пока нет закрытых сделок."
+        if not db_active and DATABASE_URL:
+            text += "\n\n⚠️ **База данных PostgreSQL недоступна.**"
     else:
         win_rate = (stats['total_plus'] / total_trades) * 100 if total_trades > 0 else 0
         
@@ -304,14 +310,20 @@ async def show_history_handler(query: types.CallbackQuery, state: FSMContext):
             "--- Статистика по парам ---\n"
         )
         
+        pair_stats_text = ""
         for pair, data in stats['pair_stats'].items():
             plus = data.get('PLUS', 0)
             minus = data.get('MINUS', 0)
             total = plus + minus
             pair_win_rate = (plus / total) * 100 if total > 0 else 0
-            text += (
+            pair_stats_text += (
                 f"\n**{pair}**: {plus} ✅ / {minus} ❌ ({pair_win_rate:.1f}%)"
             )
+        
+        if pair_stats_text:
+            text += pair_stats_text
+        else:
+            text += "\n*(Нет статистики по отдельным парам)*"
         
         if not db_active:
             text += "\n\n⚠️ **Примечание:** База данных PostgreSQL недоступна. История может быть неполной."
@@ -323,25 +335,36 @@ async def show_history_handler(query: types.CallbackQuery, state: FSMContext):
     await query.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("result:"))
-async def trade_result_handler(query: types.CallbackQuery, state: FSMContext):
-    _, trade_id_str, result = query.data.split(":")
-    trade_id = int(trade_id_str)
+async def trade_result_handler(query: types.CallbackQuery):
+    try:
+        _, trade_id_str, result = query.data.split(":")
+        trade_id = int(trade_id_str)
+    except ValueError:
+        await query.answer("Ошибка данных. Попробуйте снова.")
+        return
     
+    # 1. Обновляем результат в DB
     await update_trade_result_db(trade_id, result)
     
     icon = "✅" if result == "PLUS" else "❌"
     
-    await query.message.edit_reply_markup(reply_markup=None)
-    
+    # 2. Убираем клавиатуру результата (если сообщение еще не изменено)
+    try:
+        await query.message.edit_reply_markup(reply_markup=None)
+    except Exception as e:
+        logging.warning(f"Не удалось убрать клавиатуру результата: {e}")
+        
+    # 3. Отправляем подтверждение
     keyboard = InlineKeyboardBuilder()
     keyboard.button(text="🏠 Главное меню", callback_data="main_menu")
     
     text = f"{icon} **Результат сделки сохранен: {result}**\n\nВыберите следующее действие:"
     if not DB_POOL:
-        text += "\n\n⚠️ **ВНИМАНИЕ:** История не сохранена навсегда (нет DB)."
+        text += "\n\n⚠️ **ВНИМАНИЕ:** История не сохранена (нет DB)."
     
-    await query.message.answer(
-        text,
+    await bot.send_message( # Отправляем новое сообщение, чтобы избежать конфликтов редактирования
+        chat_id=query.message.chat.id,
+        text=text,
         reply_markup=keyboard.as_markup()
     )
 
@@ -349,8 +372,7 @@ async def trade_result_handler(query: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data.startswith("page:"))
 async def page_handler(query: types.CallbackQuery, state: FSMContext):
-    user_id = query.from_user.id
-        
+    
     page = int(query.data.split(":")[1])
     await query.message.edit_text(
         "Выбери валютную пару:",
@@ -360,23 +382,21 @@ async def page_handler(query: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
 async def pair_handler(query: types.CallbackQuery, state: FSMContext):
-    user_id = query.from_user.id
-        
+    
     pair = query.data.split(":")[1]
     await state.update_data(selected_pair=pair)
     
     await state.set_state(Form.choosing_timeframe) 
     
     await query.message.edit_text(
-        f"Выбрана пара {pair}. Теперь выбери таймфрейм:",
+        f"Выбрана пара **{pair}**. Теперь выбери таймфрейм:",
         reply_markup=get_timeframes_keyboard(pair)
     )
     await query.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("tf:"))
 async def tf_handler(query: types.CallbackQuery, state: FSMContext):
-    user_id = query.from_user.id
-        
+    
     current_state = await state.get_state()
     if current_state != Form.choosing_timeframe:
         await query.answer("⏳ Дождитесь завершения предыдущего запроса или выберите пару снова.", show_alert=False)
@@ -387,10 +407,9 @@ async def tf_handler(query: types.CallbackQuery, state: FSMContext):
     _, pair, tf = query.data.split(":")
     tf = int(tf)
     
-    await save_user_db(user_id) 
-
+    # Отправляем сообщение о загрузке
     await query.answer("Идет загрузка сигнала...", show_alert=False) 
-    message_to_edit = await query.message.edit_text(f"Выбраны {pair} и {tf} мин. Идет загрузка сигнала...")
+    message_to_edit = await query.message.edit_text(f"Выбраны **{pair}** и **{tf} мин**. Идет загрузка сигнала...")
 
     try:
         await send_signal(pair, tf, query.from_user.id, message_to_edit.chat.id, message_to_edit.message_id)
@@ -404,10 +423,11 @@ async def tf_handler(query: types.CallbackQuery, state: FSMContext):
         logging.error(f"Критическая ошибка в tf_handler: {e}")
         
     
-# -------------------- Получение свечей и Индикаторы (Без изменений) --------------------
+# -------------------- Получение свечей и Индикаторы --------------------
 
 @lru_cache(maxsize=128)
 def get_cache_key(symbol: str, exp_minutes: int, current_minute: int) -> str:
+    """Генерирует ключ кэша, который сбрасывается каждую минуту."""
     return f"{symbol}_{exp_minutes}_{current_minute}"
 
 
@@ -417,6 +437,7 @@ async def async_fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
     
     def sync_fetch_data():
         try:
+            # Загрузка 1-минутных данных за 5 дней
             df = yf.download(f"{symbol}=X", period="5d", interval="1m", progress=False, show_errors=False) 
         except Exception as e:
             logging.error(f"Ошибка загрузки данных YFinance для {symbol}: {e}")
@@ -430,6 +451,7 @@ async def async_fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
         df.columns = [col.lower() for col in required_cols]
         
         if exp_minutes > 1 and not df.empty:
+            # Пересамплирование до нужного таймфрейма
             df = df.resample(f"{exp_minutes}min").agg({
                 'open':'first','high':'max','low':'min','close':'last','volume':'sum'
             }).dropna()
@@ -440,9 +462,15 @@ async def async_fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
             
         return df
 
-    return await asyncio.to_thread(sync_fetch_data)
+    try:
+        return await asyncio.to_thread(sync_fetch_data)
+    except Exception as e:
+        logging.error(f"Ошибка выполнения sync_fetch_data в потоке: {e}")
+        return pd.DataFrame()
+
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    # (Оставлено без изменений, так как расчеты индикаторов корректны)
     df = df.copy()
     
     df['ema9'] = ta.ema(df['close'], length=9)
@@ -467,6 +495,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df_cleaned.tail(50)
 
 def support_resistance(df: pd.DataFrame) -> Dict[str, float]:
+    # (Оставлено без изменений)
     levels = {'support': float('nan'), 'resistance': float('nan')}
     df_sr = df.tail(10) 
     if not df_sr.empty:
@@ -475,6 +504,7 @@ def support_resistance(df: pd.DataFrame) -> Dict[str, float]:
     return levels
 
 def indicator_vote(latest: pd.Series) -> Dict[str, Union[str, float]]:
+    # (Оставлено без изменений, так как логика голосования индикаторов корректна)
     score = 0
     
     if latest['ema9'] > latest['ema21'] and latest['close'] > latest['ema21']:
@@ -533,12 +563,12 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
     dir_map = {"BUY":"🔺 ПОКУПКА","SELL":"🔻 ПРОДАЖА","HOLD":"⚠️ НЕОДНОЗНАЧНО"}
     text = (
         f"📊 **Сигнал #{trade_id}**\n\n"
-        f"Пара: {pair}\n"
-        f"Таймфрейм: {timeframe} мин\n\n"
+        f"Пара: **{pair}**\n"
+        f"Таймфрейм: **{timeframe} мин**\n\n"
         f"Направление: **{dir_map[res['direction']]}**\n"
         f"Уверенность: {res['confidence']:.0f}%\n\n"
-        f"Поддержка: {sr['support']:.5f}\n"
-        f"Сопротивление: {sr['resistance']:.5f}\n\n"
+        f"Поддержка (S/R): {sr['support']:.5f}\n"
+        f"Сопротивление (S/R): {sr['resistance']:.5f}\n\n"
         f"**Нажмите кнопку ниже после закрытия сделки:**"
     )
     
@@ -554,17 +584,20 @@ async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, mes
 
 # -------------------- БЛОК ЗАПУСКА WEBHOOK (ФИНАЛЬНЫЙ С FIX) --------------------
 
-# --- НОВАЯ ФУНКЦИЯ ДЛЯ ПРОВЕРКИ РАБОТОСПОСОБНОСТИ ---
 async def health_check(request):
-    """Корневая конечная точка для проверки работоспособности Render/UptimeRobot."""
+    """Корневая конечная точка для проверки работоспособности Render/UptimeRobot (FIX 200)."""
     return web.Response(text="Bot is running!", status=200)
 
 async def on_startup_webhook(bot: Bot):
+    """Выполняется при старте aiohttp-приложения."""
     await init_db_pool()
     
     try:
-        await bot(DeleteWebhook(drop_pending_updates=True))
+        # Сначала удаляем, чтобы сбросить ожидающие обновления (FIX 4)
+        await bot(DeleteWebhook(drop_pending_updates=True)) 
+        
         if WEBHOOK_URL:
+            # Устанавливаем новый Webhook (FIX 3)
             await bot(SetWebhook(url=WEBHOOK_URL)) 
             logging.info(f"✅ Webhook успешно переустановлен: {WEBHOOK_URL}")
         else:
@@ -573,34 +606,40 @@ async def on_startup_webhook(bot: Bot):
         logging.error(f"Ошибка в on_startup_webhook: {e}")
 
 async def on_shutdown_webhook(bot: Bot):
+    """Выполняется при остановке aiohttp-приложения."""
     try:
+        # Удаляем Webhook (FIX 4)
+        await bot(DeleteWebhook(drop_pending_updates=True))
+        logging.info("🗑️ Webhook удален.")
+        
+        # Закрываем пул DB (FIX 4)
         if DB_POOL:
             await DB_POOL.close()
             logging.info("❌ Пул PostgreSQL закрыт.")
-        await bot(DeleteWebhook(drop_pending_updates=True))
     except Exception as e:
         logging.error(f"Ошибка при удалении Webhook/закрытии DB: {e}")
-    logging.info("❌ Webhook удален.")
 
 
 async def start_webhook():
     logging.info(f"--- ЗАПУСК WEBHOOK СЕРВЕРА V6-FINAL-FIXED: {WEBHOOK_URL} ---")
     
+    # Регистрируем функции запуска и остановки
     dp.startup.register(on_startup_webhook)
     dp.shutdown.register(on_shutdown_webhook)
     
     app = web.Application()
     
-    # 🟢 1. ЯВНАЯ РЕГИСТРАЦИЯ РОУТА ДЛЯ ПРОВЕРКИ РАБОТОСПОСОБНОСТИ (FIX 404)
+    # 🟢 1. ЯВНАЯ РЕГИСТРАЦИЯ РОУТА ДЛЯ ПРОВЕРКИ РАБОТОСПОСОБНОСТИ (FIX 2)
     app.router.add_get('/', health_check) 
     
-    # 🟢 2. ОСНОВНОЙ РОУТ ДЛЯ WEBHOOK (FIX 404)
+    # 🟢 2. ОСНОВНОЙ РОУТ ДЛЯ WEBHOOK (FIX 1)
     webhook_request_handler = SimpleRequestHandler(
         dispatcher=dp, 
         bot=bot, 
         handle_in_background=False
     )
-    webhook_request_handler.register(app, path=WEBHOOK_BASE_PATH)
+    # Регистрируем хендлер на полный путь
+    webhook_request_handler.register(app, path=WEBHOOK_BASE_PATH) 
     
     try:
         runner = web.AppRunner(app)
@@ -609,10 +648,12 @@ async def start_webhook():
         await site.start()
         logging.info(f"🌐 Сервер запущен на {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
         
+        # Блокировка процесса, чтобы сервер продолжал работать
         await asyncio.Event().wait() 
 
     except Exception as e:
         logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА ЗАПУСКА WEBHOOK-СЕРВЕРА: {e}")
+        # В случае критической ошибки запуска, завершаем работу
         sys.exit(1) 
 
 def main():
@@ -624,4 +665,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
