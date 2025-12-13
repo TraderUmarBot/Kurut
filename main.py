@@ -1,4 +1,4 @@
-# main.py - V6-FINAL-FIXED (ФИНАЛЬНЫЙ FIX 404 WEBHOOK)
+# main.py - V7-FINAL-FIXED-ROUTE (ФИНАЛЬНЫЙ FIX 404 WEBHOOK РОУТИНГА)
 
 import os
 import asyncio
@@ -47,8 +47,8 @@ if not all([TG_TOKEN, RENDER_EXTERNAL_HOSTNAME]):
     logging.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Не задан TG_TOKEN или RENDER_EXTERNAL_HOSTNAME. Выход.")
     sys.exit(1)
 
-# --- WEBHOOK PATH ---
-WEBHOOK_PATH = f"/webhook/{TG_TOKEN}" 
+# --- WEBHOOK PATH (ОЧИЩЕННЫЙ ПУТЬ БЕЗ ТОКЕНА ДЛЯ aiohttp) ---
+WEBHOOK_PATH = "/webhook" 
 WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 WEBHOOK_BASE_PATH = WEBHOOK_PATH 
 
@@ -407,7 +407,12 @@ async def async_fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
     
     def sync_fetch_data():
         try:
-            df = yf.download(f"{symbol}=X", period="5d", interval="1m", progress=False, show_errors=False) 
+            # yfinance использует формат, отличный от того, который мы ждем для forex-пар
+            # Для надежности используем yfinance с форматированием, если это возможно, 
+            # но в реальном продакшене лучше использовать надежный Forex API
+            yf_symbol = f"{symbol}=X" if symbol not in ["USDJPY", "EURUSD", "GBPUSD"] else symbol # Пример упрощения
+            
+            df = yf.download(yf_symbol, period="5d", interval="1m", progress=False, show_errors=False) 
         except Exception as e:
             logging.error(f"Ошибка загрузки данных YFinance для {symbol}: {e}")
             return pd.DataFrame() 
@@ -529,9 +534,13 @@ async def on_startup_webhook(bot: Bot):
     
     try:
         await bot(DeleteWebhook(drop_pending_updates=True)) 
-        if WEBHOOK_URL:
-            await bot(SetWebhook(url=WEBHOOK_URL)) 
-            logging.info(f"✅ Webhook успешно переустановлен: {WEBHOOK_URL}")
+        
+        # 🟢 ИСПОЛЬЗУЕМ ПОЛНЫЙ ПУТЬ С ТОКЕНОМ ДЛЯ TELEGRAM
+        FULL_WEBHOOK_URL_WITH_TOKEN = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}/{TG_TOKEN}"
+        
+        if FULL_WEBHOOK_URL_WITH_TOKEN:
+            await bot(SetWebhook(url=FULL_WEBHOOK_URL_WITH_TOKEN)) 
+            logging.info(f"✅ Webhook успешно переустановлен: {FULL_WEBHOOK_URL_WITH_TOKEN}")
         else:
             logging.error("❌ Webhook URL не определен.")
     except Exception as e:
@@ -551,19 +560,25 @@ async def on_shutdown_webhook(bot: Bot):
 
 
 async def start_webhook():
-    logging.info(f"--- ЗАПУСК WEBHOOK СЕРВЕРА V6-FINAL-FIXED: {WEBHOOK_URL} ---")
+    
+    # 🟢 ИСПОЛЬЗУЕМ ПОЛНЫЙ ПУТЬ С ТОКЕНОМ ДЛЯ ЛОГГИРОВАНИЯ
+    FULL_WEBHOOK_URL_WITH_TOKEN = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}/{TG_TOKEN}"
+    logging.info(f"--- ЗАПУСК WEBHOOK СЕРВЕРА V7-FINAL-FIXED-ROUTE: {FULL_WEBHOOK_URL_WITH_TOKEN} ---")
     
     dp.startup.register(on_startup_webhook)
     dp.shutdown.register(on_shutdown_webhook)
     
     app = web.Application()
     
-    # 🟢 1. ЯВНАЯ РЕГИСТРАЦИЯ РОУТА ДЛЯ ПРОВЕРКИ РАБОТОСПОСОБНОСТИ (FIX 2)
+    # 🟢 1. ЯВНАЯ РЕГИСТРАЦИЯ РОУТА ДЛЯ ПРОВЕРКИ РАБОТОСПОСОБНОСТИ
     app.router.add_get('/', health_check) 
     
-    # 🟢 2. ОСНОВНОЙ РОУТ ДЛЯ WEBHOOK (ФИНАЛЬНЫЙ FIX 404!)
-    # ИСПОЛЬЗУЕМ setup_application для гарантированной привязки Webhook к aiohttp
-    setup_application(app, dp, bot=bot, path=WEBHOOK_BASE_PATH)
+    # 🟢 2. ОСНОВНОЙ РОУТ ДЛЯ WEBHOOK (ФИНАЛЬНЫЙ FIX 404)
+    
+    # ИСПОЛЬЗУЕМ {token} как параметр роута, чтобы aiohttp корректно обработал двоеточие
+    SETUP_PATH = f"{WEBHOOK_BASE_PATH}/{{token}}" 
+    
+    setup_application(app, dp, bot=bot, path=SETUP_PATH) # <-- ИСПОЛЬЗУЕМ НОВЫЙ SETUP_PATH
     
     try:
         runner = web.AppRunner(app)
