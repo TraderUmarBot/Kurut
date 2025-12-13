@@ -1,4 +1,4 @@
-# main.py - V6-FINAL-FIXED: Включена История Сделок, Статистика и ИСПРАВЛЕНЫ ОШИБКИ 404
+# main.py - V6-FINAL-FIXED (ФИНАЛЬНЫЙ FIX 404 WEBHOOK)
 
 import os
 import asyncio
@@ -24,7 +24,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder 
 from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.client.default import DefaultBotProperties
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler
+# ВАЖНОЕ ИЗМЕНЕНИЕ: setup_application для гарантированной регистрации Webhook
+from aiogram.webhook.aiohttp_server import setup_application 
 from aiohttp import web 
 from aiogram.enums import ParseMode
 
@@ -35,7 +36,6 @@ import yfinance as yf
 
 TG_TOKEN = os.environ.get("TG_TOKEN") 
 DATABASE_URL = os.environ.get("DATABASE_URL") 
-# API_KEY, SECRET_KEY, PO_REFERRAL_LINK (не используются в текущей версии)
 
 # НАСТРОЙКИ WEBHOOK
 WEB_SERVER_PORT = int(os.environ.get("PORT", 10000)) 
@@ -62,17 +62,15 @@ TIMEFRAMES = [1, 3, 5, 10]
 PAIRS_PER_PAGE = 6
 
 # -------------------- Бот и диспетчер --------------------
-# Использование ParseMode.MARKDOWN для жирного текста
 bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
 dp = Dispatcher(storage=MemoryStorage())
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 DB_POOL: Union[asyncpg.Pool, None] = None 
 
 
-# -------------------- PostgreSQL Логика --------------------
+# -------------------- PostgreSQL Логика (Оставлена без изменений) --------------------
 
 async def init_db_pool():
-    """Инициализирует пул подключений к PostgreSQL."""
     global DB_POOL
     if not DATABASE_URL:
         logging.warning("⚠️ DATABASE_URL не задан. Бот будет работать без сохранения истории (In-Memory).")
@@ -85,17 +83,14 @@ async def init_db_pool():
         logging.error(f"❌ Ошибка подключения или создания пула PostgreSQL: {e}")
 
 async def init_db_tables():
-    """Создает необходимые таблицы (users и trades)."""
     if not DB_POOL: return
     try:
         async with DB_POOL.acquire() as conn:
-            # Убеждаемся, что таблица users существует
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY
                 );
             """)
-            # Таблица trades с внешним ключом
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
                     id SERIAL PRIMARY KEY,
@@ -111,9 +106,6 @@ async def init_db_tables():
     except Exception as e:
         logging.error(f"❌ Ошибка при создании/проверке таблиц БД: {e}")
 
-# In-Memory заглушка, если DB не работает
-# AUTHORIZED_USERS: Dict[int, bool] = {} # Не используется, можно удалить
-
 async def save_user_db(user_id: int):
     if DB_POOL:
         try:
@@ -126,7 +118,6 @@ async def save_trade_db(user_id: int, pair: str, timeframe: int, direction: str)
     await save_user_db(user_id) 
 
     if not DB_POOL: 
-        # Возвращаем временный ID для in-memory логики (или просто время)
         logging.warning("⚠️ DB недоступна. Сделка не сохранена.")
         return int(time.time()) 
 
@@ -171,7 +162,7 @@ async def get_user_stats_db(user_id: int) -> Dict[str, Any]:
             """, user_id)
         
         formatted_pair_stats: Dict[str, Dict[str, int]] = {}
-        if pair_rows: # Проверка на пустой результат
+        if pair_rows: 
             for pair, result, count in pair_rows:
                 if pair not in formatted_pair_stats:
                     formatted_pair_stats[pair] = {'PLUS': 0, 'MINUS': 0}
@@ -189,7 +180,7 @@ async def get_user_stats_db(user_id: int) -> Dict[str, Any]:
         return {'total_plus': 0, 'total_minus': 0, 'pair_stats': {}, 'db_active': False}
 
 
-# -------------------- FSM и Клавиатуры --------------------
+# -------------------- FSM и Клавиатуры (Оставлены без изменений) --------------------
 class Form(StatesGroup):
     choosing_pair = State()
     choosing_timeframe = State()
@@ -241,15 +232,12 @@ def get_timeframes_keyboard(pair: str) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-# -------------------- Обработчики (Хендлеры) --------------------
+# -------------------- Обработчики (Хендлеры) (Оставлены без изменений) --------------------
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
-    
-    # Сразу пытаемся сохранить пользователя, если DB доступна
     await save_user_db(message.from_user.id)
-    
     await message.answer(
         "👋 **Привет, я твой торгующий помощник.**\n\n"
         "📈 Выбери валютную пару, чтобы начать:",
@@ -264,7 +252,6 @@ async def main_menu_handler(query: types.CallbackQuery, state: FSMContext):
     await state.clear()
     
     if query.data == "main_menu":
-        # Используем try/except для предотвращения ошибки, если сообщение уже изменено
         try:
             await query.message.edit_text(
                 "🏠 **Главное меню**\n\nВыберите действие:",
@@ -288,10 +275,8 @@ async def main_menu_handler(query: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(lambda c: c.data == "show_history")
 async def show_history_handler(query: types.CallbackQuery):
     user_id = query.from_user.id
-        
     stats = await get_user_stats_db(user_id) 
     db_active = stats.pop('db_active')
-    
     total_trades = stats['total_plus'] + stats['total_minus']
     
     if total_trades == 0:
@@ -300,7 +285,6 @@ async def show_history_handler(query: types.CallbackQuery):
             text += "\n\n⚠️ **База данных PostgreSQL недоступна.**"
     else:
         win_rate = (stats['total_plus'] / total_trades) * 100 if total_trades > 0 else 0
-        
         text = (
             "📜 **История сделок**\n\n"
             f"Общее количество сделок: **{total_trades}**\n"
@@ -309,7 +293,6 @@ async def show_history_handler(query: types.CallbackQuery):
             f"🎯 Процент побед (Win Rate): **{win_rate:.2f}%**\n\n"
             "--- Статистика по парам ---\n"
         )
-        
         pair_stats_text = ""
         for pair, data in stats['pair_stats'].items():
             plus = data.get('PLUS', 0)
@@ -343,18 +326,14 @@ async def trade_result_handler(query: types.CallbackQuery):
         await query.answer("Ошибка данных. Попробуйте снова.")
         return
     
-    # 1. Обновляем результат в DB
     await update_trade_result_db(trade_id, result)
-    
     icon = "✅" if result == "PLUS" else "❌"
     
-    # 2. Убираем клавиатуру результата (если сообщение еще не изменено)
     try:
         await query.message.edit_reply_markup(reply_markup=None)
     except Exception as e:
         logging.warning(f"Не удалось убрать клавиатуру результата: {e}")
         
-    # 3. Отправляем подтверждение
     keyboard = InlineKeyboardBuilder()
     keyboard.button(text="🏠 Главное меню", callback_data="main_menu")
     
@@ -362,17 +341,15 @@ async def trade_result_handler(query: types.CallbackQuery):
     if not DB_POOL:
         text += "\n\n⚠️ **ВНИМАНИЕ:** История не сохранена (нет DB)."
     
-    await bot.send_message( # Отправляем новое сообщение, чтобы избежать конфликтов редактирования
+    await bot.send_message(
         chat_id=query.message.chat.id,
         text=text,
         reply_markup=keyboard.as_markup()
     )
-
     await query.answer(f"Результат {result} сохранен!")
 
 @dp.callback_query(lambda c: c.data.startswith("page:"))
 async def page_handler(query: types.CallbackQuery, state: FSMContext):
-    
     page = int(query.data.split(":")[1])
     await query.message.edit_text(
         "Выбери валютную пару:",
@@ -382,12 +359,9 @@ async def page_handler(query: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
 async def pair_handler(query: types.CallbackQuery, state: FSMContext):
-    
     pair = query.data.split(":")[1]
     await state.update_data(selected_pair=pair)
-    
     await state.set_state(Form.choosing_timeframe) 
-    
     await query.message.edit_text(
         f"Выбрана пара **{pair}**. Теперь выбери таймфрейм:",
         reply_markup=get_timeframes_keyboard(pair)
@@ -396,18 +370,15 @@ async def pair_handler(query: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data.startswith("tf:"))
 async def tf_handler(query: types.CallbackQuery, state: FSMContext):
-    
     current_state = await state.get_state()
     if current_state != Form.choosing_timeframe:
         await query.answer("⏳ Дождитесь завершения предыдущего запроса или выберите пару снова.", show_alert=False)
         return
         
     await state.set_state(None) 
-
     _, pair, tf = query.data.split(":")
     tf = int(tf)
     
-    # Отправляем сообщение о загрузке
     await query.answer("Идет загрузка сигнала...", show_alert=False) 
     message_to_edit = await query.message.edit_text(f"Выбраны **{pair}** и **{tf} мин**. Идет загрузка сигнала...")
 
@@ -423,11 +394,10 @@ async def tf_handler(query: types.CallbackQuery, state: FSMContext):
         logging.error(f"Критическая ошибка в tf_handler: {e}")
         
     
-# -------------------- Получение свечей и Индикаторы --------------------
+# -------------------- Получение свечей и Индикаторы (Оставлены без изменений) --------------------
 
 @lru_cache(maxsize=128)
 def get_cache_key(symbol: str, exp_minutes: int, current_minute: int) -> str:
-    """Генерирует ключ кэша, который сбрасывается каждую минуту."""
     return f"{symbol}_{exp_minutes}_{current_minute}"
 
 
@@ -437,7 +407,6 @@ async def async_fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
     
     def sync_fetch_data():
         try:
-            # Загрузка 1-минутных данных за 5 дней
             df = yf.download(f"{symbol}=X", period="5d", interval="1m", progress=False, show_errors=False) 
         except Exception as e:
             logging.error(f"Ошибка загрузки данных YFinance для {symbol}: {e}")
@@ -451,7 +420,6 @@ async def async_fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
         df.columns = [col.lower() for col in required_cols]
         
         if exp_minutes > 1 and not df.empty:
-            # Пересамплирование до нужного таймфрейма
             df = df.resample(f"{exp_minutes}min").agg({
                 'open':'first','high':'max','low':'min','close':'last','volume':'sum'
             }).dropna()
@@ -470,32 +438,23 @@ async def async_fetch_ohlcv(symbol: str, exp_minutes: int) -> pd.DataFrame:
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    # (Оставлено без изменений, так как расчеты индикаторов корректны)
     df = df.copy()
-    
     df['ema9'] = ta.ema(df['close'], length=9)
     df['ema21'] = ta.ema(df['close'], length=21)
     df['sma50'] = ta.sma(df['close'], length=50)
-    
     macd = ta.macd(df['close'])
     df['macd'] = macd['MACD_12_26_9']
     df['macd_signal'] = macd['MACDs_12_26_9']
-    
     df['rsi14'] = ta.rsi(df['close'], length=14)
-    
     stoch = ta.stoch(df['high'], df['low'], df['close'])
     df['stoch_k'] = stoch['STOCHk_14_3_3']
     df['stoch_d'] = stoch['STOCHd_14_3_3']
-
     df['cci20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
-    
     critical_cols = ['ema9', 'ema21', 'macd', 'rsi14', 'stoch_k', 'sma50']
     df_cleaned = df.dropna(subset=critical_cols)
-    
     return df_cleaned.tail(50)
 
 def support_resistance(df: pd.DataFrame) -> Dict[str, float]:
-    # (Оставлено без изменений)
     levels = {'support': float('nan'), 'resistance': float('nan')}
     df_sr = df.tail(10) 
     if not df_sr.empty:
@@ -504,60 +463,36 @@ def support_resistance(df: pd.DataFrame) -> Dict[str, float]:
     return levels
 
 def indicator_vote(latest: pd.Series) -> Dict[str, Union[str, float]]:
-    # (Оставлено без изменений, так как логика голосования индикаторов корректна)
     score = 0
-    
-    if latest['ema9'] > latest['ema21'] and latest['close'] > latest['ema21']:
-        score += 1 
-    elif latest['ema9'] < latest['ema21'] and latest['close'] < latest['ema21']:
-        score -= 1 
-    
+    if latest['ema9'] > latest['ema21'] and latest['close'] > latest['ema21']: score += 1 
+    elif latest['ema9'] < latest['ema21'] and latest['close'] < latest['ema21']: score -= 1 
     if latest['rsi14'] < 30: score += 1 
     if latest['rsi14'] > 70: score -= 1 
-
-    if latest['macd'] > latest['macd_signal'] and latest['macd'] < 0:
-        score += 1 
-    elif latest['macd'] < latest['macd_signal'] and latest['macd'] > 0:
-        score -= 1 
-    
-    if latest['stoch_k'] < 20 and latest['stoch_k'] > latest['stoch_d']:
-        score += 1 
-    if latest['stoch_k'] > 80 and latest['stoch_k'] < latest['stoch_d']:
-        score -= 1 
-            
-    if score >= 2:
-        direction = "BUY"
-    elif score <= -2:
-        direction = "SELL"
-    else:
-        direction = "HOLD" 
-
+    if latest['macd'] > latest['macd_signal'] and latest['macd'] < 0: score += 1 
+    elif latest['macd'] < latest['macd_signal'] and latest['macd'] > 0: score -= 1 
+    if latest['stoch_k'] < 20 and latest['stoch_k'] > latest['stoch_d']: score += 1 
+    if latest['stoch_k'] > 80 and latest['stoch_k'] < latest['stoch_d']: score -= 1 
+    if score >= 2: direction = "BUY"
+    elif score <= -2: direction = "SELL"
+    else: direction = "HOLD" 
     confidence = min(100, abs(score) * 20 + 30)
-    
     return {"direction": direction, "confidence": confidence, "score": score}
 
 
 async def send_signal(pair: str, timeframe: int, user_id: int, chat_id: int, message_id: int):
-    
     df = await async_fetch_ohlcv(pair, timeframe)
-    
     if df.empty: 
         error_text = f"❌ **Ошибка.** Не удалось загрузить достаточно данных для {pair} {timeframe} мин. Попробуйте позже."
         await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=error_text)
         return
-        
     df_ind = compute_indicators(df)
-    
     if df_ind.empty:
         error_text = f"❌ **Ошибка.** Не удалось рассчитать индикаторы. Данные слишком неполные."
         await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=error_text)
         return
-        
     latest = df_ind.iloc[-1]
-    
     res = indicator_vote(latest)
     sr = support_resistance(df_ind)
-    
     trade_id = await save_trade_db(user_id, pair, timeframe, res['direction'])
 
     dir_map = {"BUY":"🔺 ПОКУПКА","SELL":"🔻 ПРОДАЖА","HOLD":"⚠️ НЕОДНОЗНАЧНО"}
@@ -593,11 +528,8 @@ async def on_startup_webhook(bot: Bot):
     await init_db_pool()
     
     try:
-        # Сначала удаляем, чтобы сбросить ожидающие обновления (FIX 4)
         await bot(DeleteWebhook(drop_pending_updates=True)) 
-        
         if WEBHOOK_URL:
-            # Устанавливаем новый Webhook (FIX 3)
             await bot(SetWebhook(url=WEBHOOK_URL)) 
             logging.info(f"✅ Webhook успешно переустановлен: {WEBHOOK_URL}")
         else:
@@ -608,11 +540,9 @@ async def on_startup_webhook(bot: Bot):
 async def on_shutdown_webhook(bot: Bot):
     """Выполняется при остановке aiohttp-приложения."""
     try:
-        # Удаляем Webhook (FIX 4)
         await bot(DeleteWebhook(drop_pending_updates=True))
         logging.info("🗑️ Webhook удален.")
         
-        # Закрываем пул DB (FIX 4)
         if DB_POOL:
             await DB_POOL.close()
             logging.info("❌ Пул PostgreSQL закрыт.")
@@ -623,7 +553,6 @@ async def on_shutdown_webhook(bot: Bot):
 async def start_webhook():
     logging.info(f"--- ЗАПУСК WEBHOOK СЕРВЕРА V6-FINAL-FIXED: {WEBHOOK_URL} ---")
     
-    # Регистрируем функции запуска и остановки
     dp.startup.register(on_startup_webhook)
     dp.shutdown.register(on_shutdown_webhook)
     
@@ -632,14 +561,9 @@ async def start_webhook():
     # 🟢 1. ЯВНАЯ РЕГИСТРАЦИЯ РОУТА ДЛЯ ПРОВЕРКИ РАБОТОСПОСОБНОСТИ (FIX 2)
     app.router.add_get('/', health_check) 
     
-    # 🟢 2. ОСНОВНОЙ РОУТ ДЛЯ WEBHOOK (FIX 1)
-    webhook_request_handler = SimpleRequestHandler(
-        dispatcher=dp, 
-        bot=bot, 
-        handle_in_background=False
-    )
-    # Регистрируем хендлер на полный путь
-    webhook_request_handler.register(app, path=WEBHOOK_BASE_PATH) 
+    # 🟢 2. ОСНОВНОЙ РОУТ ДЛЯ WEBHOOK (ФИНАЛЬНЫЙ FIX 404!)
+    # ИСПОЛЬЗУЕМ setup_application для гарантированной привязки Webhook к aiohttp
+    setup_application(app, dp, bot=bot, path=WEBHOOK_BASE_PATH)
     
     try:
         runner = web.AppRunner(app)
@@ -648,12 +572,10 @@ async def start_webhook():
         await site.start()
         logging.info(f"🌐 Сервер запущен на {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
         
-        # Блокировка процесса, чтобы сервер продолжал работать
         await asyncio.Event().wait() 
 
     except Exception as e:
         logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА ЗАПУСКА WEBHOOK-СЕРВЕРА: {e}")
-        # В случае критической ошибки запуска, завершаем работу
         sys.exit(1) 
 
 def main():
@@ -665,3 +587,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
