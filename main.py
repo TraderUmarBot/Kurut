@@ -1,51 +1,34 @@
-# main.py — AI TECH SIGNAL BOT (Биржевые пары + OTC для Pocket Option)
-import os
-import sys
 import asyncio
 import logging
-from datetime import datetime
 import random
+import os
+from datetime import datetime
 
 import pandas as pd
-import pandas_ta as ta
 import yfinance as yf
-import asyncpg
+import pandas_ta as ta
 
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, Router
+from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.methods import DeleteWebhook, SetWebhook
-
 from aiohttp import web
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 
-# ===================== CONFIG =====================
-TG_TOKEN = os.environ.get("TG_TOKEN")
-DATABASE_URL = os.environ.get("DATABASE_URL")
-PORT = int(os.environ.get("PORT", 10000))
-HOST = "0.0.0.0"
-RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-
-if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
-    print("❌ TG_TOKEN или RENDER_EXTERNAL_HOSTNAME не заданы")
-    sys.exit(1)
-
+# ================== CONFIG ==================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
+PORT = int(os.getenv("PORT", 10000))
 
+# ================== LOG ==================
 logging.basicConfig(level=logging.INFO)
 
-# ===================== BOT =====================
-bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
-dp = Dispatcher(storage=MemoryStorage())
-DB_POOL = None
+# ================== BOT ==================
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
 
-# ===================== CONSTANTS =====================
+# ================== DATA ==================
 EXCHANGE_PAIRS = [
     "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X",
     "EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X",
@@ -53,272 +36,200 @@ EXCHANGE_PAIRS = [
 ]
 
 OTC_PAIRS = [
-    "AEDUSD", "CNYUSD", "AUDCAD", "AUDJPY", "CADCHF", "EURUSD", "EURCAD",
-    "BHDUSD", "EURJPY", "CHFNOK", "CHFJPY", "EURGBP", "EURRUB", "EURNZD",
-    "GBPAUD", "MADUSD", "NZDJPY", "NZDUSD", "OMRCNY", "TNDUSD",
-    "USDCHF", "USDINR", "USDIDR", "USDMXN"
+    "AED CNY OTC","AUD CAD OTC","AUD JPY OTC","CAD CHF OTC","EUR USD OTC",
+    "EUR CAD OTC","BHD CNY OTC","EUR JPY OTC","CHF NOK OTC","CHF JPY OTC",
+    "EUR GBP OTC","EUR RUB OTC","EUR NZD OTC","GBP AUD OTC","MAD USD OTC",
+    "NZD JPY OTC","NZD USD OTC","OMR CNY OTC","TND USD OTC","USD CHF OTC",
+    "USD INR OTC","USD IDR OTC","USD MXN OTC"
 ]
 
-TIMEFRAMES = [1, 3, 5, 10]
-PAIRS_PER_PAGE = 6
+# ================== STORAGE ==================
+user_state = {}
+trade_history = {}
 
-# ===================== DB =====================
-async def init_db():
-    global DB_POOL
-    if not DATABASE_URL:
-        logging.warning("⚠️ DATABASE_URL не задан — без истории")
-        return
-    DB_POOL = await asyncpg.create_pool(DATABASE_URL)
-    async with DB_POOL.acquire() as conn:
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id BIGINT PRIMARY KEY
-        );
-        """)
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            pair TEXT,
-            timeframe INT,
-            direction TEXT,
-            result TEXT
-        );
-        """)
-    logging.info("✅ PostgreSQL готов")
+# ================== KEYBOARDS ==================
+def main_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🟢 Биржевой рынок", callback_data="market_exchange")
+    kb.button(text="🟠 OTC рынок", callback_data="market_otc")
+    kb.button(text="📜 История сделок", callback_data="history")
+    kb.adjust(1)
+    return kb.as_markup()
 
-async def save_user(user_id: int):
-    if DB_POOL:
-        async with DB_POOL.acquire() as conn:
-            await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
+def pairs_kb(pairs, prefix):
+    kb = InlineKeyboardBuilder()
+    for p in pairs:
+        kb.button(text=p, callback_data=f"{prefix}:{p}")
+    kb.adjust(2)
+    return kb.as_markup()
 
-async def save_trade(user_id: int, pair: str, tf: int, direction: str) -> int:
-    await save_user(user_id)
-    if not DB_POOL:
-        return int(datetime.now().timestamp())
-    async with DB_POOL.acquire() as conn:
-        return await conn.fetchval(
-            "INSERT INTO trades (user_id, pair, timeframe, direction) VALUES ($1,$2,$3,$4) RETURNING id",
-            user_id, pair, tf, direction
-        )
-
-async def update_trade(trade_id: int, result: str):
-    if DB_POOL:
-        async with DB_POOL.acquire() as conn:
-            await conn.execute("UPDATE trades SET result=$1 WHERE id=$2", result, trade_id)
-
-async def get_trade_history(user_id: int):
-    if DB_POOL:
-        async with DB_POOL.acquire() as conn:
-            return await conn.fetch("SELECT * FROM trades WHERE user_id=$1 ORDER BY timestamp DESC", user_id)
-    return []
-
-# ===================== FSM =====================
-class Form(StatesGroup):
-    choosing_pair = State()
-    choosing_tf = State()
-
-# ===================== KEYBOARDS =====================
-def pairs_kb(page=0):
-    b = InlineKeyboardBuilder()
-    start = page * PAIRS_PER_PAGE
-    end = start + PAIRS_PER_PAGE
-    # объединяем биржевые + OTC
-    ALL_PAIRS = EXCHANGE_PAIRS + OTC_PAIRS
-    for p in ALL_PAIRS[start:end]:
-        b.button(text=p.replace("=X",""), callback_data=f"pair:{p}")
-    b.adjust(2)
-    if page > 0:
-        b.button(text="⬅️", callback_data=f"page:{page-1}")
-    if end < len(ALL_PAIRS):
-        b.button(text="➡️", callback_data=f"page:{page+1}")
-    return b.as_markup()
-
-def tf_kb(pair):
-    b = InlineKeyboardBuilder()
-    for tf in TIMEFRAMES:
-        b.button(text=f"{tf} мин", callback_data=f"tf:{pair}:{tf}")
-    b.adjust(2)
-    return b.as_markup()
+def tf_kb():
+    kb = InlineKeyboardBuilder()
+    for tf in [1, 2, 5, 15]:
+        kb.button(text=f"{tf} мин", callback_data=f"tf:{tf}")
+    kb.adjust(4)
+    return kb.as_markup()
 
 def result_kb(trade_id):
-    b = InlineKeyboardBuilder()
-    b.button(text="✅ ПЛЮС", callback_data=f"res:{trade_id}:PLUS")
-    b.button(text="❌ МИНУС", callback_data=f"res:{trade_id}:MINUS")
-    b.button(text="📜 История", callback_data=f"history")
-    b.adjust(2)
-    return b.as_markup()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ ПЛЮС", callback_data=f"res:plus:{trade_id}")
+    kb.button(text="➖ МИНУС", callback_data=f"res:minus:{trade_id}")
+    kb.adjust(2)
+    return kb.as_markup()
 
-# ===================== ANALYSIS =====================
-def get_signal(df: pd.DataFrame):
-    if df.empty:
-        return "❌ Ошибка получения данных"
+# ================== SIGNAL LOGIC ==================
+def exchange_signal(df):
+    if df is None or len(df) < 50:
+        return None
 
     signals = []
+    close = df["Close"]
 
-    # 1. SMA
-    sma_short = ta.sma(df['Close'], length=5)
-    sma_long = ta.sma(df['Close'], length=20)
-    signals.append("BUY" if sma_short.iloc[-1] > sma_long.iloc[-1] else "SELL")
+    signals.append("BUY" if ta.sma(close, 50).iloc[-1] > ta.sma(close, 200).iloc[-1] else "SELL")
+    signals.append("BUY" if ta.ema(close, 20).iloc[-1] > ta.ema(close, 50).iloc[-1] else "SELL")
 
-    # 2. EMA
-    ema_short = ta.ema(df['Close'], length=5)
-    ema_long = ta.ema(df['Close'], length=20)
-    signals.append("BUY" if ema_short.iloc[-1] > ema_long.iloc[-1] else "SELL")
+    if ta.adx(df["High"], df["Low"], close)["ADX_14"].iloc[-1] < 20:
+        return None
 
-    # 3. RSI
-    rsi = ta.rsi(df['Close'], length=14)
-    if rsi.iloc[-1] < 30:
-        signals.append("BUY")
-    elif rsi.iloc[-1] > 70:
-        signals.append("SELL")
+    signals.append("BUY" if ta.rsi(close).iloc[-1] < 30 else "SELL" if ta.rsi(close).iloc[-1] > 70 else "NEUTRAL")
 
-    # 4. MACD
-    macd = ta.macd(df['Close'])
-    if macd["MACD_12_26_9"].iloc[-1] > macd["MACDs_12_26_9"].iloc[-1]:
-        signals.append("BUY")
-    else:
-        signals.append("SELL")
+    macd = ta.macd(close)
+    signals.append("BUY" if macd["MACD_12_26_9"].iloc[-1] > macd["MACDs_12_26_9"].iloc[-1] else "SELL")
 
-    # 5. Stochastic
-    stoch = ta.stoch(df['High'], df['Low'], df['Close'])
-    if stoch["STOCHk_14_3_3"].iloc[-1] < 20:
-        signals.append("BUY")
-    elif stoch["STOCHk_14_3_3"].iloc[-1] > 80:
-        signals.append("SELL")
+    stoch = ta.stoch(df["High"], df["Low"], close)
+    signals.append("BUY" if stoch["STOCHk_14_3_3"].iloc[-1] < 20 else "SELL" if stoch["STOCHk_14_3_3"].iloc[-1] > 80 else "NEUTRAL")
 
-    # 6. Bollinger Bands
-    bb = ta.bbands(df['Close'])
-    if df['Close'].iloc[-1] < bb['BBL_5_2.0'].iloc[-1]:
-        signals.append("BUY")
-    elif df['Close'].iloc[-1] > bb['BBU_5_2.0'].iloc[-1]:
-        signals.append("SELL")
+    bb = ta.bbands(close)
+    signals.append("BUY" if close.iloc[-1] < bb["BBL_20_2.0"].iloc[-1] else "SELL")
 
-    # 7. ADX
-    adx = ta.adx(df['High'], df['Low'], df['Close'])
-    if adx['ADX_14'].iloc[-1] > 25:
-        signals.append("BUY" if df['Close'].iloc[-1] > df['Close'].iloc[-2] else "SELL")
+    buy = signals.count("BUY")
+    sell = signals.count("SELL")
 
-    # 8. CCI
-    cci = ta.cci(df['High'], df['Low'], df['Close'])
-    if cci.iloc[-1] < -100:
-        signals.append("BUY")
-    elif cci.iloc[-1] > 100:
-        signals.append("SELL")
+    if buy >= 7:
+        return "🟢 ВВЕРХ"
+    if sell >= 7:
+        return "🔴 ВНИЗ"
+    return None
 
-    # 9. OBV
-    obv = ta.obv(df['Close'], df['Volume'])
-    signals.append("BUY" if obv.iloc[-1] > obv.iloc[-2] else "SELL")
+def otc_signal():
+    return random.choice(["🟢 ВВЕРХ", "🔴 ВНИЗ"])
 
-    # 10. ATR trend
-    atr = ta.atr(df['High'], df['Low'], df['Close'])
-    signals.append("BUY" if df['Close'].iloc[-1] > df['Close'].iloc[-2] else "SELL")
+# ================== HANDLERS ==================
+@router.message(Command("start"))
+async def start_cmd(msg: Message):
+    await msg.answer("📊 Главное меню", reply_markup=main_menu())
 
-    # Консенсус
-    from collections import Counter
-    final_signal = Counter(signals).most_common(1)[0][0]
-    return final_signal
-
-# ===================== HANDLERS =====================
-@dp.message(Command("start"))
-async def start_cmd(msg: types.Message, state: FSMContext):
-    await state.clear()
-    await save_user(msg.from_user.id)
-    await msg.answer("📈 Выбери валютную пару:", reply_markup=pairs_kb())
-    await state.set_state(Form.choosing_pair)
-
-@dp.callback_query(lambda c: c.data.startswith("page:"))
-async def page_cb(cb: types.CallbackQuery):
-    page = int(cb.data.split(":")[1])
-    await cb.message.edit_reply_markup(reply_markup=pairs_kb(page))
+@router.callback_query(lambda c: c.data == "market_exchange")
+async def market_exchange(cb: CallbackQuery):
+    user_state[cb.from_user.id] = {"market": "exchange"}
+    await cb.message.answer("📈 Выберите валютную пару:", reply_markup=pairs_kb(EXCHANGE_PAIRS, "pair"))
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data.startswith("pair:"))
-async def pair_cb(cb: types.CallbackQuery, state: FSMContext):
-    pair = cb.data.split(":")[1]
-    await state.update_data(pair=pair)
-    await state.set_state(Form.choosing_tf)
-    await cb.message.edit_text(f"Пара **{pair.replace('=X','')}**, выбери ТФ:", reply_markup=tf_kb(pair))
+@router.callback_query(lambda c: c.data == "market_otc")
+async def market_otc(cb: CallbackQuery):
+    user_state[cb.from_user.id] = {"market": "otc"}
+    await cb.message.answer("🟠 Выберите OTC пару:", reply_markup=pairs_kb(OTC_PAIRS, "pair"))
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data.startswith("tf:"))
-async def tf_cb(cb: types.CallbackQuery, state: FSMContext):
-    _, pair, tf = cb.data.split(":")
-    tf = int(tf)
-    await cb.answer("⏳ Анализ...")
+@router.callback_query(lambda c: c.data.startswith("pair:"))
+async def pair_cb(cb: CallbackQuery):
+    pair = cb.data.split(":", 1)[1]
+    user_state[cb.from_user.id]["pair"] = pair
 
-    # Проверяем, биржевой ли это инструмент
-    if pair in EXCHANGE_PAIRS:
-        # Биржевой сигнал через yfinance
-        df = yf.download(pair, period="1d", interval=f"{tf}m")
-        if df.empty:
-            await cb.message.edit_text("❌ Ошибка получения данных")
-            return
-        direction = get_signal(df)
+    if user_state[cb.from_user.id]["market"] == "exchange":
+        await cb.message.answer("⏱ Выберите таймфрейм:", reply_markup=tf_kb())
     else:
-        # OTC сигнал — рандомно
-        direction = random.choice(["BUY", "SELL"])
+        await cb.message.answer("⏳ Анализ OTC рынка...")
+        await asyncio.sleep(2)
+        signal = otc_signal()
+        trade_id = datetime.now().timestamp()
+        trade_history.setdefault(cb.from_user.id, []).append({
+            "id": trade_id,
+            "pair": pair,
+            "signal": signal,
+            "time": datetime.now(),
+            "result": None
+        })
+        await cb.message.answer(
+            f"📊 {pair}\nСигнал: {signal}",
+            reply_markup=result_kb(trade_id)
+        )
+    await cb.answer()
 
-    trade_id = await save_trade(cb.from_user.id, pair.replace("=X",""), tf, direction)
-    await cb.message.edit_text(
-        f"📊 **Сигнал**\n\nПара: {pair.replace('=X','')}\nTF: {tf} мин\n\nНаправление: {direction}",
+@router.callback_query(lambda c: c.data.startswith("tf:"))
+async def tf_cb(cb: CallbackQuery):
+    tf = int(cb.data.split(":")[1])
+    uid = cb.from_user.id
+    pair = user_state[uid]["pair"]
+
+    await cb.message.answer("🔍 Анализ рынка...")
+    await asyncio.sleep(2)
+
+    df = yf.download(pair, period="1d", interval=f"{tf}m", progress=False)
+    signal = exchange_signal(df)
+
+    if not signal:
+        await cb.message.answer("⚪ Нет чёткого сигнала, рынок во флэте")
+        await cb.message.answer("📊 Главное меню", reply_markup=main_menu())
+        return
+
+    trade_id = datetime.now().timestamp()
+    trade_history.setdefault(uid, []).append({
+        "id": trade_id,
+        "pair": pair,
+        "signal": signal,
+        "time": datetime.now(),
+        "result": None
+    })
+
+    await cb.message.answer(
+        f"📊 {pair}\nTF: {tf} мин\nСигнал: {signal}",
         reply_markup=result_kb(trade_id)
     )
-
-@dp.callback_query(lambda c: c.data.startswith("res:"))
-async def res_cb(cb: types.CallbackQuery):
-    _, trade_id, result = cb.data.split(":")
-    await update_trade(int(trade_id), result)
-    await cb.message.edit_text("✅ Результат сохранён")
     await cb.answer()
-    # Возврат к выбору пары
-    await cb.message.answer("📈 Выбери валютную пару:", reply_markup=pairs_kb())
 
-@dp.callback_query(lambda c: c.data.startswith("history"))
-async def history_cb(cb: types.CallbackQuery):
-    trades = await get_trade_history(cb.from_user.id)
+@router.callback_query(lambda c: c.data.startswith("res:"))
+async def result_cb(cb: CallbackQuery):
+    _, res, trade_id = cb.data.split(":")
+    uid = cb.from_user.id
+
+    for t in trade_history.get(uid, []):
+        if str(t["id"]) == trade_id:
+            t["result"] = "PLUS" if res == "plus" else "MINUS"
+
+    await cb.message.answer("✅ Результат сохранён")
+    await cb.message.answer("📊 Главное меню", reply_markup=main_menu())
+    await cb.answer()
+
+@router.callback_query(lambda c: c.data == "history")
+async def history_cb(cb: CallbackQuery):
+    trades = trade_history.get(cb.from_user.id, [])
     if not trades:
         await cb.message.answer("📜 История пустая")
-    else:
-        text = "📜 История сделок:\n\n"
-        for t in trades[:20]:
-            ts = t["timestamp"].strftime("%Y-%m-%d %H:%M")
-            text += f"{ts} | {t['pair']} | {t['timeframe']} мин | {t['direction']} | {t['result']}\n"
-        await cb.message.answer(text)
+        return
 
-# ===================== WEBHOOK =====================
-async def on_startup(bot: Bot):
-    await init_db()
-    await bot(DeleteWebhook(drop_pending_updates=True))
-    await bot(SetWebhook(url=WEBHOOK_URL))
-    logging.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
+    text = "📜 История сделок:\n\n"
+    for t in trades[-20:][::-1]:
+        time = t["time"].strftime("%d.%m %H:%M")
+        res = t["result"] if t["result"] else "—"
+        text += f"{time} | {t['pair']} | {t['signal']} | {res}\n"
 
-async def on_shutdown(bot: Bot):
-    await bot(DeleteWebhook())
-    if DB_POOL:
-        await DB_POOL.close()
+    await cb.message.answer(text)
+    await cb.answer()
 
-async def health(request):
-    return web.Response(text="OK")
-
-async def main():
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-
-    app = web.Application()
-    app.router.add_get("/", health)
-
-    handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
-    handler.register(app, path=WEBHOOK_PATH)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, HOST, PORT)
-    await site.start()
-
+# ================== WEBHOOK ==================
+async def on_startup(app):
+    await bot.set_webhook(os.getenv("WEBHOOK_URL") + WEBHOOK_PATH)
     logging.info("🚀 BOT LIVE")
-    await asyncio.Event().wait()
+
+async def handle_webhook(request):
+    update = await request.json()
+    await dp.feed_raw_update(bot, update)
+    return web.Response()
+
+app = web.Application()
+app.router.add_post(WEBHOOK_PATH, handle_webhook)
+app.on_startup.append(on_startup)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    web.run_app(app, port=PORT)
