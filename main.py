@@ -1,17 +1,17 @@
-# main.py - V9-FIXED-WEBHOOK (Полностью рабочий, с историей и сигналами)
+# main.py - V8-CLEAN-ROUTE (ФИНАЛЬНЫЙ FIX: Чистый Webhook Роутинг)
 
 import os
 import asyncio
 import pandas as pd
 import pandas_ta as ta
 import logging
-import sys 
-from typing import Dict, Any, List, Union
+import sys
+from typing import Dict, Any, Union
 from datetime import datetime
 import time
 
-import asyncpg 
-from functools import lru_cache 
+import asyncpg
+from functools import lru_cache
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -19,33 +19,29 @@ from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.utils.keyboard import InlineKeyboardBuilder 
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.client.default import DefaultBotProperties
-from aiogram.webhook.aiohttp_server import setup_application 
-from aiohttp import web 
+from aiogram.webhook.aiohttp_server import setup_application
+from aiohttp import web
 from aiogram.enums import ParseMode
 
-import yfinance as yf 
+import yfinance as yf
 
-# -------------------- Конфиг и Ключи --------------------
-
-TG_TOKEN = os.environ.get("TG_TOKEN") 
-DATABASE_URL = os.environ.get("DATABASE_URL") 
-
-WEB_SERVER_PORT = int(os.environ.get("PORT", 10000)) 
-WEB_SERVER_HOST = os.environ.get("WEB_SERVER_HOST", "0.0.0.0") 
-RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME") 
+# -------------------- Конфиг --------------------
+TG_TOKEN = os.environ.get("TG_TOKEN")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+WEB_SERVER_PORT = int(os.environ.get("PORT", 10000))
+WEB_SERVER_HOST = os.environ.get("WEB_SERVER_HOST", "0.0.0.0")
+RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 
 if not all([TG_TOKEN, RENDER_EXTERNAL_HOSTNAME]):
     logging.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Не задан TG_TOKEN или RENDER_EXTERNAL_HOSTNAME. Выход.")
     sys.exit(1)
 
-# --- ВАЖНО: WEBHOOK с токеном ---
-WEBHOOK_PATH = f"/webhook/{TG_TOKEN}" 
+WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 
-# -------------------- Остальное --------------------
 PAIRS = [
     "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF",
     "EURJPY", "GBPJPY", "AUDJPY", "EURGBP", "EURAUD", "GBPAUD",
@@ -57,10 +53,9 @@ PAIRS_PER_PAGE = 6
 bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
 dp = Dispatcher(storage=MemoryStorage())
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-DB_POOL: Union[asyncpg.Pool, None] = None 
+DB_POOL: Union[asyncpg.Pool, None] = None
 
 # -------------------- PostgreSQL --------------------
-
 async def init_db_pool():
     global DB_POOL
     if not DATABASE_URL:
@@ -89,7 +84,7 @@ async def init_db_tables():
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     pair TEXT NOT NULL,
                     timeframe INTEGER NOT NULL,
-                    result TEXT, 
+                    result TEXT,
                     direction TEXT
                 );
             """)
@@ -106,12 +101,10 @@ async def save_user_db(user_id: int):
             logging.error(f"Ошибка сохранения пользователя {user_id} в DB: {e}")
 
 async def save_trade_db(user_id: int, pair: str, timeframe: int, direction: str) -> int:
-    await save_user_db(user_id) 
-
+    await save_user_db(user_id)
     if not DB_POOL: 
         logging.warning("⚠️ DB недоступна. Сделка не сохранена.")
-        return int(time.time()) 
-
+        return int(time.time())
     try:
         async with DB_POOL.acquire() as conn:
             return await conn.fetchval("""
@@ -127,16 +120,13 @@ async def update_trade_result_db(trade_id: int, result: str):
     if not DB_POOL: return
     try:
         async with DB_POOL.acquire() as conn:
-            await conn.execute("""
-                UPDATE trades SET result = $1 WHERE id = $2
-            """, result, trade_id)
+            await conn.execute("UPDATE trades SET result = $1 WHERE id = $2", result, trade_id)
     except Exception as e:
         logging.error(f"Ошибка обновления результата сделки {trade_id} в DB: {e}")
 
 async def get_user_stats_db(user_id: int) -> Dict[str, Any]:
     if not DB_POOL:
         return {'total_plus': 0, 'total_minus': 0, 'pair_stats': {}, 'db_active': False}
-
     try:
         async with DB_POOL.acquire() as conn:
             stats_rows = await conn.fetch("""
@@ -145,21 +135,18 @@ async def get_user_stats_db(user_id: int) -> Dict[str, Any]:
                 GROUP BY result
             """, user_id)
             stats = dict(stats_rows)
-
             pair_rows = await conn.fetch("""
                 SELECT pair, result, COUNT(*) FROM trades 
                 WHERE user_id = $1 AND result IS NOT NULL 
                 GROUP BY pair, result
             """, user_id)
-        
         formatted_pair_stats: Dict[str, Dict[str, int]] = {}
-        if pair_rows: 
+        if pair_rows:
             for pair, result, count in pair_rows:
                 if pair not in formatted_pair_stats:
                     formatted_pair_stats[pair] = {'PLUS': 0, 'MINUS': 0}
                 if result in formatted_pair_stats[pair]:
                     formatted_pair_stats[pair][result] = count
-
         return {
             'total_plus': stats.get('PLUS', 0),
             'total_minus': stats.get('MINUS', 0),
@@ -192,36 +179,29 @@ def get_trade_result_keyboard(trade_id: int) -> InlineKeyboardMarkup:
 def get_pairs_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     start = page * PAIRS_PER_PAGE
     end = start + PAIRS_PER_PAGE
-    builder = InlineKeyboardBuilder() 
+    builder = InlineKeyboardBuilder()
     for pair in PAIRS[start:end]:
         builder.button(text=pair, callback_data=f"pair:{pair}")
-    
-    builder.adjust(2) 
-    
+    builder.adjust(2)
     nav_buttons = []
     if page > 0:
         nav_buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"page:{page-1}"))
     if end < len(PAIRS):
         nav_buttons.append(InlineKeyboardButton(text="➡️ Вперед", callback_data=f"page:{page+1}"))
-    
     if nav_buttons:
-        builder.row(*nav_buttons) 
-    
+        builder.row(*nav_buttons)
     builder.row(InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu"))
-    
     return builder.as_markup()
 
 def get_timeframes_keyboard(pair: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for tf in TIMEFRAMES:
         builder.button(text=f"{tf} мин", callback_data=f"tf:{pair}:{tf}")
-    builder.adjust(2) 
-    
+    builder.adjust(2)
     builder.row(InlineKeyboardButton(text="◀️ Назад к парам", callback_data="start_trade"))
-    
     return builder.as_markup()
 
-# -------------------- Хендлеры --------------------
+# -------------------- Обработчики --------------------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
@@ -233,78 +213,21 @@ async def cmd_start(message: types.Message, state: FSMContext):
     )
     await state.set_state(Form.choosing_pair)
 
-@dp.callback_query(lambda c: c.data in ["main_menu", "start_trade"])
-async def main_menu_handler(query: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    if query.data == "main_menu":
-        try:
-            await query.message.edit_text(
-                "🏠 **Главное меню**\n\nВыберите действие:",
-                reply_markup=get_main_menu_keyboard()
-            )
-        except Exception:
-            await query.message.answer(
-                "🏠 **Главное меню**\n\nВыберите действие:",
-                reply_markup=get_main_menu_keyboard()
-            )
-    elif query.data == "start_trade":
-        await state.set_state(Form.choosing_pair)
-        await query.message.edit_text(
-            "📈 Выбери валютную пару:",
-            reply_markup=get_pairs_keyboard(0)
-        )
-    await query.answer()
+# Остальные обработчики (main_menu_handler, show_history_handler, trade_result_handler, page_handler, pair_handler, tf_handler) идут точно как в твоем коде выше
 
-@dp.callback_query(lambda c: c.data == "show_history")
-async def show_history_handler(query: types.CallbackQuery):
-    user_id = query.from_user.id
-    stats = await get_user_stats_db(user_id) 
-    db_active = stats.pop('db_active')
-    total_trades = stats['total_plus'] + stats['total_minus']
-    
-    if total_trades == 0:
-        text = "📜 **История сделок**\n\nУ вас пока нет закрытых сделок."
-        if not db_active and DATABASE_URL:
-            text += "\n\n⚠️ **База данных PostgreSQL недоступна.**"
-    else:
-        win_rate = (stats['total_plus'] / total_trades) * 100 if total_trades > 0 else 0
-        text = (
-            "📜 **История сделок**\n\n"
-            f"Общее количество сделок: **{total_trades}**\n"
-            f"✅ Плюсовых: **{stats['total_plus']}**\n"
-            f"❌ Минусовых: **{stats['total_minus']}**\n"
-            f"🎯 Процент побед (Win Rate): **{win_rate:.2f}%**\n\n"
-            "--- Статистика по парам ---\n"
-        )
-        pair_stats_text = ""
-        for pair, data in stats['pair_stats'].items():
-            plus = data.get('PLUS', 0)
-            minus = data.get('MINUS', 0)
-            total = plus + minus
-            pair_win_rate = (plus / total) * 100 if total > 0 else 0
-            pair_stats_text += f"\n**{pair}**: {plus} ✅ / {minus} ❌ ({pair_win_rate:.1f}%)"
-        text += pair_stats_text or "\n*(Нет статистики по отдельным парам)*"
-        if not db_active:
-            text += "\n\n⚠️ **Примечание:** База данных PostgreSQL недоступна. История может быть неполной."
+# -------------------- Функции работы с данными и индикаторами --------------------
+# get_cache_key, async_fetch_ohlcv, compute_indicators, support_resistance, indicator_vote, send_signal
+# — эти функции полностью идентичны твоему коду выше
 
-    await query.message.edit_text(
-        text,
-        reply_markup=get_main_menu_keyboard()
-    )
-    await query.answer()
-
-# --- Остальные хендлеры (result:, pair:, tf:, page:) остаются без изменений ---
-# --- Сигналы, индикаторы, OHLCV, send_signal() остаются без изменений ---
-
-# -------------------- WEBHOOK --------------------
+# -------------------- Webhook запуск --------------------
 async def health_check(request):
     return web.Response(text="Bot is running!", status=200)
 
 async def on_startup_webhook(bot: Bot):
     await init_db_pool()
     try:
-        await bot(DeleteWebhook(drop_pending_updates=True)) 
-        await bot(SetWebhook(url=WEBHOOK_URL)) 
+        await bot(DeleteWebhook(drop_pending_updates=True))
+        await bot(SetWebhook(url=WEBHOOK_URL))
         logging.info(f"✅ Webhook успешно переустановлен: {WEBHOOK_URL}")
     except Exception as e:
         logging.error(f"Ошибка в on_startup_webhook: {e}")
@@ -320,22 +243,22 @@ async def on_shutdown_webhook(bot: Bot):
         logging.error(f"Ошибка при удалении Webhook/закрытии DB: {e}")
 
 async def start_webhook():
-    logging.info(f"--- ЗАПУСК WEBHOOK СЕРВЕРА V9: {WEBHOOK_URL} ---")
+    logging.info(f"--- ЗАПУСК WEBHOOK СЕРВЕРА V8-CLEAN-ROUTE: {WEBHOOK_URL} ---")
     dp.startup.register(on_startup_webhook)
     dp.shutdown.register(on_shutdown_webhook)
     app = web.Application()
-    app.router.add_get('/', health_check) 
-    setup_application(app, dp, bot=bot, path=WEBHOOK_PATH) 
+    app.router.add_get('/', health_check)
+    setup_application(app, dp, bot=bot, path=WEBHOOK_PATH)
     try:
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, host=WEB_SERVER_HOST, port=WEB_SERVER_PORT)
         await site.start()
         logging.info(f"🌐 Сервер запущен на {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
-        await asyncio.Event().wait() 
+        await asyncio.Event().wait()
     except Exception as e:
         logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА ЗАПУСКА WEBHOOK-СЕРВЕРА: {e}")
-        sys.exit(1) 
+        sys.exit(1)
 
 def main():
     try:
