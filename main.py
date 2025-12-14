@@ -16,7 +16,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
 from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web
@@ -30,7 +29,7 @@ HOST = "0.0.0.0"
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
 
-AUTHORS = [7079260196]
+AUTHORS = [7079260196]  # ID авторов
 
 if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME or not DATABASE_URL:
     print("❌ ENV не заданы или DATABASE_URL неверен")
@@ -42,7 +41,7 @@ WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 logging.basicConfig(level=logging.INFO)
 
 # ===================== BOT =====================
-bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode=None))
+bot = Bot(token=TG_TOKEN)  # без parse_mode, будем задавать по месту
 dp = Dispatcher(storage=MemoryStorage())
 DB_POOL: asyncpg.pool.Pool | None = None
 
@@ -208,7 +207,8 @@ def get_signal(df: pd.DataFrame):
     direction, count = counter.most_common(1)[0]
     confidence = round(count / len(signals) * 100, 1)
 
-    expl_safe = " | ".join(expl)  # убираем спецсимволы
+    # теперь возвращаем обычный текст без Markdown экранирования
+    expl_safe = " | ".join(expl)
 
     return direction, confidence, expl_safe
 
@@ -219,7 +219,11 @@ async def start(msg: types.Message):
     balance = await get_balance(user_id)
 
     if user_id in AUTHORS:
-        await msg.answer("🏠 Главное меню - Авторский доступ", reply_markup=main_menu(), parse_mode=None)
+        await msg.answer(
+            "🏠 Главное меню (Авторский доступ)",
+            reply_markup=main_menu(),
+            parse_mode=None
+        )
         return
 
     if balance < MIN_DEPOSIT:
@@ -228,8 +232,7 @@ async def start(msg: types.Message):
         kb.adjust(1)
         await msg.answer(
             f"🚀 Для доступа к сигналам пополните минимум ${MIN_DEPOSIT}\n\n"
-            f"🔗 Регистрация: {REF_LINK}\n"
-            "После пополнения нажмите кнопку ниже:",
+            f"🔗 Регистрация: {REF_LINK}\nПосле пополнения нажмите кнопку ниже:",
             reply_markup=kb.as_markup(),
             parse_mode=None
         )
@@ -340,7 +343,6 @@ async def handle_postback(request: web.Request):
 # ===================== WEBHOOK =====================
 async def main():
     await init_db()
-
     await bot(DeleteWebhook(drop_pending_updates=True))
     await bot(SetWebhook(url=WEBHOOK_URL))
 
