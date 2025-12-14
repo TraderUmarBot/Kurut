@@ -2,13 +2,13 @@ import os
 import sys
 import asyncio
 import logging
-from collections import Counter
-import sqlite3
 from datetime import datetime
+from collections import Counter
 
 import pandas as pd
 import pandas_ta as ta
 import yfinance as yf
+import asyncpg
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -18,18 +18,20 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web
 
 # ===================== CONFIG =====================
 TG_TOKEN = os.getenv("TG_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 PORT = int(os.getenv("PORT", 10000))
 HOST = "0.0.0.0"
 
-REF_LINK = "https://u3.shortink.io/login?social=Google&utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
+REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
 
-if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
+if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME or not DATABASE_URL:
     print("❌ ENV не заданы")
     sys.exit(1)
 
@@ -44,6 +46,7 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
 )
 dp = Dispatcher(storage=MemoryStorage())
+DB_POOL = None
 
 # ===================== CONSTANTS =====================
 PAIRS = [
@@ -53,61 +56,79 @@ PAIRS = [
 ]
 TIMEFRAMES = [1, 2, 5, 15]
 PAIRS_PER_PAGE = 6
+MIN_DEPOSIT = 20.0  # минимальный депозит для доступа
+
+# ===================== DB =====================
+async def init_db():
+    global DB_POOL
+    DB_POOL = await asyncpg.create_pool(DATABASE_URL)
+    async with DB_POOL.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            pocket_id TEXT,
+            balance FLOAT DEFAULT 0
+        );
+        """)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            pair TEXT,
+            timeframe INT,
+            direction TEXT,
+            confidence FLOAT,
+            explanation TEXT,
+            result TEXT
+        );
+        """)
+
+async def add_user(user_id: int, pocket_id: str):
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (user_id, pocket_id) VALUES ($1,$2) ON CONFLICT (user_id) DO NOTHING",
+            user_id, pocket_id
+        )
+
+async def update_balance(user_id: int, amount: float):
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET balance = balance + $1 WHERE user_id=$2",
+            amount, user_id
+        )
+
+async def get_balance(user_id: int) -> float:
+    async with DB_POOL.acquire() as conn:
+        val = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", user_id)
+        return val or 0.0
+
+async def save_trade(user_id, pair, tf, direction, confidence, explanation):
+    async with DB_POOL.acquire() as conn:
+        return await conn.fetchval(
+            """INSERT INTO trades (user_id, pair, timeframe, direction, confidence, explanation)
+               VALUES ($1,$2,$3,$4,$5,$6) RETURNING id""",
+            user_id, pair, tf, direction, confidence, explanation
+        )
+
+async def update_trade(trade_id, result):
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            "UPDATE trades SET result=$1 WHERE id=$2",
+            result, trade_id
+        )
+
+async def get_history(user_id):
+    async with DB_POOL.acquire() as conn:
+        return await conn.fetch(
+            "SELECT * FROM trades WHERE user_id=$1 ORDER BY timestamp DESC LIMIT 20",
+            user_id
+        )
 
 # ===================== FSM =====================
-class AccessState(StatesGroup):
-    waiting_pocket_id = State()
-
-# ===================== DATABASE =====================
-DB_FILE = "trades.db"
-
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            timestamp TEXT,
-            pair TEXT,
-            timeframe INTEGER,
-            direction TEXT,
-            confidence REAL,
-            result TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-def save_trade(user_id, pair, tf, direction, confidence):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO trades (user_id, timestamp, pair, timeframe, direction, confidence) VALUES (?,?,?,?,?,?)",
-        (user_id, datetime.now().isoformat(), pair, tf, direction, confidence)
-    )
-    trade_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return trade_id
-
-def update_trade(trade_id, result):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE trades SET result=? WHERE id=?", (result, trade_id))
-    conn.commit()
-    conn.close()
-
-def get_history(user_id):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, timestamp, pair, timeframe, direction, confidence, result FROM trades WHERE user_id=? ORDER BY timestamp DESC LIMIT 20",
-        (user_id,)
-    )
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
+class TradeState(StatesGroup):
+    choosing_pair = State()
+    choosing_tf = State()
 
 # ===================== KEYBOARDS =====================
 def main_menu():
@@ -122,11 +143,10 @@ def pairs_kb(page=0):
     start = page * PAIRS_PER_PAGE
     for p in PAIRS[start:start+PAIRS_PER_PAGE]:
         kb.button(text=p.replace("=X",""), callback_data=f"pair:{p}")
-    # Кнопки пагинации
     if page > 0:
         kb.button(text="⬅️ Назад", callback_data=f"pairs_page:{page-1}")
-    if (start + PAIRS_PER_PAGE) < len(PAIRS):
-        kb.button(text="➡️ Вперед", callback_data=f"pairs_page:{page+1}")
+    if start + PAIRS_PER_PAGE < len(PAIRS):
+        kb.button(text="➡️ Вперёд", callback_data=f"pairs_page:{page+1}")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -184,21 +204,35 @@ def get_signal(df: pd.DataFrame):
 # ===================== HANDLERS =====================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
-    await msg.answer("🏠 Главное меню", reply_markup=main_menu())
+    balance = await get_balance(msg.from_user.id)
+    if balance < MIN_DEPOSIT:
+        await msg.answer(
+            f"🚀 Для доступа к сигналам пополните минимум ${MIN_DEPOSIT}\n\n"
+            f"🔗 Регистрация: {REF_LINK}\n"
+            "После пополнения нажмите кнопку ниже:",
+            reply_markup=InlineKeyboardBuilder().button(text="💰 Я пополнил баланс", callback_data="check_deposit").as_markup()
+        )
+    else:
+        await msg.answer("🏠 Главное меню", reply_markup=main_menu())
 
-@dp.message()
-async def pocket_id(msg: types.Message):
-    await msg.answer("✅ Доступ открыт!", reply_markup=main_menu())
-
-@dp.callback_query(lambda c: c.data == "pairs")
-async def pairs(cb: types.CallbackQuery):
-    await cb.message.edit_text("📈 Выбери пару", reply_markup=pairs_kb())
+@dp.callback_query(lambda c: c.data == "check_deposit")
+async def check_deposit(cb: types.CallbackQuery):
+    balance = await get_balance(cb.from_user.id)
+    if balance >= MIN_DEPOSIT:
+        await cb.message.answer("✅ Доступ к сигналам открыт!", reply_markup=main_menu())
+    else:
+        await cb.message.answer(f"❌ Пополните баланс минимум на ${MIN_DEPOSIT}")
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("pairs_page:"))
 async def pairs_page(cb: types.CallbackQuery):
     page = int(cb.data.split(":")[1])
     await cb.message.edit_text("📈 Выбери пару", reply_markup=pairs_kb(page))
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data == "pairs")
+async def pairs(cb: types.CallbackQuery):
+    await cb.message.edit_text("📈 Выбери пару", reply_markup=pairs_kb())
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
@@ -213,57 +247,78 @@ async def pair(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("tf:"))
 async def tf(cb: types.CallbackQuery):
     _, pair, tf = cb.data.split(":")
-    try:
-        period = "1d" if int(tf) <= 5 else "5d"
-        df = yf.download(pair, period=period, interval=f"{tf}m")
-        if df.empty:
-            await cb.message.edit_text("❌ Не удалось получить данные для этой пары")
-            return
-        direction, confidence, expl = get_signal(df)
-        trade_id = save_trade(cb.from_user.id, pair.replace("=X",""), int(tf), direction, confidence)
-        await cb.message.edit_text(
-            f"📊 *Сигнал*\n\n"
-            f"Пара: {pair.replace('=X','')}\n"
-            f"TF: {tf} мин\n"
-            f"Направление: *{direction}*\n"
-            f"Уверенность: *{confidence}%*\n\n"
-            f"{expl}",
-            reply_markup=result_kb(trade_id)
-        )
-    except Exception as e:
-        await cb.message.edit_text(f"❌ Ошибка при загрузке данных: {e}")
+    df = yf.download(pair, period="5d", interval=f"{tf}m")
+    direction, confidence, expl = get_signal(df)
+
+    trade_id = await save_trade(
+        cb.from_user.id,
+        pair.replace("=X",""),
+        int(tf),
+        direction,
+        confidence,
+        expl
+    )
+
+    await cb.message.edit_text(
+        f"📊 *Сигнал*\n\n"
+        f"Пара: {pair.replace('=X','')}\n"
+        f"TF: {tf} мин\n"
+        f"Направление: *{direction}*\n"
+        f"Уверенность: *{confidence}%*\n\n"
+        f"{expl}",
+        reply_markup=result_kb(trade_id)
+    )
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("res:"))
 async def res(cb: types.CallbackQuery):
-    _, tid, res_val = cb.data.split(":")
-    update_trade(int(tid), res_val)
+    _, tid, res = cb.data.split(":")
+    await update_trade(int(tid), res)
     await cb.message.edit_text("✅ Результат сохранён", reply_markup=main_menu())
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data == "history")
 async def history(cb: types.CallbackQuery):
-    trades = get_history(cb.from_user.id)
+    trades = await get_history(cb.from_user.id)
     if not trades:
         await cb.message.answer("📜 История пуста")
         return
     text = "📜 *История сделок*\n\n"
     for t in trades:
-        tid, ts, pair, tf, direction, confidence, result = t
-        text += f"{ts[:19]} | {pair} | {direction} | {result or '-'}\n"
+        text += f"{t['timestamp']} | {t['pair']} | {t['direction']} | {t['result']}\n"
     await cb.message.answer(text)
 
-@dp.callback_query(lambda c: c.data == "menu")
-async def menu(cb: types.CallbackQuery):
-    await cb.message.edit_text("🏠 Главное меню", reply_markup=main_menu())
-    await cb.answer()
+# ===================== POSTBACK =====================
+async def handle_postback(request: web.Request):
+    event = request.query.get("event")
+    click_id = request.query.get("click_id")
+    amount = float(request.query.get("amount", 0))
+
+    if not click_id:
+        return web.Response(text="No click_id", status=400)
+
+    # Пользователь идентифицируется по click_id
+    user_id = int(click_id)  # допустим click_id = telegram_id
+    await add_user(user_id, pocket_id=str(click_id))
+    if event == "deposit" and amount > 0:
+        await update_balance(user_id, amount)
+
+    return web.Response(text="OK")
 
 # ===================== WEBHOOK =====================
+async def on_startup(bot: Bot):
+    await init_db()
+    await bot(DeleteWebhook(drop_pending_updates=True))
+    await bot(SetWebhook(WEBHOOK_URL))
+
 async def main():
-    init_db()
+    dp.startup.register(on_startup)
+
     app = web.Application()
     handler = SimpleRequestHandler(dp, bot)
     handler.register(app, WEBHOOK_PATH)
+
+    app.router.add_get("/postback", handle_postback)  # Postback endpoint
 
     runner = web.AppRunner(app)
     await runner.setup()
