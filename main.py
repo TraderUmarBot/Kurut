@@ -30,8 +30,7 @@ HOST = "0.0.0.0"
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
 
-# User IDs авторов (доступ без пополнения)
-AUTHORS = [7079260196]  # сюда можешь добавить ещё ID авторов
+AUTHORS = [7079260196]  # ID авторов без регистрации и пополнения
 
 if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME or not DATABASE_URL:
     print("❌ ENV не заданы или DATABASE_URL неверен")
@@ -55,7 +54,7 @@ PAIRS = [
 ]
 TIMEFRAMES = [1, 2, 5, 15]
 PAIRS_PER_PAGE = 6
-MIN_DEPOSIT = 20.0  # минимальный депозит для доступа
+MIN_DEPOSIT = 20.0
 
 # ===================== DB =====================
 async def init_db():
@@ -104,8 +103,6 @@ async def update_balance(user_id: int, amount: float):
         )
 
 async def get_balance(user_id: int) -> float:
-    if DB_POOL is None:
-        raise RuntimeError("DB_POOL не инициализирован!")
     async with DB_POOL.acquire() as conn:
         val = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", user_id)
         return val or 0.0
@@ -209,8 +206,8 @@ def get_signal(df: pd.DataFrame):
     direction, count = counter.most_common(1)[0]
     confidence = round(count / len(signals) * 100, 1)
 
-    # Экранируем спецсимволы MarkdownV2
-    expl_safe = expl.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("]", "\\]")
+    expl_text = "\\n".join(expl)
+    expl_safe = expl_text.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("]", "\\]")
 
     return direction, confidence, expl_safe
 
@@ -221,7 +218,6 @@ async def start(msg: types.Message):
     balance = await get_balance(user_id)
 
     if user_id in AUTHORS:
-        # Авторы имеют доступ всегда
         await msg.answer("🏠 Главное меню (Авторский доступ)", reply_markup=main_menu())
         return
 
@@ -331,7 +327,7 @@ async def handle_postback(request: web.Request):
     try:
         user_id = int(click_id)
     except ValueError:
-        user_id = click_id
+        return web.Response(text="Invalid click_id", status=400)
 
     await add_user(user_id, pocket_id=str(click_id))
     if event in ["deposit","reg"] and amount > 0:
@@ -342,7 +338,6 @@ async def handle_postback(request: web.Request):
 # ===================== WEBHOOK =====================
 async def main():
     await init_db()
-
     await bot(DeleteWebhook(drop_pending_updates=True))
     await bot(SetWebhook(url=WEBHOOK_URL))
 
