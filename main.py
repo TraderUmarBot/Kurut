@@ -26,7 +26,7 @@ from aiohttp import web
 TG_TOKEN = os.getenv("TG_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
-PORT = int(os.getenv("PORT", 10000))
+PORT = int(os.environ.get("PORT", 10000))  # использовать порт из Render
 HOST = "0.0.0.0"
 
 REF_LINK = "https://u3.shortink.io/login?social=Google&utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
@@ -292,21 +292,21 @@ async def history(cb: types.CallbackQuery):
 async def on_startup(bot: Bot):
     await init_db()
     await bot(DeleteWebhook(drop_pending_updates=True))
-    await bot(SetWebhook(WEBHOOK_URL))
+    await bot(SetWebhook(url=WEBHOOK_URL))
 
 async def main():
     dp.startup.register(on_startup)
 
     app = web.Application()
     handler = SimpleRequestHandler(dp, bot)
-    handler.register(app, WEBHOOK_PATH)
+    handler.register(app, WEBHOOK_PATH)  # путь вебхука
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, HOST, PORT)
+    site = web.TCPSite(runner, HOST, PORT)  # слушаем порт Render
     await site.start()
 
-    logging.info("🚀 BOT LIVE")
+    logging.info(f"🚀 BOT LIVE на порту {PORT}")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
