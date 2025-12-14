@@ -1,16 +1,14 @@
-# main.py — AI TECH SIGNAL BOT (Render + aiogram v3 + webhook + 12 индикаторов)
-
 import os
 import sys
 import asyncio
 import logging
 from datetime import datetime
+from collections import Counter
 
 import pandas as pd
 import pandas_ta as ta
 import yfinance as yf
 import asyncpg
-from collections import Counter
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -21,19 +19,20 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.methods import DeleteWebhook, SetWebhook
-from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
-from aiogram.utils.markdown import escape_md  # <-- для экранирования Markdown
+from aiohttp import web
 
 # ===================== CONFIG =====================
-TG_TOKEN = os.environ.get("TG_TOKEN")
-DATABASE_URL = os.environ.get("DATABASE_URL")
-PORT = int(os.environ.get("PORT", 10000))
+TG_TOKEN = os.getenv("TG_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+PORT = int(os.getenv("PORT", 10000))
 HOST = "0.0.0.0"
-RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+
+REF_LINK = "https://u3.shortink.io/login?social=Google&utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
 
 if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
-    print("❌ TG_TOKEN или RENDER_EXTERNAL_HOSTNAME не заданы")
+    print("❌ ENV не заданы")
     sys.exit(1)
 
 WEBHOOK_PATH = "/webhook"
@@ -44,7 +43,7 @@ logging.basicConfig(level=logging.INFO)
 # ===================== BOT =====================
 bot = Bot(
     token=TG_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN_V2)  # <-- MARKDOWN_V2
+    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
 )
 dp = Dispatcher(storage=MemoryStorage())
 DB_POOL = None
@@ -62,13 +61,13 @@ PAIRS_PER_PAGE = 6
 async def init_db():
     global DB_POOL
     if not DATABASE_URL:
-        logging.warning("⚠️ DATABASE_URL не задан — без истории")
         return
     DB_POOL = await asyncpg.create_pool(DATABASE_URL)
     async with DB_POOL.acquire() as conn:
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id BIGINT PRIMARY KEY
+            user_id BIGINT PRIMARY KEY,
+            pocket_id TEXT
         );
         """)
         await conn.execute("""
@@ -84,319 +83,223 @@ async def init_db():
             result TEXT
         );
         """)
-    logging.info("✅ PostgreSQL готов")
 
-async def save_user(user_id: int):
-    if DB_POOL:
-        async with DB_POOL.acquire() as conn:
-            await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
-
-async def save_trade(user_id: int, pair: str, tf: int, direction: str, confidence: float, explanation: str) -> int:
-    await save_user(user_id)
+async def has_access(user_id: int) -> bool:
     if not DB_POOL:
-        return int(datetime.now().timestamp())
+        return False
+    async with DB_POOL.acquire() as conn:
+        return bool(await conn.fetchval(
+            "SELECT pocket_id FROM users WHERE user_id=$1 AND pocket_id IS NOT NULL",
+            user_id
+        ))
+
+async def save_pocket_id(user_id: int, pocket_id: str):
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET pocket_id=$1 WHERE user_id=$2",
+            pocket_id, user_id
+        )
+
+async def save_trade(user_id, pair, tf, direction, confidence, explanation):
     async with DB_POOL.acquire() as conn:
         return await conn.fetchval(
-            "INSERT INTO trades (user_id, pair, timeframe, direction, confidence, explanation) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+            """INSERT INTO trades (user_id, pair, timeframe, direction, confidence, explanation)
+               VALUES ($1,$2,$3,$4,$5,$6) RETURNING id""",
             user_id, pair, tf, direction, confidence, explanation
         )
 
-async def update_trade(trade_id: int, result: str):
-    if DB_POOL:
-        async with DB_POOL.acquire() as conn:
-            await conn.execute("UPDATE trades SET result=$1 WHERE id=$2", result, trade_id)
+async def update_trade(trade_id, result):
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            "UPDATE trades SET result=$1 WHERE id=$2",
+            result, trade_id
+        )
 
-async def get_trade_history(user_id: int):
-    if DB_POOL:
-        async with DB_POOL.acquire() as conn:
-            return await conn.fetch("SELECT * FROM trades WHERE user_id=$1 ORDER BY timestamp DESC", user_id)
-    return []
+async def get_history(user_id):
+    async with DB_POOL.acquire() as conn:
+        return await conn.fetch(
+            "SELECT * FROM trades WHERE user_id=$1 ORDER BY timestamp DESC LIMIT 20",
+            user_id
+        )
 
 # ===================== FSM =====================
-class Form(StatesGroup):
+class AccessState(StatesGroup):
+    waiting_pocket_id = State()
+
+class TradeState(StatesGroup):
     choosing_pair = State()
     choosing_tf = State()
 
 # ===================== KEYBOARDS =====================
-def main_menu_kb():
-    b = InlineKeyboardBuilder()
-    b.button(text="📈 Валютные пары", callback_data="menu_pairs")
-    b.button(text="📜 История сделок", callback_data="menu_history")
-    b.adjust(1)
-    return b.as_markup()
+def main_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📈 Валютные пары", callback_data="pairs")
+    kb.button(text="📜 История сделок", callback_data="history")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def reg_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔗 Зарегистрироваться", url=REF_LINK)
+    kb.button(text="✅ Я зарегистрировался", callback_data="reg_done")
+    kb.adjust(1)
+    return kb.as_markup()
 
 def pairs_kb(page=0):
-    b = InlineKeyboardBuilder()
+    kb = InlineKeyboardBuilder()
     start = page * PAIRS_PER_PAGE
-    end = start + PAIRS_PER_PAGE
-    for p in PAIRS[start:end]:
-        b.button(text=p.replace("=X",""), callback_data=f"pair:{p}")
-    b.adjust(2)
-    if page > 0:
-        b.button(text="⬅️", callback_data=f"page:{page-1}")
-    if end < len(PAIRS):
-        b.button(text="➡️", callback_data=f"page:{page+1}")
-    return b.as_markup()
+    for p in PAIRS[start:start+PAIRS_PER_PAGE]:
+        kb.button(text=p.replace("=X",""), callback_data=f"pair:{p}")
+    kb.adjust(2)
+    return kb.as_markup()
 
 def tf_kb(pair):
-    b = InlineKeyboardBuilder()
+    kb = InlineKeyboardBuilder()
     for tf in TIMEFRAMES:
-        b.button(text=f"{tf} мин", callback_data=f"tf:{pair}:{tf}")
-    b.adjust(2)
-    return b.as_markup()
+        kb.button(text=f"{tf} мин", callback_data=f"tf:{pair}:{tf}")
+    kb.adjust(2)
+    return kb.as_markup()
 
 def result_kb(trade_id):
-    b = InlineKeyboardBuilder()
-    b.button(text="✅ ПЛЮС", callback_data=f"res:{trade_id}:PLUS")
-    b.button(text="❌ МИНУС", callback_data=f"res:{trade_id}:MINUS")
-    b.button(text="🏠 Главное меню", callback_data="menu_main")
-    b.adjust(2)
-    return b.as_markup()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ ПЛЮС", callback_data=f"res:{trade_id}:PLUS")
+    kb.button(text="❌ МИНУС", callback_data=f"res:{trade_id}:MINUS")
+    kb.button(text="🏠 Меню", callback_data="menu")
+    kb.adjust(2)
+    return kb.as_markup()
 
 # ===================== ANALYSIS =====================
 def get_signal(df: pd.DataFrame):
-    explanations = []
-    signals = []
+    signals, expl = [], []
 
-    # ----- SMA -----
-    sma_short = ta.sma(df['Close'], length=5)
-    sma_long = ta.sma(df['Close'], length=20)
-    if sma_short is None or sma_long is None or len(sma_short) < 1 or len(sma_long) < 1:
-        return "SELL", 50, "Недостаточно данных"
-    if sma_short.iloc[-1] > sma_long.iloc[-1]:
-        signals.append("BUY")
-        explanations.append("Краткосрочная SMA выше долгосрочной → восходящий тренд")
-    else:
-        signals.append("SELL")
-        explanations.append("Краткосрочная SMA ниже долгосрочной → нисходящий тренд")
+    sma5 = ta.sma(df.Close, 5)
+    sma20 = ta.sma(df.Close, 20)
+    signals.append("BUY" if sma5.iloc[-1] > sma20.iloc[-1] else "SELL")
+    expl.append("SMA 5/20 определяет тренд")
 
-    # ----- EMA -----
-    ema_short = ta.ema(df['Close'], length=5)
-    ema_long = ta.ema(df['Close'], length=20)
-    if ema_short.iloc[-1] > ema_long.iloc[-1]:
-        signals.append("BUY")
-        explanations.append("EMA подтверждает восходящий тренд")
-    else:
-        signals.append("SELL")
-        explanations.append("EMA подтверждает нисходящий тренд")
+    ema5 = ta.ema(df.Close, 5)
+    ema20 = ta.ema(df.Close, 20)
+    signals.append("BUY" if ema5.iloc[-1] > ema20.iloc[-1] else "SELL")
+    expl.append("EMA подтверждает направление")
 
-    # ----- RSI -----
-    rsi = ta.rsi(df['Close'], length=14)
-    if rsi.iloc[-1] < 30:
-        signals.append("BUY")
-        explanations.append("RSI перепродан → возможный разворот вверх")
-    elif rsi.iloc[-1] > 70:
-        signals.append("SELL")
-        explanations.append("RSI перекуплен → возможный разворот вниз")
+    rsi = ta.rsi(df.Close)
+    signals.append("BUY" if rsi.iloc[-1] < 30 else "SELL" if rsi.iloc[-1] > 70 else "BUY")
+    expl.append("RSI анализ перекупленности")
 
-    # ----- MACD -----
-    macd = ta.macd(df['Close'])
-    if macd["MACD_12_26_9"].iloc[-1] > macd["MACDs_12_26_9"].iloc[-1]:
-        signals.append("BUY")
-        explanations.append("MACD выше сигнальной линии → бычий сигнал")
-    else:
-        signals.append("SELL")
-        explanations.append("MACD ниже сигнальной линии → медвежий сигнал")
+    macd = ta.macd(df.Close)
+    signals.append("BUY" if macd.iloc[-1,0] > macd.iloc[-1,1] else "SELL")
+    expl.append("MACD сигнал")
 
-    # ----- STOCH -----
-    stoch = ta.stoch(df['High'], df['Low'], df['Close'])
-    if stoch["STOCHk_14_3_3"].iloc[-1] < 20:
-        signals.append("BUY")
-        explanations.append("Стохастик перепродан → возможен рост")
-    elif stoch["STOCHk_14_3_3"].iloc[-1] > 80:
-        signals.append("SELL")
-        explanations.append("Стохастик перекуплен → возможен спад")
+    bb = ta.bbands(df.Close)
+    signals.append("BUY" if df.Close.iloc[-1] < bb.iloc[-1,0] else "SELL")
+    expl.append("Bollinger Bands")
 
-    # ----- Bollinger Bands -----
-    bb = ta.bbands(df['Close'])
-    if df['Close'].iloc[-1] < bb['BBL_5_2.0'].iloc[-1]:
-        signals.append("BUY")
-        explanations.append("Цена у нижней линии Bollinger → возможен рост")
-    elif df['Close'].iloc[-1] > bb['BBU_5_2.0'].iloc[-1]:
-        signals.append("SELL")
-        explanations.append("Цена у верхней линии Bollinger → возможен спад")
+    adx = ta.adx(df.High, df.Low, df.Close)
+    signals.append("BUY" if adx.iloc[-1,0] > 25 else "SELL")
+    expl.append("ADX сила тренда")
 
-    # ----- ADX -----
-    adx = ta.adx(df['High'], df['Low'], df['Close'])
-    if adx['ADX_14'].iloc[-1] > 25:
-        if df['Close'].iloc[-1] > df['Close'].iloc[-2]:
-            signals.append("BUY")
-            explanations.append("ADX > 25 и рост цены → тренд вверх")
-        else:
-            signals.append("SELL")
-            explanations.append("ADX > 25 и падение цены → тренд вниз")
-
-    # ----- CCI -----
-    cci = ta.cci(df['High'], df['Low'], df['Close'])
-    if cci.iloc[-1] < -100:
-        signals.append("BUY")
-        explanations.append("CCI ниже -100 → возможный разворот вверх")
-    elif cci.iloc[-1] > 100:
-        signals.append("SELL")
-        explanations.append("CCI выше 100 → возможный разворот вниз")
-
-    # ----- OBV -----
-    obv = ta.obv(df['Close'], df['Volume'])
-    if obv.iloc[-1] > obv.iloc[-2]:
-        signals.append("BUY")
-        explanations.append("OBV растет → покупатели доминируют")
-    else:
-        signals.append("SELL")
-        explanations.append("OBV падает → продавцы доминируют")
-
-    # ----- ATR -----
-    atr = ta.atr(df['High'], df['Low'], df['Close'])
-    if df['Close'].iloc[-1] > df['Close'].iloc[-2]:
-        signals.append("BUY")
-        explanations.append("ATR растет и цена растет → тренд вверх")
-    else:
-        signals.append("SELL")
-        explanations.append("ATR растет и цена падает → тренд вниз")
-
-    # ----- Williams %R -----
-    willr = ta.willr(df['High'], df['Low'], df['Close'])
-    if willr.iloc[-1] < -80:
-        signals.append("BUY")
-        explanations.append("Williams %R перепродан → возможен рост")
-    elif willr.iloc[-1] > -20:
-        signals.append("SELL")
-        explanations.append("Williams %R перекуплен → возможен спад")
-
-    # ----- Ultimate Oscillator -----
-    uo = ta.uo(df['High'], df['Low'], df['Close'])
-    if uo.iloc[-1] > 50:
-        signals.append("BUY")
-        explanations.append("Ultimate Oscillator >50 → бычий сигнал")
-    else:
-        signals.append("SELL")
-        explanations.append("Ultimate Oscillator <50 → медвежий сигнал")
-
-    # Подсчет уверенности
     counter = Counter(signals)
-    final_signal, count = counter.most_common(1)[0]
+    direction, count = counter.most_common(1)[0]
     confidence = round(count / len(signals) * 100, 1)
-    explanation_text = "\n".join(explanations)
 
-    return final_signal, confidence, explanation_text
+    return direction, confidence, "\n".join(expl)
 
 # ===================== HANDLERS =====================
 @dp.message(Command("start"))
-async def start_cmd(msg: types.Message, state: FSMContext):
+async def start(msg: types.Message):
+    if not await has_access(msg.from_user.id):
+        await msg.answer(
+            "🚀 *Доступ к боту*\n\n"
+            "1️⃣ Зарегистрируйся по ссылке\n"
+            "2️⃣ Нажми «Я зарегистрировался»\n"
+            "3️⃣ Отправь Pocket Option ID",
+            reply_markup=reg_menu()
+        )
+        return
+    await msg.answer("🏠 Главное меню", reply_markup=main_menu())
+
+@dp.callback_query(lambda c: c.data == "reg_done")
+async def reg_done(cb: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AccessState.waiting_pocket_id)
+    await cb.message.answer("✍️ Отправь свой Pocket Option ID")
+    await cb.answer()
+
+@dp.message(AccessState.waiting_pocket_id)
+async def pocket_id(msg: types.Message, state: FSMContext):
+    await save_pocket_id(msg.from_user.id, msg.text.strip())
     await state.clear()
-    await save_user(msg.from_user.id)
-    await msg.answer(
-        "👋 Привет! Я твой помощник по валютным парам.\nВыбери режим:",
-        reply_markup=main_menu_kb()
-    )
+    await msg.answer("✅ Доступ открыт!", reply_markup=main_menu())
 
-@dp.callback_query(lambda c: c.data=="menu_main")
-async def menu_main_cb(cb: types.CallbackQuery):
-    await cb.message.edit_text("👋 Главное меню:", reply_markup=main_menu_kb())
-    await cb.answer()
-
-@dp.callback_query(lambda c: c.data=="menu_pairs")
-async def menu_pairs_cb(cb: types.CallbackQuery, state: FSMContext):
-    await state.set_state(Form.choosing_pair)
-    await cb.message.edit_text("📈 Выбери валютную пару:", reply_markup=pairs_kb())
-    await cb.answer()
-
-@dp.callback_query(lambda c: c.data=="menu_history")
-async def menu_history_cb(cb: types.CallbackQuery):
-    trades = await get_trade_history(cb.from_user.id)
-    if not trades:
-        await cb.message.answer("📜 История пустая")
-    else:
-        text = "📜 История сделок:\n\n"
-        for t in trades[:20]:
-            ts = t["timestamp"].strftime("%Y-%m-%d %H:%M")
-            text += (
-                f"{escape_md(ts)} | {escape_md(t['pair'])} | {t['timeframe']} мин | "
-                f"{escape_md(t['direction'])} | {t['confidence']}% | {escape_md(t['result'] or '')}\n"
-            )
-        await cb.message.answer(text)
-
-@dp.callback_query(lambda c: c.data.startswith("page:"))
-async def page_cb(cb: types.CallbackQuery):
-    page = int(cb.data.split(":")[1])
-    await cb.message.edit_reply_markup(reply_markup=pairs_kb(page))
+@dp.callback_query(lambda c: c.data == "pairs")
+async def pairs(cb: types.CallbackQuery):
+    await cb.message.edit_text("📈 Выбери пару", reply_markup=pairs_kb())
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
-async def pair_cb(cb: types.CallbackQuery, state: FSMContext):
+async def pair(cb: types.CallbackQuery):
     pair = cb.data.split(":")[1]
-    await state.update_data(pair=pair)
-    await state.set_state(Form.choosing_tf)
-    text = f"📊 Пара *{escape_md(pair.replace('=X',''))}*, выбери ТФ:"
-    await cb.message.edit_text(text, reply_markup=tf_kb(pair))
+    await cb.message.edit_text(
+        f"⏱ Пара {pair.replace('=X','')}, выбери TF",
+        reply_markup=tf_kb(pair)
+    )
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("tf:"))
-async def tf_cb(cb: types.CallbackQuery, state: FSMContext):
-    try:
-        await cb.answer("⏳ Анализ...", show_alert=False)
-    except: pass
-
+async def tf(cb: types.CallbackQuery):
     _, pair, tf = cb.data.split(":")
-    tf = int(tf)
+    df = yf.download(pair, period="5d", interval=f"{tf}m")
+    direction, confidence, expl = get_signal(df)
 
-    try:
-        df = yf.download(pair, period="5d", interval=f"{tf}m")
-    except Exception as e:
-        await cb.message.edit_text(f"❌ Ошибка загрузки данных: {escape_md(str(e))}")
-        return
-    if df.empty:
-        await cb.message.edit_text("❌ Не удалось получить данные")
-        return
-
-    try:
-        direction, confidence, explanation = get_signal(df)
-    except Exception as e:
-        await cb.message.edit_text(f"❌ Ошибка при расчёте сигнала: {escape_md(str(e))}")
-        return
-
-    trade_id = await save_trade(cb.from_user.id, pair.replace("=X",""), tf, direction, confidence, explanation)
-
-    text = (
-        f"📊 *Сигнал*\n\n"
-        f"Пара: *{escape_md(pair.replace('=X',''))}*\n"
-        f"TF: {tf} мин\n\n"
-        f"Направление: {escape_md(direction)}\n"
-        f"Уверенность: {confidence}%\n\n"
-        f"Пояснение:\n{escape_md(explanation)}"
+    trade_id = await save_trade(
+        cb.from_user.id,
+        pair.replace("=X",""),
+        int(tf),
+        direction,
+        confidence,
+        expl
     )
-    await cb.message.edit_text(text, reply_markup=result_kb(trade_id))
+
+    await cb.message.edit_text(
+        f"📊 *Сигнал*\n\n"
+        f"Пара: {pair.replace('=X','')}\n"
+        f"TF: {tf} мин\n"
+        f"Направление: *{direction}*\n"
+        f"Уверенность: *{confidence}%*\n\n"
+        f"{expl}",
+        reply_markup=result_kb(trade_id)
+    )
+    await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("res:"))
-async def res_cb(cb: types.CallbackQuery):
-    _, trade_id, result = cb.data.split(":")
-    await update_trade(int(trade_id), result)
-    await cb.message.edit_text("✅ Результат сохранён", reply_markup=main_menu_kb())
+async def res(cb: types.CallbackQuery):
+    _, tid, res = cb.data.split(":")
+    await update_trade(int(tid), res)
+    await cb.message.edit_text("✅ Результат сохранён", reply_markup=main_menu())
     await cb.answer()
+
+@dp.callback_query(lambda c: c.data == "history")
+async def history(cb: types.CallbackQuery):
+    trades = await get_history(cb.from_user.id)
+    if not trades:
+        await cb.message.answer("📜 История пуста")
+        return
+    text = "📜 *История сделок*\n\n"
+    for t in trades:
+        text += f"{t['timestamp']} | {t['pair']} | {t['direction']} | {t['result']}\n"
+    await cb.message.answer(text)
 
 # ===================== WEBHOOK =====================
 async def on_startup(bot: Bot):
     await init_db()
     await bot(DeleteWebhook(drop_pending_updates=True))
-    await bot(SetWebhook(url=WEBHOOK_URL))
-    logging.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
-
-async def on_shutdown(bot: Bot):
-    await bot(DeleteWebhook())
-    if DB_POOL:
-        await DB_POOL.close()
-
-async def health(request):
-    return web.Response(text="OK")
+    await bot(SetWebhook(WEBHOOK_URL))
 
 async def main():
     dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
 
     app = web.Application()
-    app.router.add_get("/", health)
-
-    handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
-    handler.register(app, path=WEBHOOK_PATH)
+    handler = SimpleRequestHandler(dp, bot)
+    handler.register(app, WEBHOOK_PATH)
 
     runner = web.AppRunner(app)
     await runner.setup()
