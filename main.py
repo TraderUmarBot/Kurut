@@ -26,7 +26,7 @@ from aiohttp import web
 TG_TOKEN = os.getenv("TG_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
-PORT = int(os.environ.get("PORT", 10000))  # использовать порт из Render
+PORT = int(os.environ.get("PORT", 10000))  # Render сам задаёт порт
 HOST = "0.0.0.0"
 
 REF_LINK = "https://u3.shortink.io/login?social=Google&utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
@@ -35,7 +35,7 @@ if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
     print("❌ ENV не заданы")
     sys.exit(1)
 
-WEBHOOK_PATH = "/webhook"
+WEBHOOK_PATH = "/webhook"  # Telegram шлёт апдейты сюда
 WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 
 logging.basicConfig(level=logging.INFO)
@@ -292,14 +292,14 @@ async def history(cb: types.CallbackQuery):
 async def on_startup(bot: Bot):
     await init_db()
     await bot(DeleteWebhook(drop_pending_updates=True))
-    await bot(SetWebhook(url=WEBHOOK_URL))
+    await bot(SetWebhook(url=WEBHOOK_URL))  # Telegram будет слать на /webhook
 
 async def main():
     dp.startup.register(on_startup)
 
     app = web.Application()
     handler = SimpleRequestHandler(dp, bot)
-    handler.register(app, WEBHOOK_PATH)  # путь вебхука
+    handler.register(app, WEBHOOK_PATH)  # /webhook
 
     runner = web.AppRunner(app)
     await runner.setup()
