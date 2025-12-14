@@ -16,6 +16,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web
 
@@ -28,8 +30,7 @@ HOST = "0.0.0.0"
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
 
-# User IDs авторов (доступ без пополнения)
-AUTHORS = [7079260196]  # сюда можешь добавить ещё ID авторов
+AUTHORS = [7079260196]
 
 if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME or not DATABASE_URL:
     print("❌ ENV не заданы или DATABASE_URL неверен")
@@ -41,7 +42,7 @@ WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 logging.basicConfig(level=logging.INFO)
 
 # ===================== BOT =====================
-bot = Bot(token=TG_TOKEN)
+bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode=None))
 dp = Dispatcher(storage=MemoryStorage())
 DB_POOL: asyncpg.pool.Pool | None = None
 
@@ -53,7 +54,7 @@ PAIRS = [
 ]
 TIMEFRAMES = [1, 2, 5, 15]
 PAIRS_PER_PAGE = 6
-MIN_DEPOSIT = 20.0  # минимальный депозит для доступа
+MIN_DEPOSIT = 20.0
 
 # ===================== DB =====================
 async def init_db():
@@ -207,7 +208,7 @@ def get_signal(df: pd.DataFrame):
     direction, count = counter.most_common(1)[0]
     confidence = round(count / len(signals) * 100, 1)
 
-    expl_safe = "\n".join(expl)  # plain text, без экранирования
+    expl_safe = " | ".join(expl)  # убираем спецсимволы
 
     return direction, confidence, expl_safe
 
@@ -218,8 +219,7 @@ async def start(msg: types.Message):
     balance = await get_balance(user_id)
 
     if user_id in AUTHORS:
-        # Авторы имеют доступ всегда
-        await msg.answer("🏠 Главное меню (Авторский доступ)", reply_markup=main_menu())
+        await msg.answer("🏠 Главное меню - Авторский доступ", reply_markup=main_menu(), parse_mode=None)
         return
 
     if balance < MIN_DEPOSIT:
@@ -230,18 +230,19 @@ async def start(msg: types.Message):
             f"🚀 Для доступа к сигналам пополните минимум ${MIN_DEPOSIT}\n\n"
             f"🔗 Регистрация: {REF_LINK}\n"
             "После пополнения нажмите кнопку ниже:",
-            reply_markup=kb.as_markup()
+            reply_markup=kb.as_markup(),
+            parse_mode=None
         )
     else:
-        await msg.answer("🏠 Главное меню", reply_markup=main_menu())
+        await msg.answer("🏠 Главное меню", reply_markup=main_menu(), parse_mode=None)
 
 @dp.callback_query(lambda c: c.data == "check_deposit")
 async def check_deposit(cb: types.CallbackQuery):
     balance = await get_balance(cb.from_user.id)
     if balance >= MIN_DEPOSIT:
-        await cb.message.answer("✅ Доступ к сигналам открыт!", reply_markup=main_menu())
+        await cb.message.answer("✅ Доступ к сигналам открыт!", reply_markup=main_menu(), parse_mode=None)
     else:
-        await cb.message.answer(f"❌ Пополните баланс минимум на ${MIN_DEPOSIT}")
+        await cb.message.answer(f"❌ Пополните баланс минимум на ${MIN_DEPOSIT}", parse_mode=None)
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("pairs_page:"))
@@ -270,7 +271,7 @@ async def tf(cb: types.CallbackQuery):
     try:
         df = yf.download(pair, period="5d", interval=f"{tf}m")
     except Exception as e:
-        await cb.message.answer(f"Ошибка получения данных: {e}")
+        await cb.message.answer(f"Ошибка получения данных: {e}", parse_mode=None)
         await cb.answer()
         return
 
@@ -292,7 +293,8 @@ async def tf(cb: types.CallbackQuery):
         f"Направление: {direction}\n"
         f"Уверенность: {confidence}%\n\n"
         f"{expl}",
-        reply_markup=result_kb(trade_id)
+        reply_markup=result_kb(trade_id),
+        parse_mode=None
     )
     await cb.answer()
 
@@ -300,20 +302,20 @@ async def tf(cb: types.CallbackQuery):
 async def res(cb: types.CallbackQuery):
     _, tid, res_val = cb.data.split(":")
     await update_trade(int(tid), res_val)
-    await cb.message.edit_text("✅ Результат сохранён", reply_markup=main_menu())
+    await cb.message.edit_text("✅ Результат сохранён", reply_markup=main_menu(), parse_mode=None)
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data == "history")
 async def history(cb: types.CallbackQuery):
     trades = await get_history(cb.from_user.id)
     if not trades:
-        await cb.message.answer("📜 История пуста")
+        await cb.message.answer("📜 История пуста", parse_mode=None)
         return
     text = "📜 История сделок\n\n"
     for t in trades:
         result = t['result'] if t['result'] else "—"
         text += f"{t['timestamp']} | {t['pair']} | {t['direction']} | {result}\n"
-    await cb.message.answer(text)
+    await cb.message.answer(text, parse_mode=None)
 
 # ===================== POSTBACK =====================
 async def handle_postback(request: web.Request):
@@ -339,8 +341,8 @@ async def handle_postback(request: web.Request):
 async def main():
     await init_db()
 
-    await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(WEBHOOK_URL)
+    await bot(DeleteWebhook(drop_pending_updates=True))
+    await bot(SetWebhook(url=WEBHOOK_URL))
 
     app = web.Application()
     handler = SimpleRequestHandler(dp, bot)
