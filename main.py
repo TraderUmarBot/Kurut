@@ -32,7 +32,7 @@ HOST = "0.0.0.0"
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
 
 if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME or not DATABASE_URL:
-    print("❌ ENV не заданы")
+    print("❌ ENV не заданы или DATABASE_URL неверен")
     sys.exit(1)
 
 WEBHOOK_PATH = "/webhook"
@@ -61,7 +61,12 @@ MIN_DEPOSIT = 20.0  # минимальный депозит для доступ�
 # ===================== DB =====================
 async def init_db():
     global DB_POOL
-    DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    if DB_POOL is None:
+        try:
+            DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+        except Exception as e:
+            logging.error(f"Ошибка подключения к БД: {e}")
+            sys.exit(1)
     async with DB_POOL.acquire() as conn:
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
