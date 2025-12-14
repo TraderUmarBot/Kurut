@@ -23,6 +23,7 @@ from aiogram.enums import ParseMode
 from aiogram.methods import DeleteWebhook, SetWebhook
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
+from aiogram.utils.markdown import escape_md  # <-- для экранирования Markdown
 
 # ===================== CONFIG =====================
 TG_TOKEN = os.environ.get("TG_TOKEN")
@@ -41,7 +42,10 @@ WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 logging.basicConfig(level=logging.INFO)
 
 # ===================== BOT =====================
-bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+bot = Bot(
+    token=TG_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN_V2)  # <-- MARKDOWN_V2
+)
 dp = Dispatcher(storage=MemoryStorage())
 DB_POOL = None
 
@@ -280,7 +284,10 @@ def get_signal(df: pd.DataFrame):
 async def start_cmd(msg: types.Message, state: FSMContext):
     await state.clear()
     await save_user(msg.from_user.id)
-    await msg.answer("👋 Привет! Я твой помощник по валютным парам.\nВыбери режим:", reply_markup=main_menu_kb())
+    await msg.answer(
+        "👋 Привет! Я твой помощник по валютным парам.\nВыбери режим:",
+        reply_markup=main_menu_kb()
+    )
 
 @dp.callback_query(lambda c: c.data=="menu_main")
 async def menu_main_cb(cb: types.CallbackQuery):
@@ -302,7 +309,10 @@ async def menu_history_cb(cb: types.CallbackQuery):
         text = "📜 История сделок:\n\n"
         for t in trades[:20]:
             ts = t["timestamp"].strftime("%Y-%m-%d %H:%M")
-            text += f"{ts} | {t['pair']} | {t['timeframe']} мин | {t['direction']} | {t['confidence']}% | {t['result']}\n"
+            text += (
+                f"{escape_md(ts)} | {escape_md(t['pair'])} | {t['timeframe']} мин | "
+                f"{escape_md(t['direction'])} | {t['confidence']}% | {escape_md(t['result'] or '')}\n"
+            )
         await cb.message.answer(text)
 
 @dp.callback_query(lambda c: c.data.startswith("page:"))
@@ -316,7 +326,8 @@ async def pair_cb(cb: types.CallbackQuery, state: FSMContext):
     pair = cb.data.split(":")[1]
     await state.update_data(pair=pair)
     await state.set_state(Form.choosing_tf)
-    await cb.message.edit_text(f"📊 Пара **{pair.replace('=X','')}**, выбери ТФ:", reply_markup=tf_kb(pair))
+    text = f"📊 Пара *{escape_md(pair.replace('=X',''))}*, выбери ТФ:"
+    await cb.message.edit_text(text, reply_markup=tf_kb(pair))
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("tf:"))
@@ -331,7 +342,7 @@ async def tf_cb(cb: types.CallbackQuery, state: FSMContext):
     try:
         df = yf.download(pair, period="5d", interval=f"{tf}m")
     except Exception as e:
-        await cb.message.edit_text(f"❌ Ошибка загрузки данных: {e}")
+        await cb.message.edit_text(f"❌ Ошибка загрузки данных: {escape_md(str(e))}")
         return
     if df.empty:
         await cb.message.edit_text("❌ Не удалось получить данные")
@@ -340,17 +351,20 @@ async def tf_cb(cb: types.CallbackQuery, state: FSMContext):
     try:
         direction, confidence, explanation = get_signal(df)
     except Exception as e:
-        await cb.message.edit_text(f"❌ Ошибка при расчёте сигнала: {e}")
+        await cb.message.edit_text(f"❌ Ошибка при расчёте сигнала: {escape_md(str(e))}")
         return
 
     trade_id = await save_trade(cb.from_user.id, pair.replace("=X",""), tf, direction, confidence, explanation)
 
-    await cb.message.edit_text(
-        f"📊 **Сигнал**\n\nПара: {pair.replace('=X','')}\nTF: {tf} мин\n\n"
-        f"Направление: {direction}\nУверенность: {confidence}%\n\n"
-        f"Пояснение:\n{explanation}",
-        reply_markup=result_kb(trade_id)
+    text = (
+        f"📊 *Сигнал*\n\n"
+        f"Пара: *{escape_md(pair.replace('=X',''))}*\n"
+        f"TF: {tf} мин\n\n"
+        f"Направление: {escape_md(direction)}\n"
+        f"Уверенность: {confidence}%\n\n"
+        f"Пояснение:\n{escape_md(explanation)}"
     )
+    await cb.message.edit_text(text, reply_markup=result_kb(trade_id))
 
 @dp.callback_query(lambda c: c.data.startswith("res:"))
 async def res_cb(cb: types.CallbackQuery):
