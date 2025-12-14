@@ -13,7 +13,6 @@ import asyncpg
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
@@ -41,10 +40,7 @@ WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 logging.basicConfig(level=logging.INFO)
 
 # ===================== BOT =====================
-bot = Bot(
-    token=TG_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
-)
+bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
 dp = Dispatcher(storage=MemoryStorage())
 DB_POOL: asyncpg.pool.Pool | None = None
 
@@ -64,6 +60,7 @@ async def init_db():
     if DB_POOL is None:
         try:
             DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+            logging.info("✅ Подключение к БД успешно")
         except Exception as e:
             logging.error(f"Ошибка подключения к БД: {e}")
             sys.exit(1)
@@ -329,29 +326,29 @@ async def handle_postback(request: web.Request):
     return web.Response(text="OK")
 
 # ===================== WEBHOOK =====================
-async def on_startup(bot: Bot):
-    await init_db()
-    await bot(DeleteWebhook(drop_pending_updates=True))
-    await bot(SetWebhook(WEBHOOK_URL))
-
 async def main():
     await init_db()
+
+    # Устанавливаем вебхук корректно
     await bot(DeleteWebhook(drop_pending_updates=True))
-    await bot(SetWebhook(WEBHOOK_URL))
+    await bot(SetWebhook(url=WEBHOOK_URL))
 
     app = web.Application()
     handler = SimpleRequestHandler(dp, bot)
     handler.register(app, WEBHOOK_PATH)
 
-    app.router.add_get("/postback", handle_postback)  # Postback endpoint
+    app.router.add_get("/postback", handle_postback)
 
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, HOST, PORT)
     await site.start()
 
-    logging.info("🚀 BOT LIVE")
+    logging.info(f"🚀 BOT LIVE на {HOST}:{PORT}")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        asyncio.run(bot.session.close())
