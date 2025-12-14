@@ -64,14 +64,29 @@ async def init_db():
         except Exception as e:
             logging.error(f"Ошибка подключения к БД: {e}")
             sys.exit(1)
+
     async with DB_POOL.acquire() as conn:
+        # Создаём таблицу users, если нет
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
-            pocket_id TEXT,
-            balance FLOAT DEFAULT 0
+            pocket_id TEXT
         );
         """)
+
+        # Проверяем, есть ли колонка balance, если нет — добавляем
+        col_exists = await conn.fetchval("""
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_name='users' AND column_name='balance'
+        );
+        """)
+        if not col_exists:
+            await conn.execute("ALTER TABLE users ADD COLUMN balance FLOAT DEFAULT 0;")
+            logging.info("✅ Колонка balance добавлена в users")
+
+        # Создаём таблицу trades, если нет
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id SERIAL PRIMARY KEY,
@@ -85,6 +100,7 @@ async def init_db():
             result TEXT
         );
         """)
+        logging.info("✅ Таблицы проверены/созданы")
 
 async def add_user(user_id: int, pocket_id: str):
     async with DB_POOL.acquire() as conn:
@@ -211,9 +227,6 @@ def get_signal(df: pd.DataFrame):
 # ===================== HANDLERS =====================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
-    # Авто-добавление пользователя
-    await add_user(msg.from_user.id, pocket_id=str(msg.from_user.id))
-
     balance = await get_balance(msg.from_user.id)
     if balance < MIN_DEPOSIT:
         kb = InlineKeyboardBuilder()
@@ -316,14 +329,13 @@ async def handle_postback(request: web.Request):
     if not click_id:
         return web.Response(text="No click_id", status=400)
 
+    # Пользователь идентифицируется по click_id
     try:
         user_id = int(click_id)
     except ValueError:
         user_id = click_id
 
-    # Авто-добавление пользователя
     await add_user(user_id, pocket_id=str(click_id))
-
     if event in ["deposit","reg"] and amount > 0:
         await update_balance(user_id, amount)
 
@@ -333,7 +345,6 @@ async def handle_postback(request: web.Request):
 async def main():
     await init_db()
 
-    # Устанавливаем вебхук
     await bot(DeleteWebhook(drop_pending_updates=True))
     await bot(SetWebhook(url=WEBHOOK_URL))
 
