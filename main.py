@@ -5,12 +5,12 @@ import sys
 import asyncio
 import logging
 from datetime import datetime
+from collections import Counter
 
 import pandas as pd
 import pandas_ta as ta
 import yfinance as yf
 import asyncpg
-from collections import Counter
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -161,10 +161,10 @@ def get_signal(df: pd.DataFrame):
         return "SELL", 50, "Недостаточно данных"
     if sma_short.iloc[-1] > sma_long.iloc[-1]:
         signals.append("BUY")
-        explanations.append("Краткосрочная SMA выше долгосрочной → восходящий тренд")
+        explanations.append("SMA короткая > длинной → восходящий тренд")
     else:
         signals.append("SELL")
-        explanations.append("Краткосрочная SMA ниже долгосрочной → нисходящий тренд")
+        explanations.append("SMA короткая < длинной → нисходящий тренд")
 
     # ----- EMA -----
     ema_short = ta.ema(df['Close'], length=5)
@@ -180,10 +180,10 @@ def get_signal(df: pd.DataFrame):
     rsi = ta.rsi(df['Close'], length=14)
     if rsi.iloc[-1] < 30:
         signals.append("BUY")
-        explanations.append("RSI перепродан → возможный разворот вверх")
+        explanations.append("RSI перепродан → возможный рост")
     elif rsi.iloc[-1] > 70:
         signals.append("SELL")
-        explanations.append("RSI перекуплен → возможный разворот вниз")
+        explanations.append("RSI перекуплен → возможный спад")
 
     # ----- MACD -----
     macd = ta.macd(df['Close'])
@@ -226,10 +226,10 @@ def get_signal(df: pd.DataFrame):
     cci = ta.cci(df['High'], df['Low'], df['Close'])
     if cci.iloc[-1] < -100:
         signals.append("BUY")
-        explanations.append("CCI ниже -100 → возможный разворот вверх")
+        explanations.append("CCI ниже -100 → возможен рост")
     elif cci.iloc[-1] > 100:
         signals.append("SELL")
-        explanations.append("CCI выше 100 → возможный разворот вниз")
+        explanations.append("CCI выше 100 → возможен спад")
 
     # ----- OBV -----
     obv = ta.obv(df['Close'], df['Volume'])
@@ -267,12 +267,10 @@ def get_signal(df: pd.DataFrame):
         signals.append("SELL")
         explanations.append("Ultimate Oscillator <50 → медвежий сигнал")
 
-    # Подсчет уверенности
     counter = Counter(signals)
     final_signal, count = counter.most_common(1)[0]
     confidence = round(count / len(signals) * 100, 1)
     explanation_text = "\n".join(explanations)
-
     return final_signal, confidence, explanation_text
 
 # ===================== HANDLERS =====================
