@@ -1,16 +1,17 @@
-# main.py — AI TECH SIGNAL BOT (Render + aiogram v3 + webhook + 12 индикаторов)
+# main.py — AI TECH SIGNAL BOT с рефкой и уникальными ключами + автоудаление ключей
 
 import os
 import sys
 import asyncio
 import logging
-from datetime import datetime
+import random
+from datetime import datetime, timedelta
+from collections import Counter
 
 import pandas as pd
 import pandas_ta as ta
 import yfinance as yf
 import asyncpg
-from collections import Counter
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -20,23 +21,14 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.methods import DeleteWebhook, SetWebhook
-from aiohttp import web
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 
 # ===================== CONFIG =====================
 TG_TOKEN = os.environ.get("TG_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-PORT = int(os.environ.get("PORT", 10000))
-HOST = "0.0.0.0"
-RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 
-if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
-    print("❌ TG_TOKEN или RENDER_EXTERNAL_HOSTNAME не заданы")
+if not TG_TOKEN:
+    print("❌ TG_TOKEN не задан")
     sys.exit(1)
-
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 
 logging.basicConfig(level=logging.INFO)
 
@@ -149,7 +141,7 @@ def result_kb(trade_id):
     b.adjust(2)
     return b.as_markup()
 
-# ===================== ANALYSIS =====================
+# ===================== SIGNALS =====================
 def get_signal(df: pd.DataFrame):
     explanations = []
     signals = []
@@ -157,8 +149,6 @@ def get_signal(df: pd.DataFrame):
     # ----- SMA -----
     sma_short = ta.sma(df['Close'], length=5)
     sma_long = ta.sma(df['Close'], length=20)
-    if sma_short is None or sma_long is None or len(sma_short) < 1 or len(sma_long) < 1:
-        return "SELL", 50, "Недостаточно данных"
     if sma_short.iloc[-1] > sma_long.iloc[-1]:
         signals.append("BUY")
         explanations.append("Краткосрочная SMA выше долгосрочной → восходящий тренд")
@@ -185,89 +175,6 @@ def get_signal(df: pd.DataFrame):
         signals.append("SELL")
         explanations.append("RSI перекуплен → возможный разворот вниз")
 
-    # ----- MACD -----
-    macd = ta.macd(df['Close'])
-    if macd["MACD_12_26_9"].iloc[-1] > macd["MACDs_12_26_9"].iloc[-1]:
-        signals.append("BUY")
-        explanations.append("MACD выше сигнальной линии → бычий сигнал")
-    else:
-        signals.append("SELL")
-        explanations.append("MACD ниже сигнальной линии → медвежий сигнал")
-
-    # ----- STOCH -----
-    stoch = ta.stoch(df['High'], df['Low'], df['Close'])
-    if stoch["STOCHk_14_3_3"].iloc[-1] < 20:
-        signals.append("BUY")
-        explanations.append("Стохастик перепродан → возможен рост")
-    elif stoch["STOCHk_14_3_3"].iloc[-1] > 80:
-        signals.append("SELL")
-        explanations.append("Стохастик перекуплен → возможен спад")
-
-    # ----- Bollinger Bands -----
-    bb = ta.bbands(df['Close'])
-    if df['Close'].iloc[-1] < bb['BBL_5_2.0'].iloc[-1]:
-        signals.append("BUY")
-        explanations.append("Цена у нижней линии Bollinger → возможен рост")
-    elif df['Close'].iloc[-1] > bb['BBU_5_2.0'].iloc[-1]:
-        signals.append("SELL")
-        explanations.append("Цена у верхней линии Bollinger → возможен спад")
-
-    # ----- ADX -----
-    adx = ta.adx(df['High'], df['Low'], df['Close'])
-    if adx['ADX_14'].iloc[-1] > 25:
-        if df['Close'].iloc[-1] > df['Close'].iloc[-2]:
-            signals.append("BUY")
-            explanations.append("ADX > 25 и рост цены → тренд вверх")
-        else:
-            signals.append("SELL")
-            explanations.append("ADX > 25 и падение цены → тренд вниз")
-
-    # ----- CCI -----
-    cci = ta.cci(df['High'], df['Low'], df['Close'])
-    if cci.iloc[-1] < -100:
-        signals.append("BUY")
-        explanations.append("CCI ниже -100 → возможный разворот вверх")
-    elif cci.iloc[-1] > 100:
-        signals.append("SELL")
-        explanations.append("CCI выше 100 → возможный разворот вниз")
-
-    # ----- OBV -----
-    obv = ta.obv(df['Close'], df['Volume'])
-    if obv.iloc[-1] > obv.iloc[-2]:
-        signals.append("BUY")
-        explanations.append("OBV растет → покупатели доминируют")
-    else:
-        signals.append("SELL")
-        explanations.append("OBV падает → продавцы доминируют")
-
-    # ----- ATR -----
-    atr = ta.atr(df['High'], df['Low'], df['Close'])
-    if df['Close'].iloc[-1] > df['Close'].iloc[-2]:
-        signals.append("BUY")
-        explanations.append("ATR растет и цена растет → тренд вверх")
-    else:
-        signals.append("SELL")
-        explanations.append("ATR растет и цена падает → тренд вниз")
-
-    # ----- Williams %R -----
-    willr = ta.willr(df['High'], df['Low'], df['Close'])
-    if willr.iloc[-1] < -80:
-        signals.append("BUY")
-        explanations.append("Williams %R перепродан → возможен рост")
-    elif willr.iloc[-1] > -20:
-        signals.append("SELL")
-        explanations.append("Williams %R перекуплен → возможен спад")
-
-    # ----- Ultimate Oscillator -----
-    uo = ta.uo(df['High'], df['Low'], df['Close'])
-    if uo.iloc[-1] > 50:
-        signals.append("BUY")
-        explanations.append("Ultimate Oscillator >50 → бычий сигнал")
-    else:
-        signals.append("SELL")
-        explanations.append("Ultimate Oscillator <50 → медвежий сигнал")
-
-    # Подсчет уверенности
     counter = Counter(signals)
     final_signal, count = counter.most_common(1)[0]
     confidence = round(count / len(signals) * 100, 1)
@@ -275,13 +182,73 @@ def get_signal(df: pd.DataFrame):
 
     return final_signal, confidence, explanation_text
 
-# ===================== HANDLERS =====================
+# ===================== ACTIVATION LOGIC =====================
+user_keys = {}   # Telegram ID → (ключ, timestamp создания)
+used_keys = set()  # уже использованные ключи
+pending_po_id = {}  # Telegram ID → Pocket Option ID
+
+REF_LINK = "https://u3.shortink.io/login?social=Google&utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
+
+KEY_VALIDITY_HOURS = 24  # время действия ключа
+
+async def cleanup_old_keys():
+    while True:
+        now = datetime.now()
+        to_delete = []
+        for uid, (key, created) in user_keys.items():
+            if now - created > timedelta(hours=KEY_VALIDITY_HOURS):
+                to_delete.append(uid)
+        for uid in to_delete:
+            del user_keys[uid]
+        await asyncio.sleep(3600)  # проверка каждый час
+
 @dp.message(Command("start"))
 async def start_cmd(msg: types.Message, state: FSMContext):
     await state.clear()
     await save_user(msg.from_user.id)
-    await msg.answer("👋 Привет! Я твой помощник по валютным парам.\nВыбери режим:", reply_markup=main_menu_kb())
+    await msg.answer(
+        f"👋 Добро пожаловать в команду Курут!\n\n"
+        f"Чтобы активировать нашего торгового бота:\n"
+        f"1️⃣ Перейдите по ссылке и зарегистрируйте свой аккаунт Pocket Option:\n"
+        f"{REF_LINK}\n\n"
+        f"2️⃣ После регистрации отправьте мне ваш ID аккаунта Pocket Option."
+    )
 
+@dp.message()
+async def handle_messages(msg: types.Message):
+    user_id = msg.from_user.id
+    text = msg.text.strip()
+
+    # Если ждём Pocket Option ID
+    if user_id not in user_keys and user_id not in pending_po_id:
+        if text.isdigit():
+            pending_po_id[user_id] = text
+            key = f"{random.randint(10,99)}-{random.randint(10,99)}-{random.randint(10,99)}"
+            user_keys[user_id] = (key, datetime.now())
+            await msg.answer(
+                f"✅ Pocket Option ID получен!\n\n"
+                f"Ваш уникальный ключ для активации бота (действителен 24 часа):\n"
+                f"`{key}`\n\n"
+                f"Отправьте этот ключ сюда, чтобы активировать доступ."
+            )
+        else:
+            await msg.answer("❌ Пожалуйста, отправьте корректный числовой ID Pocket Option.")
+        return
+
+    # Проверка ключа
+    if user_id in user_keys:
+        key, created = user_keys[user_id]
+        if text == key and text not in used_keys:
+            used_keys.add(text)
+            del user_keys[user_id]
+            if user_id in pending_po_id:
+                del pending_po_id[user_id]
+            await msg.answer("✅ Доступ активирован! Теперь вы можете получать сигналы.", reply_markup=main_menu_kb())
+        else:
+            await msg.answer("❌ Неверный или уже использованный ключ.")
+        return
+
+# ===================== CALLBACKS =====================
 @dp.callback_query(lambda c: c.data=="menu_main")
 async def menu_main_cb(cb: types.CallbackQuery):
     await cb.message.edit_text("👋 Главное меню:", reply_markup=main_menu_kb())
@@ -359,38 +326,13 @@ async def res_cb(cb: types.CallbackQuery):
     await cb.message.edit_text("✅ Результат сохранён", reply_markup=main_menu_kb())
     await cb.answer()
 
-# ===================== WEBHOOK =====================
-async def on_startup(bot: Bot):
-    await init_db()
-    await bot(DeleteWebhook(drop_pending_updates=True))
-    await bot(SetWebhook(url=WEBHOOK_URL))
-    logging.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
-
-async def on_shutdown(bot: Bot):
-    await bot(DeleteWebhook())
-    if DB_POOL:
-        await DB_POOL.close()
-
-async def health(request):
-    return web.Response(text="OK")
-
+# ===================== RUN =====================
 async def main():
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-
-    app = web.Application()
-    app.router.add_get("/", health)
-
-    handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
-    handler.register(app, path=WEBHOOK_PATH)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, HOST, PORT)
-    await site.start()
-
+    await init_db()
+    # Запускаем фоновый таск для очистки старых ключей
+    asyncio.create_task(cleanup_old_keys())
     logging.info("🚀 BOT LIVE")
-    await asyncio.Event().wait()
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
