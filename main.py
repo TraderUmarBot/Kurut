@@ -46,7 +46,7 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
 )
 dp = Dispatcher(storage=MemoryStorage())
-DB_POOL = None
+DB_POOL: asyncpg.pool.Pool | None = None
 
 # ===================== CONSTANTS =====================
 PAIRS = [
@@ -61,7 +61,7 @@ MIN_DEPOSIT = 20.0  # минимальный депозит для доступ�
 # ===================== DB =====================
 async def init_db():
     global DB_POOL
-    DB_POOL = await asyncpg.create_pool(DATABASE_URL)
+    DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     async with DB_POOL.acquire() as conn:
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -99,6 +99,8 @@ async def update_balance(user_id: int, amount: float):
         )
 
 async def get_balance(user_id: int) -> float:
+    if DB_POOL is None:
+        raise RuntimeError("DB_POOL не инициализирован!")
     async with DB_POOL.acquire() as conn:
         val = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", user_id)
         return val or 0.0
@@ -167,6 +169,9 @@ def result_kb(trade_id):
 
 # ===================== ANALYSIS =====================
 def get_signal(df: pd.DataFrame):
+    if df.empty:
+        return "SELL", 50.0, "Нет данных для анализа"
+
     signals, expl = [], []
 
     sma5 = ta.sma(df.Close, 5)
@@ -206,11 +211,14 @@ def get_signal(df: pd.DataFrame):
 async def start(msg: types.Message):
     balance = await get_balance(msg.from_user.id)
     if balance < MIN_DEPOSIT:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="💰 Я пополнил баланс", callback_data="check_deposit")
+        kb.adjust(1)
         await msg.answer(
             f"🚀 Для доступа к сигналам пополните минимум ${MIN_DEPOSIT}\n\n"
             f"🔗 Регистрация: {REF_LINK}\n"
             "После пополнения нажмите кнопку ниже:",
-            reply_markup=InlineKeyboardBuilder().button(text="💰 Я пополнил баланс", callback_data="check_deposit").as_markup()
+            reply_markup=kb.as_markup()
         )
     else:
         await msg.answer("🏠 Главное меню", reply_markup=main_menu())
@@ -247,7 +255,13 @@ async def pair(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("tf:"))
 async def tf(cb: types.CallbackQuery):
     _, pair, tf = cb.data.split(":")
-    df = yf.download(pair, period="5d", interval=f"{tf}m")
+    try:
+        df = yf.download(pair, period="5d", interval=f"{tf}m")
+    except Exception as e:
+        await cb.message.answer(f"Ошибка получения данных: {e}")
+        await cb.answer()
+        return
+
     direction, confidence, expl = get_signal(df)
 
     trade_id = await save_trade(
@@ -272,8 +286,8 @@ async def tf(cb: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("res:"))
 async def res(cb: types.CallbackQuery):
-    _, tid, res = cb.data.split(":")
-    await update_trade(int(tid), res)
+    _, tid, res_val = cb.data.split(":")
+    await update_trade(int(tid), res_val)
     await cb.message.edit_text("✅ Результат сохранён", reply_markup=main_menu())
     await cb.answer()
 
@@ -298,9 +312,13 @@ async def handle_postback(request: web.Request):
         return web.Response(text="No click_id", status=400)
 
     # Пользователь идентифицируется по click_id
-    user_id = int(click_id)  # допустим click_id = telegram_id
+    try:
+        user_id = int(click_id)
+    except ValueError:
+        user_id = click_id
+
     await add_user(user_id, pocket_id=str(click_id))
-    if event == "deposit" and amount > 0:
+    if event in ["deposit","reg"] and amount > 0:
         await update_balance(user_id, amount)
 
     return web.Response(text="OK")
@@ -312,7 +330,9 @@ async def on_startup(bot: Bot):
     await bot(SetWebhook(WEBHOOK_URL))
 
 async def main():
-    dp.startup.register(on_startup)
+    await init_db()
+    await bot(DeleteWebhook(drop_pending_updates=True))
+    await bot(SetWebhook(WEBHOOK_URL))
 
     app = web.Application()
     handler = SimpleRequestHandler(dp, bot)
