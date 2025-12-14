@@ -1,4 +1,4 @@
-# main.py — AI TECH SIGNAL BOT с рефкой и уникальными ключами + автоудаление ключей
+# main.py — AI TECH SIGNAL BOT с удалением webhook, рефкой и уникальными ключами + автоудаление старых ключей
 
 import os
 import sys
@@ -202,6 +202,7 @@ async def cleanup_old_keys():
             del user_keys[uid]
         await asyncio.sleep(3600)  # проверка каждый час
 
+# ===================== START CMD =====================
 @dp.message(Command("start"))
 async def start_cmd(msg: types.Message, state: FSMContext):
     await state.clear()
@@ -227,7 +228,7 @@ async def handle_messages(msg: types.Message):
             user_keys[user_id] = (key, datetime.now())
             await msg.answer(
                 f"✅ Pocket Option ID получен!\n\n"
-                f"Ваш уникальный ключ для активации бота (действителен 24 часа):\n"
+                f"Ваш уникальный ключ для активации бота (действителен 24 часа, если не использован):\n"
                 f"`{key}`\n\n"
                 f"Отправьте этот ключ сюда, чтобы активировать доступ."
             )
@@ -329,6 +330,8 @@ async def res_cb(cb: types.CallbackQuery):
 # ===================== RUN =====================
 async def main():
     await init_db()
+    # Удаляем старый webhook перед polling
+    await bot.delete_webhook(drop_pending_updates=True)
     # Запускаем фоновый таск для очистки старых ключей
     asyncio.create_task(cleanup_old_keys())
     logging.info("🚀 BOT LIVE")
