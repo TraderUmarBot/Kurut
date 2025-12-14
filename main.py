@@ -211,6 +211,9 @@ def get_signal(df: pd.DataFrame):
 # ===================== HANDLERS =====================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
+    # Авто-добавление пользователя
+    await add_user(msg.from_user.id, pocket_id=str(msg.from_user.id))
+
     balance = await get_balance(msg.from_user.id)
     if balance < MIN_DEPOSIT:
         kb = InlineKeyboardBuilder()
@@ -313,13 +316,14 @@ async def handle_postback(request: web.Request):
     if not click_id:
         return web.Response(text="No click_id", status=400)
 
-    # Пользователь идентифицируется по click_id
     try:
         user_id = int(click_id)
     except ValueError:
         user_id = click_id
 
+    # Авто-добавление пользователя
     await add_user(user_id, pocket_id=str(click_id))
+
     if event in ["deposit","reg"] and amount > 0:
         await update_balance(user_id, amount)
 
@@ -329,7 +333,7 @@ async def handle_postback(request: web.Request):
 async def main():
     await init_db()
 
-    # Устанавливаем вебхук корректно
+    # Устанавливаем вебхук
     await bot(DeleteWebhook(drop_pending_updates=True))
     await bot(SetWebhook(url=WEBHOOK_URL))
 
