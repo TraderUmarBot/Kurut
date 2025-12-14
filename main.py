@@ -16,8 +16,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web
 
@@ -30,7 +28,8 @@ HOST = "0.0.0.0"
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
 
-AUTHORS = [7079260196]  # ID авторов без регистрации и пополнения
+# User IDs авторов (доступ без пополнения)
+AUTHORS = [7079260196]  # сюда можешь добавить ещё ID авторов
 
 if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME or not DATABASE_URL:
     print("❌ ENV не заданы или DATABASE_URL неверен")
@@ -42,7 +41,7 @@ WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 logging.basicConfig(level=logging.INFO)
 
 # ===================== BOT =====================
-bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN_V2))
+bot = Bot(token=TG_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 DB_POOL: asyncpg.pool.Pool | None = None
 
@@ -54,7 +53,7 @@ PAIRS = [
 ]
 TIMEFRAMES = [1, 2, 5, 15]
 PAIRS_PER_PAGE = 6
-MIN_DEPOSIT = 20.0
+MIN_DEPOSIT = 20.0  # минимальный депозит для доступа
 
 # ===================== DB =====================
 async def init_db():
@@ -103,6 +102,8 @@ async def update_balance(user_id: int, amount: float):
         )
 
 async def get_balance(user_id: int) -> float:
+    if DB_POOL is None:
+        raise RuntimeError("DB_POOL не инициализирован!")
     async with DB_POOL.acquire() as conn:
         val = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", user_id)
         return val or 0.0
@@ -206,8 +207,7 @@ def get_signal(df: pd.DataFrame):
     direction, count = counter.most_common(1)[0]
     confidence = round(count / len(signals) * 100, 1)
 
-    expl_text = "\\n".join(expl)
-    expl_safe = expl_text.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("]", "\\]")
+    expl_safe = "\n".join(expl)  # plain text, без экранирования
 
     return direction, confidence, expl_safe
 
@@ -218,6 +218,7 @@ async def start(msg: types.Message):
     balance = await get_balance(user_id)
 
     if user_id in AUTHORS:
+        # Авторы имеют доступ всегда
         await msg.answer("🏠 Главное меню (Авторский доступ)", reply_markup=main_menu())
         return
 
@@ -285,13 +286,12 @@ async def tf(cb: types.CallbackQuery):
     )
 
     await cb.message.edit_text(
-        f"📊 *Сигнал*\n\n"
+        f"📊 Сигнал\n\n"
         f"Пара: {pair.replace('=X','')}\n"
         f"TF: {tf} мин\n"
-        f"Направление: *{direction}*\n"
-        f"Уверенность: *{confidence}%*\n\n"
+        f"Направление: {direction}\n"
+        f"Уверенность: {confidence}%\n\n"
         f"{expl}",
-        parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=result_kb(trade_id)
     )
     await cb.answer()
@@ -309,11 +309,11 @@ async def history(cb: types.CallbackQuery):
     if not trades:
         await cb.message.answer("📜 История пуста")
         return
-    text = "📜 *История сделок*\n\n"
+    text = "📜 История сделок\n\n"
     for t in trades:
         result = t['result'] if t['result'] else "—"
         text += f"{t['timestamp']} | {t['pair']} | {t['direction']} | {result}\n"
-    await cb.message.answer(text, parse_mode=ParseMode.MARKDOWN_V2)
+    await cb.message.answer(text)
 
 # ===================== POSTBACK =====================
 async def handle_postback(request: web.Request):
@@ -327,7 +327,7 @@ async def handle_postback(request: web.Request):
     try:
         user_id = int(click_id)
     except ValueError:
-        return web.Response(text="Invalid click_id", status=400)
+        user_id = click_id
 
     await add_user(user_id, pocket_id=str(click_id))
     if event in ["deposit","reg"] and amount > 0:
@@ -338,8 +338,9 @@ async def handle_postback(request: web.Request):
 # ===================== WEBHOOK =====================
 async def main():
     await init_db()
-    await bot(DeleteWebhook(drop_pending_updates=True))
-    await bot(SetWebhook(url=WEBHOOK_URL))
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_webhook(WEBHOOK_URL)
 
     app = web.Application()
     handler = SimpleRequestHandler(dp, bot)
