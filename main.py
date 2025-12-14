@@ -3,6 +3,8 @@ import sys
 import asyncio
 import logging
 from collections import Counter
+import sqlite3
+from datetime import datetime
 
 import pandas as pd
 import pandas_ta as ta
@@ -53,9 +55,59 @@ TIMEFRAMES = [1, 2, 5, 15]
 PAIRS_PER_PAGE = 6
 
 # ===================== FSM =====================
-class TradeState(StatesGroup):
-    choosing_pair = State()
-    choosing_tf = State()
+class AccessState(StatesGroup):
+    waiting_pocket_id = State()
+
+# ===================== DATABASE =====================
+DB_FILE = "trades.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            timestamp TEXT,
+            pair TEXT,
+            timeframe INTEGER,
+            direction TEXT,
+            confidence REAL,
+            result TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def save_trade(user_id, pair, tf, direction, confidence):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO trades (user_id, timestamp, pair, timeframe, direction, confidence) VALUES (?,?,?,?,?,?)",
+        (user_id, datetime.now().isoformat(), pair, tf, direction, confidence)
+    )
+    trade_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return trade_id
+
+def update_trade(trade_id, result):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE trades SET result=? WHERE id=?", (result, trade_id))
+    conn.commit()
+    conn.close()
+
+def get_history(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, timestamp, pair, timeframe, direction, confidence, result FROM trades WHERE user_id=? ORDER BY timestamp DESC LIMIT 20",
+        (user_id,)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
 
 # ===================== KEYBOARDS =====================
 def main_menu():
@@ -70,6 +122,11 @@ def pairs_kb(page=0):
     start = page * PAIRS_PER_PAGE
     for p in PAIRS[start:start+PAIRS_PER_PAGE]:
         kb.button(text=p.replace("=X",""), callback_data=f"pair:{p}")
+    # Кнопки пагинации
+    if page > 0:
+        kb.button(text="⬅️ Назад", callback_data=f"pairs_page:{page-1}")
+    if (start + PAIRS_PER_PAGE) < len(PAIRS):
+        kb.button(text="➡️ Вперед", callback_data=f"pairs_page:{page+1}")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -127,18 +184,21 @@ def get_signal(df: pd.DataFrame):
 # ===================== HANDLERS =====================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
-    await msg.answer(
-        "✍️ Отправь свой Pocket Option ID для доступа к сигналам"
-    )
+    await msg.answer("🏠 Главное меню", reply_markup=main_menu())
 
 @dp.message()
-async def receive_id(msg: types.Message, state: FSMContext):
-    # Любой ID открывает доступ
-    await msg.answer("✅ Доступ к сигналам открыт!", reply_markup=main_menu())
+async def pocket_id(msg: types.Message):
+    await msg.answer("✅ Доступ открыт!", reply_markup=main_menu())
 
 @dp.callback_query(lambda c: c.data == "pairs")
 async def pairs(cb: types.CallbackQuery):
     await cb.message.edit_text("📈 Выбери пару", reply_markup=pairs_kb())
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("pairs_page:"))
+async def pairs_page(cb: types.CallbackQuery):
+    page = int(cb.data.split(":")[1])
+    await cb.message.edit_text("📈 Выбери пару", reply_markup=pairs_kb(page))
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
@@ -153,31 +213,54 @@ async def pair(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("tf:"))
 async def tf(cb: types.CallbackQuery):
     _, pair, tf = cb.data.split(":")
-    df = yf.download(pair, period="5d", interval=f"{tf}m")
-    direction, confidence, expl = get_signal(df)
+    try:
+        period = "1d" if int(tf) <= 5 else "5d"
+        df = yf.download(pair, period=period, interval=f"{tf}m")
+        if df.empty:
+            await cb.message.edit_text("❌ Не удалось получить данные для этой пары")
+            return
+        direction, confidence, expl = get_signal(df)
+        trade_id = save_trade(cb.from_user.id, pair.replace("=X",""), int(tf), direction, confidence)
+        await cb.message.edit_text(
+            f"📊 *Сигнал*\n\n"
+            f"Пара: {pair.replace('=X','')}\n"
+            f"TF: {tf} мин\n"
+            f"Направление: *{direction}*\n"
+            f"Уверенность: *{confidence}%*\n\n"
+            f"{expl}",
+            reply_markup=result_kb(trade_id)
+        )
+    except Exception as e:
+        await cb.message.edit_text(f"❌ Ошибка при загрузке данных: {e}")
+    await cb.answer()
 
-    await cb.message.edit_text(
-        f"📊 *Сигнал*\n\n"
-        f"Пара: {pair.replace('=X','')}\n"
-        f"TF: {tf} мин\n"
-        f"Направление: *{direction}*\n"
-        f"Уверенность: *{confidence}%*\n\n"
-        f"{expl}",
-    )
+@dp.callback_query(lambda c: c.data.startswith("res:"))
+async def res(cb: types.CallbackQuery):
+    _, tid, res_val = cb.data.split(":")
+    update_trade(int(tid), res_val)
+    await cb.message.edit_text("✅ Результат сохранён", reply_markup=main_menu())
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data == "history")
 async def history(cb: types.CallbackQuery):
-    await cb.message.answer("📜 История пока недоступна")
+    trades = get_history(cb.from_user.id)
+    if not trades:
+        await cb.message.answer("📜 История пуста")
+        return
+    text = "📜 *История сделок*\n\n"
+    for t in trades:
+        tid, ts, pair, tf, direction, confidence, result = t
+        text += f"{ts[:19]} | {pair} | {direction} | {result or '-'}\n"
+    await cb.message.answer(text)
+
+@dp.callback_query(lambda c: c.data == "menu")
+async def menu(cb: types.CallbackQuery):
+    await cb.message.edit_text("🏠 Главное меню", reply_markup=main_menu())
+    await cb.answer()
 
 # ===================== WEBHOOK =====================
-async def on_startup(bot: Bot):
-    await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(WEBHOOK_URL)
-
 async def main():
-    dp.startup.register(on_startup)
-
+    init_db()
     app = web.Application()
     handler = SimpleRequestHandler(dp, bot)
     handler.register(app, WEBHOOK_PATH)
