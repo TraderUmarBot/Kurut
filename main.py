@@ -2,7 +2,6 @@ import os
 import sys
 import asyncio
 import logging
-from datetime import datetime
 from collections import Counter
 
 import pandas as pd
@@ -12,10 +11,8 @@ import asyncpg
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.client.default import DefaultBotProperties
 from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web
@@ -29,10 +26,13 @@ HOST = "0.0.0.0"
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
 
-AUTHORS = [7079260196]  # ID авторов
+AUTHORS = [
+    7079260196,
+    6117198446
+]
 
-if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME or not DATABASE_URL:
-    print("❌ ENV не заданы или DATABASE_URL неверен")
+if not TG_TOKEN or not DATABASE_URL or not RENDER_EXTERNAL_HOSTNAME:
+    print("❌ ENV variables not set")
     sys.exit(1)
 
 WEBHOOK_PATH = "/webhook"
@@ -41,9 +41,9 @@ WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 logging.basicConfig(level=logging.INFO)
 
 # ===================== BOT =====================
-bot = Bot(token=TG_TOKEN)  # без parse_mode, будем задавать по месту
+bot = Bot(token=TG_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-DB_POOL: asyncpg.pool.Pool | None = None
+DB_POOL = None
 
 # ===================== CONSTANTS =====================
 PAIRS = [
@@ -51,20 +51,15 @@ PAIRS = [
     "EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X",
     "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
+
 TIMEFRAMES = [1, 2, 5, 15]
 PAIRS_PER_PAGE = 6
 MIN_DEPOSIT = 20.0
 
-# ===================== DB =====================
+# ===================== DATABASE =====================
 async def init_db():
     global DB_POOL
-    if DB_POOL is None:
-        try:
-            DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
-            logging.info("✅ Подключение к БД успешно")
-        except Exception as e:
-            logging.error(f"Ошибка подключения к БД: {e}")
-            sys.exit(1)
+    DB_POOL = await asyncpg.create_pool(DATABASE_URL)
     async with DB_POOL.acquire() as conn:
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -87,34 +82,33 @@ async def init_db():
         );
         """)
 
-async def add_user(user_id: int, pocket_id: str):
+async def get_balance(user_id):
+    async with DB_POOL.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT balance FROM users WHERE user_id=$1", user_id
+        )
+        return val or 0.0
+
+async def add_user(user_id, pocket_id):
     async with DB_POOL.acquire() as conn:
         await conn.execute(
-            "INSERT INTO users (user_id, pocket_id) VALUES ($1,$2) ON CONFLICT (user_id) DO NOTHING",
+            "INSERT INTO users (user_id, pocket_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
             user_id, pocket_id
         )
 
-async def update_balance(user_id: int, amount: float):
+async def update_balance(user_id, amount):
     async with DB_POOL.acquire() as conn:
         await conn.execute(
             "UPDATE users SET balance = balance + $1 WHERE user_id=$2",
             amount, user_id
         )
 
-async def get_balance(user_id: int) -> float:
-    if DB_POOL is None:
-        raise RuntimeError("DB_POOL не инициализирован!")
-    async with DB_POOL.acquire() as conn:
-        val = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", user_id)
-        return val or 0.0
-
 async def save_trade(user_id, pair, tf, direction, confidence, explanation):
     async with DB_POOL.acquire() as conn:
-        return await conn.fetchval(
-            """INSERT INTO trades (user_id, pair, timeframe, direction, confidence, explanation)
-               VALUES ($1,$2,$3,$4,$5,$6) RETURNING id""",
-            user_id, pair, tf, direction, confidence, explanation
-        )
+        return await conn.fetchval("""
+            INSERT INTO trades (user_id,pair,timeframe,direction,confidence,explanation)
+            VALUES ($1,$2,$3,$4,$5,$6) RETURNING id
+        """, user_id, pair, tf, direction, confidence, explanation)
 
 async def update_trade(trade_id, result):
     async with DB_POOL.acquire() as conn:
@@ -125,21 +119,17 @@ async def update_trade(trade_id, result):
 
 async def get_history(user_id):
     async with DB_POOL.acquire() as conn:
-        return await conn.fetch(
-            "SELECT * FROM trades WHERE user_id=$1 ORDER BY timestamp DESC LIMIT 20",
-            user_id
-        )
-
-# ===================== FSM =====================
-class TradeState(StatesGroup):
-    choosing_pair = State()
-    choosing_tf = State()
+        return await conn.fetch("""
+            SELECT * FROM trades
+            WHERE user_id=$1
+            ORDER BY timestamp DESC LIMIT 20
+        """, user_id)
 
 # ===================== KEYBOARDS =====================
 def main_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="📈 Валютные пары", callback_data="pairs")
-    kb.button(text="📜 История сделок", callback_data="history")
+    kb.button(text="📜 История", callback_data="history")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -151,7 +141,7 @@ def pairs_kb(page=0):
     if page > 0:
         kb.button(text="⬅️ Назад", callback_data=f"pairs_page:{page-1}")
     if start + PAIRS_PER_PAGE < len(PAIRS):
-        kb.button(text="➡️ Вперёд", callback_data=f"pairs_page:{page+1}")
+        kb.button(text="➡️ Далее", callback_data=f"pairs_page:{page+1}")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -166,176 +156,113 @@ def result_kb(trade_id):
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ ПЛЮС", callback_data=f"res:{trade_id}:PLUS")
     kb.button(text="❌ МИНУС", callback_data=f"res:{trade_id}:MINUS")
-    kb.button(text="🏠 Меню", callback_data="menu")
     kb.adjust(2)
     return kb.as_markup()
 
 # ===================== ANALYSIS =====================
-def get_signal(df: pd.DataFrame):
+def get_signal(df):
     if df.empty:
-        return "SELL", 50.0, "Нет данных для анализа"
+        return "SELL", 50.0, "Нет данных"
 
-    signals, expl = [], []
+    signals = []
+    expl = []
 
-    sma5 = ta.sma(df.Close, 5)
-    sma20 = ta.sma(df.Close, 20)
-    signals.append("BUY" if sma5.iloc[-1] > sma20.iloc[-1] else "SELL")
-    expl.append("SMA 5/20 определяет тренд")
+    signals.append("BUY" if ta.sma(df.Close, 5).iloc[-1] > ta.sma(df.Close, 20).iloc[-1] else "SELL")
+    expl.append("SMA")
 
-    ema5 = ta.ema(df.Close, 5)
-    ema20 = ta.ema(df.Close, 20)
-    signals.append("BUY" if ema5.iloc[-1] > ema20.iloc[-1] else "SELL")
-    expl.append("EMA подтверждает направление")
+    signals.append("BUY" if ta.ema(df.Close, 5).iloc[-1] > ta.ema(df.Close, 20).iloc[-1] else "SELL")
+    expl.append("EMA")
 
-    rsi = ta.rsi(df.Close)
-    signals.append("BUY" if rsi.iloc[-1] < 30 else "SELL" if rsi.iloc[-1] > 70 else "BUY")
-    expl.append("RSI анализ перекупленности")
+    rsi = ta.rsi(df.Close).iloc[-1]
+    signals.append("BUY" if rsi < 30 else "SELL" if rsi > 70 else "BUY")
+    expl.append("RSI")
 
     macd = ta.macd(df.Close)
     signals.append("BUY" if macd.iloc[-1,0] > macd.iloc[-1,1] else "SELL")
-    expl.append("MACD сигнал")
-
-    bb = ta.bbands(df.Close)
-    signals.append("BUY" if df.Close.iloc[-1] < bb.iloc[-1,0] else "SELL")
-    expl.append("Bollinger Bands")
-
-    adx = ta.adx(df.High, df.Low, df.Close)
-    signals.append("BUY" if adx.iloc[-1,0] > 25 else "SELL")
-    expl.append("ADX сила тренда")
+    expl.append("MACD")
 
     counter = Counter(signals)
     direction, count = counter.most_common(1)[0]
     confidence = round(count / len(signals) * 100, 1)
 
-    # теперь возвращаем обычный текст без Markdown экранирования
-    expl_safe = " | ".join(expl)
-
-    return direction, confidence, expl_safe
+    return direction, confidence, " | ".join(expl)
 
 # ===================== HANDLERS =====================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
-    user_id = msg.from_user.id
-    balance = await get_balance(user_id)
+    uid = msg.from_user.id
 
-    if user_id in AUTHORS:
-        await msg.answer(
-            "🏠 Главное меню (Авторский доступ)",
-            reply_markup=main_menu(),
-            parse_mode=None
-        )
+    if uid in AUTHORS:
+        await msg.answer("🏠 Главное меню (Автор)", reply_markup=main_menu())
         return
 
+    balance = await get_balance(uid)
     if balance < MIN_DEPOSIT:
         kb = InlineKeyboardBuilder()
-        kb.button(text="💰 Я пополнил баланс", callback_data="check_deposit")
-        kb.adjust(1)
+        kb.button(text="💰 Я пополнил", callback_data="check_deposit")
         await msg.answer(
-            f"🚀 Для доступа к сигналам пополните минимум ${MIN_DEPOSIT}\n\n"
-            f"🔗 Регистрация: {REF_LINK}\nПосле пополнения нажмите кнопку ниже:",
-            reply_markup=kb.as_markup(),
-            parse_mode=None
+            f"Минимальный депозит ${MIN_DEPOSIT}\nРегистрация:\n{REF_LINK}",
+            reply_markup=kb.as_markup()
         )
     else:
-        await msg.answer("🏠 Главное меню", reply_markup=main_menu(), parse_mode=None)
-
-@dp.callback_query(lambda c: c.data == "check_deposit")
-async def check_deposit(cb: types.CallbackQuery):
-    balance = await get_balance(cb.from_user.id)
-    if balance >= MIN_DEPOSIT:
-        await cb.message.answer("✅ Доступ к сигналам открыт!", reply_markup=main_menu(), parse_mode=None)
-    else:
-        await cb.message.answer(f"❌ Пополните баланс минимум на ${MIN_DEPOSIT}", parse_mode=None)
-    await cb.answer()
-
-@dp.callback_query(lambda c: c.data.startswith("pairs_page:"))
-async def pairs_page(cb: types.CallbackQuery):
-    page = int(cb.data.split(":")[1])
-    await cb.message.edit_text("📈 Выбери пару", reply_markup=pairs_kb(page))
-    await cb.answer()
+        await msg.answer("🏠 Главное меню", reply_markup=main_menu())
 
 @dp.callback_query(lambda c: c.data == "pairs")
 async def pairs(cb: types.CallbackQuery):
-    await cb.message.edit_text("📈 Выбери пару", reply_markup=pairs_kb())
+    await cb.message.edit_text("Выбери пару", reply_markup=pairs_kb())
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
 async def pair(cb: types.CallbackQuery):
     pair = cb.data.split(":")[1]
-    await cb.message.edit_text(
-        f"⏱ Пара {pair.replace('=X','')}, выбери TF",
-        reply_markup=tf_kb(pair)
-    )
+    await cb.message.edit_text(f"{pair.replace('=X','')} — выбери TF", reply_markup=tf_kb(pair))
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("tf:"))
 async def tf(cb: types.CallbackQuery):
     _, pair, tf = cb.data.split(":")
-    try:
-        df = yf.download(pair, period="5d", interval=f"{tf}m")
-    except Exception as e:
-        await cb.message.answer(f"Ошибка получения данных: {e}", parse_mode=None)
-        await cb.answer()
-        return
+    df = yf.download(pair, period="2d", interval=f"{tf}m", progress=False)
 
     direction, confidence, expl = get_signal(df)
-
-    trade_id = await save_trade(
-        cb.from_user.id,
-        pair.replace("=X",""),
-        int(tf),
-        direction,
-        confidence,
-        expl
-    )
+    trade_id = await save_trade(cb.from_user.id, pair.replace("=X",""), int(tf), direction, confidence, expl)
 
     await cb.message.edit_text(
-        f"📊 Сигнал\n\n"
-        f"Пара: {pair.replace('=X','')}\n"
-        f"TF: {tf} мин\n"
-        f"Направление: {direction}\n"
-        f"Уверенность: {confidence}%\n\n"
-        f"{expl}",
-        reply_markup=result_kb(trade_id),
-        parse_mode=None
+        f"Пара: {pair.replace('=X','')}\nTF: {tf} мин\nСигнал: {direction}\nУверенность: {confidence}%\n{expl}",
+        reply_markup=result_kb(trade_id)
     )
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("res:"))
 async def res(cb: types.CallbackQuery):
-    _, tid, res_val = cb.data.split(":")
-    await update_trade(int(tid), res_val)
-    await cb.message.edit_text("✅ Результат сохранён", reply_markup=main_menu(), parse_mode=None)
+    _, tid, r = cb.data.split(":")
+    await update_trade(int(tid), r)
+    await cb.message.edit_text("Результат сохранён", reply_markup=main_menu())
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data == "history")
 async def history(cb: types.CallbackQuery):
     trades = await get_history(cb.from_user.id)
     if not trades:
-        await cb.message.answer("📜 История пуста", parse_mode=None)
+        await cb.message.answer("История пуста")
         return
-    text = "📜 История сделок\n\n"
+    text = "История:\n"
     for t in trades:
-        result = t['result'] if t['result'] else "—"
-        text += f"{t['timestamp']} | {t['pair']} | {t['direction']} | {result}\n"
-    await cb.message.answer(text, parse_mode=None)
+        text += f"{t['timestamp']} | {t['pair']} | {t['direction']} | {t['result']}\n"
+    await cb.message.answer(text)
 
 # ===================== POSTBACK =====================
-async def handle_postback(request: web.Request):
+async def handle_postback(request):
     event = request.query.get("event")
     click_id = request.query.get("click_id")
     amount = float(request.query.get("amount", 0))
 
     if not click_id:
-        return web.Response(text="No click_id", status=400)
+        return web.Response(text="NO CLICK_ID", status=400)
 
-    try:
-        user_id = int(click_id)
-    except ValueError:
-        user_id = click_id
+    user_id = int(click_id)
+    await add_user(user_id, click_id)
 
-    await add_user(user_id, pocket_id=str(click_id))
-    if event in ["deposit","reg"] and amount > 0:
+    if event == "deposit" and amount > 0:
         await update_balance(user_id, amount)
 
     return web.Response(text="OK")
@@ -344,7 +271,7 @@ async def handle_postback(request: web.Request):
 async def main():
     await init_db()
     await bot(DeleteWebhook(drop_pending_updates=True))
-    await bot(SetWebhook(url=WEBHOOK_URL))
+    await bot(SetWebhook(WEBHOOK_URL))
 
     app = web.Application()
     handler = SimpleRequestHandler(dp, bot)
@@ -356,11 +283,8 @@ async def main():
     site = web.TCPSite(runner, HOST, PORT)
     await site.start()
 
-    logging.info(f"🚀 BOT LIVE на {HOST}:{PORT}")
+    logging.info("🚀 BOT LIVE")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    finally:
-        asyncio.run(bot.session.close())
+    asyncio.run(main())
