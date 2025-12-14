@@ -30,6 +30,9 @@ HOST = "0.0.0.0"
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
 
+# User IDs авторов (доступ без пополнения)
+AUTHORS = [7079260196]  # сюда можешь добавить ещё ID авторов
+
 if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME or not DATABASE_URL:
     print("❌ ENV не заданы или DATABASE_URL неверен")
     sys.exit(1)
@@ -40,7 +43,7 @@ WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 logging.basicConfig(level=logging.INFO)
 
 # ===================== BOT =====================
-bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN_V2))
 dp = Dispatcher(storage=MemoryStorage())
 DB_POOL: asyncpg.pool.Pool | None = None
 
@@ -64,29 +67,14 @@ async def init_db():
         except Exception as e:
             logging.error(f"Ошибка подключения к БД: {e}")
             sys.exit(1)
-
     async with DB_POOL.acquire() as conn:
-        # Создаём таблицу users, если нет
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
-            pocket_id TEXT
+            pocket_id TEXT,
+            balance FLOAT DEFAULT 0
         );
         """)
-
-        # Проверяем, есть ли колонка balance, если нет — добавляем
-        col_exists = await conn.fetchval("""
-        SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_name='users' AND column_name='balance'
-        );
-        """)
-        if not col_exists:
-            await conn.execute("ALTER TABLE users ADD COLUMN balance FLOAT DEFAULT 0;")
-            logging.info("✅ Колонка balance добавлена в users")
-
-        # Создаём таблицу trades, если нет
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id SERIAL PRIMARY KEY,
@@ -100,7 +88,6 @@ async def init_db():
             result TEXT
         );
         """)
-        logging.info("✅ Таблицы проверены/созданы")
 
 async def add_user(user_id: int, pocket_id: str):
     async with DB_POOL.acquire() as conn:
@@ -222,12 +209,22 @@ def get_signal(df: pd.DataFrame):
     direction, count = counter.most_common(1)[0]
     confidence = round(count / len(signals) * 100, 1)
 
-    return direction, confidence, "\n".join(expl)
+    # Экранируем спецсимволы MarkdownV2
+    expl_safe = expl.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("]", "\\]")
+
+    return direction, confidence, expl_safe
 
 # ===================== HANDLERS =====================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
-    balance = await get_balance(msg.from_user.id)
+    user_id = msg.from_user.id
+    balance = await get_balance(user_id)
+
+    if user_id in AUTHORS:
+        # Авторы имеют доступ всегда
+        await msg.answer("🏠 Главное меню (Авторский доступ)", reply_markup=main_menu())
+        return
+
     if balance < MIN_DEPOSIT:
         kb = InlineKeyboardBuilder()
         kb.button(text="💰 Я пополнил баланс", callback_data="check_deposit")
@@ -298,6 +295,7 @@ async def tf(cb: types.CallbackQuery):
         f"Направление: *{direction}*\n"
         f"Уверенность: *{confidence}%*\n\n"
         f"{expl}",
+        parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=result_kb(trade_id)
     )
     await cb.answer()
@@ -317,8 +315,9 @@ async def history(cb: types.CallbackQuery):
         return
     text = "📜 *История сделок*\n\n"
     for t in trades:
-        text += f"{t['timestamp']} | {t['pair']} | {t['direction']} | {t['result']}\n"
-    await cb.message.answer(text)
+        result = t['result'] if t['result'] else "—"
+        text += f"{t['timestamp']} | {t['pair']} | {t['direction']} | {result}\n"
+    await cb.message.answer(text, parse_mode=ParseMode.MARKDOWN_V2)
 
 # ===================== POSTBACK =====================
 async def handle_postback(request: web.Request):
@@ -329,7 +328,6 @@ async def handle_postback(request: web.Request):
     if not click_id:
         return web.Response(text="No click_id", status=400)
 
-    # Пользователь идентифицируется по click_id
     try:
         user_id = int(click_id)
     except ValueError:
@@ -351,7 +349,6 @@ async def main():
     app = web.Application()
     handler = SimpleRequestHandler(dp, bot)
     handler.register(app, WEBHOOK_PATH)
-
     app.router.add_get("/postback", handle_postback)
 
     runner = web.AppRunner(app)
