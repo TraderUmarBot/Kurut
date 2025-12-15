@@ -5,9 +5,8 @@ import logging
 from datetime import datetime
 from collections import Counter
 
-import pandas as pd
-import pandas_ta as ta
 import asyncpg
+import pandas as pd
 from tradingview_ta import TA_Handler, Interval, Exchange
 
 from aiogram import Bot, Dispatcher, types
@@ -28,7 +27,7 @@ HOST = "0.0.0.0"
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
 
-AUTHORS = [7079260196, 6117198446]  # Добавлен новый автор
+AUTHORS = [7079260196, 6117198446]  # ID авторов
 
 if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME or not DATABASE_URL:
     print("❌ ENV не заданы или DATABASE_URL неверен")
@@ -108,8 +107,8 @@ async def get_balance(user_id: int) -> float:
         return val or 0.0
 
 async def save_trade(user_id, pair, tf, direction, confidence, explanation):
-    async with DB_POOL.acquire() as conn:
-        return await conn.fetchval(
+    async with DB_POOL.acquire() as c:
+        return await c.fetchval(
             """INSERT INTO trades (user_id, pair, timeframe, direction, confidence, explanation)
                VALUES ($1,$2,$3,$4,$5,$6) RETURNING id""",
             user_id, pair, tf, direction, confidence, explanation
@@ -169,6 +168,18 @@ def result_kb(trade_id):
     kb.adjust(2)
     return kb.as_markup()
 
+def start_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🚀 Начать", callback_data="begin")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def deposit_check_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💰 Проверить пополнение", callback_data="check_deposit")
+    kb.adjust(1)
+    return kb.as_markup()
+
 # ===================== ANALYSIS =====================
 def get_signal(pair: str, tf: int):
     try:
@@ -176,15 +187,16 @@ def get_signal(pair: str, tf: int):
             symbol=pair,
             screener="forex",
             exchange="FX_IDC",
-            interval={1: Interval.INTERVAL_1_MIN, 2: Interval.INTERVAL_2_MIN,
-                      5: Interval.INTERVAL_5_MIN, 15: Interval.INTERVAL_15_MIN}[tf]
+            interval=Interval.INTERVAL_1_MIN if tf==1 else
+                     Interval.INTERVAL_2_MIN if tf==2 else
+                     Interval.INTERVAL_5_MIN if tf==5 else
+                     Interval.INTERVAL_15_MIN
         )
         analysis = handler.get_analysis()
-        summary = analysis.summary
-        direction = "BUY" if summary["BUY"] >= summary["SELL"] else "SELL"
-        confidence = round(summary["BUY"] / (summary["BUY"] + summary["SELL"]) * 100, 1)
-        expl = " | ".join([f"{k}: {v}" for k, v in summary.items()])
-        return direction, confidence, expl
+        direction = analysis.summary['RECOMMENDATION']
+        confidence = round(sum(1 for v in analysis.indicators.values() if v in ["BUY","STRONG_BUY"]) / len(analysis.indicators) * 100,1)
+        explanation = " | ".join([f"{k}: {v}" for k,v in analysis.indicators.items()])
+        return direction, confidence, explanation
     except Exception as e:
         return "SELL", 50.0, f"Ошибка анализа: {e}"
 
@@ -192,8 +204,6 @@ def get_signal(pair: str, tf: int):
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     user_id = msg.from_user.id
-    balance = await get_balance(user_id)
-
     if user_id in AUTHORS:
         await msg.answer(
             "🏠 Главное меню (Авторский доступ)",
@@ -201,33 +211,22 @@ async def start(msg: types.Message):
         )
         return
 
-    instruction_text = (
-        "👋 Привет!\n\n"
-        "Этот бот помогает анализировать валютные пары и давать сигналы на основе нескольких индикаторов:\n\n"
-        "📊 Используемые индикаторы:\n"
-        "- SMA 5/20\n- EMA 5/20\n- RSI\n- MACD\n- Bollinger Bands\n- ADX\n\n"
-        "Бот анализирует свечи с TradingView, рассчитывает сигналы для выбранной валютной пары и таймфрейма.\n"
-        "Сигнал формируется на основе большинства индикаторов.\n\n"
-        "Чтобы начать пользоваться сигналами, нужно:\n"
-        "1️⃣ Зарегистрировать аккаунт по нашей ссылке.\n"
-        "2️⃣ Пополнить баланс минимум на $20.\n"
-        "3️⃣ Нажать кнопку проверки пополнения для получения доступа к сигналам."
+    text = (
+        "📊 Бот анализирует свечи с TradingView, рассчитывает сигналы на основе индикаторов:\n"
+        "- SMA, EMA\n"
+        "- RSI, MACD\n"
+        "- Bollinger Bands, ADX\n\n"
+        "Сигнал формируется после комплексного анализа выбранной валютной пары и таймфрейма.\n\n"
+        "Для начала работы:\n"
+        f"1️⃣ Зарегистрируйте аккаунт: {REF_LINK}\n"
+        f"2️⃣ Пополните баланс минимум на ${MIN_DEPOSIT}\n\n"
+        "Нажмите кнопку ниже чтобы начать:"
     )
+    await msg.answer(text, reply_markup=start_kb())
 
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Начать", callback_data="start_register")
-    kb.adjust(1)
-
-    await msg.answer(instruction_text, reply_markup=kb.as_markup())
-
-@dp.callback_query(lambda c: c.data == "start_register")
-async def start_register(cb: types.CallbackQuery):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🔗 Регистрация", url=REF_LINK)
-    kb.adjust(1)
-    kb.button(text="💰 Я пополнил баланс", callback_data="check_deposit")
-    kb.adjust(1)
-    await cb.message.answer("Сначала зарегистрируйтесь, затем пополните баланс и нажмите проверку.", reply_markup=kb.as_markup())
+@dp.callback_query(lambda c: c.data=="begin")
+async def begin(cb: types.CallbackQuery):
+    await cb.message.answer(f"После регистрации пополните баланс минимум на ${MIN_DEPOSIT}", reply_markup=deposit_check_kb())
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data == "check_deposit")
@@ -253,34 +252,21 @@ async def pairs(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
 async def pair(cb: types.CallbackQuery):
     pair = cb.data.split(":")[1]
-    await cb.message.edit_text(
-        f"⏱ Пара {pair}, выбери TF",
-        reply_markup=tf_kb(pair)
-    )
+    await cb.message.edit_text(f"⏱ Пара {pair}, выбери таймфрейм", reply_markup=tf_kb(pair))
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("tf:"))
 async def tf(cb: types.CallbackQuery):
-    _, pair, tf = cb.data.split(":")
-    tf = int(tf)
+    _, pair, tf_str = cb.data.split(":")
+    tf = int(tf_str)
     direction, confidence, expl = get_signal(pair, tf)
-
-    trade_id = await save_trade(
-        cb.from_user.id,
-        pair,
-        tf,
-        direction,
-        confidence,
-        expl
-    )
-
+    trade_id = await save_trade(cb.from_user.id, pair, tf, direction, confidence, expl)
     await cb.message.edit_text(
         f"📊 Сигнал\n\n"
         f"Пара: {pair}\n"
         f"TF: {tf} мин\n"
         f"Направление: {direction}\n"
-        f"Уверенность: {confidence}%\n\n"
-        f"{expl}",
+        f"Уверенность: {confidence}%\n\n{expl}",
         reply_markup=result_kb(trade_id)
     )
     await cb.answer()
@@ -308,10 +294,7 @@ async def history(cb: types.CallbackQuery):
 async def handle_postback(request: web.Request):
     event = request.query.get("event")
     click_id = request.query.get("click_id")
-    try:
-        amount = float(request.query.get("amount", 0))
-    except ValueError:
-        amount = 0
+    amount = float(request.query.get("amount", 0))
 
     if not click_id:
         return web.Response(text="No click_id", status=400)
