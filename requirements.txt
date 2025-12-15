@@ -4,3 +4,4 @@ pandas
 yfinance
 pandas-ta
 asyncpg
+tradingview_ta
