@@ -85,11 +85,6 @@ async def get_balance(user_id: int) -> float:
         val = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", user_id)
         return val or 0.0
 
-# ================= FSM =====================
-class TradeState(StatesGroup):
-    choosing_pair = State()
-    choosing_exp = State()
-
 # ================= KEYBOARDS =================
 def main_menu():
     kb = InlineKeyboardBuilder()
@@ -119,21 +114,18 @@ def expiration_kb(pair):
 
 def result_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ ПЛЮС", callback_data="menu")
-    kb.button(text="❌ МИНУС", callback_data="menu")
+    kb.button(text="✅ ПЛЮС", callback_data="result:+")
+    kb.button(text="❌ МИНУС", callback_data="result:-")
     kb.adjust(2)
     return kb.as_markup()
 
 # ================= SIGNALS =================
 async def get_signal(pair: str, expiration: int = 1):
-    """
-    Сигнал на основе 8 индикаторов, безопасный от NaN.
-    Возвращает direction, confidence, explanation
-    """
+    """Генерируем сигнал только BUY/SELL, NEUTRAL убран."""
     try:
         data = yf.download(pair, period="60d", interval="1h", progress=False)
         if data.empty:
-            return "NEUTRAL", 50.0, "Нет данных"
+            return random.choice(["BUY","SELL"]), 50.0, "Нет данных, сигнал сгенерирован случайно"
 
         close = data['Close']
         high = data['High']
@@ -159,34 +151,30 @@ async def get_signal(pair: str, expiration: int = 1):
         rs = gain / (loss + 1e-9)
         rsi = 100 - (100 / (1 + rs))
         if not rsi.empty:
-            votes.append("BUY" if rsi.iloc[-1] < 30 else "SELL" if rsi.iloc[-1] > 70 else "BUY")  # минимизируем NEUTRAL
+            votes.append("BUY" if rsi.iloc[-1] < 50 else "SELL")
 
         # ==== MACD ====
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
         macd = ema12 - ema26
         signal_line = macd.ewm(span=9, adjust=False).mean()
-        if not macd.empty:
-            votes.append("BUY" if macd.iloc[-1] > signal_line.iloc[-1] else "SELL")
+        votes.append("BUY" if macd.iloc[-1] > signal_line.iloc[-1] else "SELL")
 
         # ==== Stochastic ====
         low14 = low.rolling(14).min()
         high14 = high.rolling(14).max()
         stoch = (close - low14) / (high14 - low14 + 1e-9) * 100
-        votes.append("BUY" if stoch.iloc[-1] < 50 else "SELL")  # убираем NEUTRAL
+        votes.append("BUY" if stoch.iloc[-1] < 50 else "SELL")
 
         # ==== Bollinger Bands ====
         sma20 = close.rolling(20).mean()
         std = close.rolling(20).std()
         upper = sma20 + 2*std
         lower = sma20 - 2*std
-        if not sma20.empty:
-            if close.iloc[-1] > upper.iloc[-1]:
-                votes.append("SELL")
-            elif close.iloc[-1] < lower.iloc[-1]:
-                votes.append("BUY")
-            else:
-                votes.append("BUY")  # вместо NEUTRAL ставим BUY для ясного сигнала
+        if close.iloc[-1] > upper.iloc[-1]:
+            votes.append("SELL")
+        else:
+            votes.append("BUY")
 
         # ==== Momentum ====
         if len(close) >= 10:
@@ -202,32 +190,20 @@ async def get_signal(pair: str, expiration: int = 1):
         minus_dm = np.where((down > up) & (down > 0), down, 0)
         plus_di = 100 * pd.Series(plus_dm).rolling(14).mean() / (atr14 + 1e-9)
         minus_di = 100 * pd.Series(minus_dm).rolling(14).mean() / (atr14 + 1e-9)
-        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
-        adx = dx.rolling(14).mean()
-        if plus_di.iloc[-1] > minus_di.iloc[-1]:
-            votes.append("BUY")
-        else:
-            votes.append("SELL")
+        votes.append("BUY" if plus_di.iloc[-1] > minus_di.iloc[-1] else "SELL")
 
-        # ==== Final ====
         buy_votes = votes.count("BUY")
         sell_votes = votes.count("SELL")
-        total_votes = buy_votes + sell_votes
-        if total_votes == 0:
-            direction = "NEUTRAL"
-            confidence = 50
-        elif buy_votes >= sell_votes:
-            direction = "BUY"
-            confidence = buy_votes / total_votes * 100
+        if buy_votes == sell_votes:
+            direction = random.choice(["BUY","SELL"])
         else:
-            direction = "SELL"
-            confidence = sell_votes / total_votes * 100
+            direction = "BUY" if buy_votes > sell_votes else "SELL"
+        confidence = max(buy_votes, sell_votes) / len(votes) * 100
 
         explanation = f"Голоса индикаторов: BUY={buy_votes}, SELL={sell_votes}"
         return direction, confidence, explanation
-
     except Exception as e:
-        return "NEUTRAL", 50.0, f"Ошибка анализа: {e}"
+        return random.choice(["BUY","SELL"]), 50.0, f"Ошибка анализа: {e}"
 
 # ================= HANDLERS =================
 @dp.message(Command("start"))
@@ -236,7 +212,7 @@ async def start(msg: types.Message):
 
     if user_id in AUTHORS:
         await msg.answer(
-            "🏠 Главное меню (Авторский доступ — сигналы доступны бесплатно)",
+            "🏠 Главное меню (Авторский доступ — сигналы бесплатны)",
             reply_markup=main_menu()
         )
         return
@@ -247,9 +223,9 @@ async def start(msg: types.Message):
 
     await msg.answer(
         "👋 Привет!\n"
-        "Этот бот анализирует валютные пары с помощью индикаторов:\n"
+        "Бот анализирует валютные пары с помощью индикаторов:\n"
         "- SMA, EMA, RSI, MACD, Stochastic, Bollinger Bands, Momentum, ADX\n"
-        "- Сигналы BUY/SELL генерируются на основе голосов индикаторов\n\n"
+        "Сигналы всегда BUY или SELL (NEUTRAL убран)\n\n"
         "Нажми 'Продолжить', чтобы начать регистрацию.",
         reply_markup=kb.as_markup()
     )
@@ -269,7 +245,7 @@ async def begin_instruction(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "check_deposit")
 async def check_deposit(cb: types.CallbackQuery):
     balance = await get_balance(cb.from_user.id)
-    if balance >= MIN_DEPOSIT:
+    if balance >= MIN_DEPOSIT or cb.from_user.id in AUTHORS:
         await cb.message.answer("✅ Доступ к сигналам открыт!", reply_markup=main_menu())
     else:
         await cb.message.answer(f"❌ Пополните баланс минимум на ${MIN_DEPOSIT}")
@@ -300,7 +276,6 @@ async def expiration(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
     exp = int(exp)
     direction, conf, expl = await get_signal(pair, exp)
-    # Проверяем, не идентична ли информация предыдущей
     text_new = (
         f"📊 Сигнал\nПара: {pair.replace('=X','')}\n"
         f"Время экспирации: {exp} мин\n"
@@ -308,8 +283,13 @@ async def expiration(cb: types.CallbackQuery):
         f"Уверенность: {conf:.2f}%\n\n"
         f"{expl}"
     )
-    if cb.message.text != text_new:
-        await cb.message.edit_text(text_new, reply_markup=result_kb())
+    await cb.message.edit_text(text_new, reply_markup=result_kb())
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("result:"))
+async def result(cb: types.CallbackQuery):
+    # После нажатия + или - возвращаем в главное меню
+    await cb.message.answer("Возврат в главное меню", reply_markup=main_menu())
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data == "news")
