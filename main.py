@@ -46,9 +46,9 @@ PAIRS = [
     "EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X",
     "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
+EXPIRATIONS = [1, 2, 3, 5, 10]  # минуты
 PAIRS_PER_PAGE = 6
 MIN_DEPOSIT = 20.0
-EXPIRATIONS = [1, 2, 3, 5, 10]  # время экспирации в минутах
 
 # ===================== DB =====================
 async def init_db():
@@ -123,6 +123,11 @@ async def get_history(user_id):
             user_id
         )
 
+# ===================== FSM =====================
+class TradeState(StatesGroup):
+    choosing_pair = State()
+    choosing_expiration = State()
+
 # ===================== KEYBOARDS =====================
 def main_menu():
     kb = InlineKeyboardBuilder()
@@ -147,7 +152,7 @@ def expiration_kb(pair):
     kb = InlineKeyboardBuilder()
     for exp in EXPIRATIONS:
         kb.button(text=f"{exp} мин", callback_data=f"exp:{pair}:{exp}")
-    kb.adjust(2)
+    kb.adjust(3)
     return kb.as_markup()
 
 def result_kb(trade_id):
@@ -159,20 +164,17 @@ def result_kb(trade_id):
     return kb.as_markup()
 
 # ===================== SIGNALS =====================
-async def get_signal_tv(pair: str, expiration_minutes: int):
-    tf_map_tv = {1: "1m", 2: "2m", 3: "3m", 5: "5m", 10: "10m"}
-    tv_tf = tf_map_tv.get(expiration_minutes, "5m")
-
+async def get_signal_tv(pair: str, tf: str):
     handler = TA_Handler(
         symbol=pair,
         screener="forex",
         exchange="FX_IDC",
-        interval=tv_tf
+        interval=tf
     )
     analysis = await asyncio.to_thread(handler.get_analysis)
     direction = analysis.summary["RECOMMENDATION"]
     conf = 70.0
-    expl = f"Сигнал TradingView ({tv_tf}): {direction}\nИндикаторы: {', '.join(analysis.indicators.keys())}"
+    expl = f"Сигнал TradingView: {direction}\nИндикаторы: {', '.join(analysis.indicators.keys())}"
     return direction, conf, expl
 
 # ===================== HANDLERS =====================
@@ -182,10 +184,7 @@ async def start(msg: types.Message):
     balance = await get_balance(user_id)
 
     if user_id in AUTHORS:
-        await msg.answer(
-            "🏠 Главное меню (Авторский доступ)",
-            reply_markup=main_menu()
-        )
+        await msg.answer("🏠 Главное меню (Авторский доступ)", reply_markup=main_menu())
         return
 
     kb = InlineKeyboardBuilder()
@@ -239,29 +238,32 @@ async def pairs(cb: types.CallbackQuery):
 async def pair(cb: types.CallbackQuery):
     pair = cb.data.split(":")[1]
     await cb.message.edit_text(
-        f"⏱ Пара {pair.replace('=X','')}, выберите время экспирации",
+        f"⏱ Пара {pair.replace('=X','')}, выбери время экспирации",
         reply_markup=expiration_kb(pair)
     )
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
 async def expiration(cb: types.CallbackQuery):
-    _, pair, exp_val = cb.data.split(":")
-    expiration = int(exp_val)
-
+    _, pair, exp = cb.data.split(":")
+    exp = int(exp)
+    
+    tf_map = {1:"1m", 2:"2m", 3:"3m", 5:"5m", 10:"15m"}  # 10m → 15m
+    tf_tv = tf_map.get(exp, "5m")
+    
     try:
-        direction, conf, expl = await get_signal_tv(pair.replace("=X",""), expiration)
+        direction, conf, expl = await get_signal_tv(pair.replace("=X",""), tf_tv)
     except Exception as e:
         await cb.message.answer(f"Ошибка получения сигнала: {e}")
         await cb.answer()
         return
-
-    trade_id = await save_trade(cb.from_user.id, pair.replace("=X",""), expiration, direction, conf, expl)
-
+    
+    trade_id = await save_trade(cb.from_user.id, pair.replace("=X",""), exp, direction, conf, expl)
+    
     await cb.message.edit_text(
         f"📊 Сигнал\n\n"
         f"Пара: {pair.replace('=X','')}\n"
-        f"Время экспирации: {expiration} мин\n"
+        f"Время экспирации: {exp} мин\n"
         f"Направление: {direction}\n"
         f"Уверенность: {conf}%\n\n"
         f"{expl}",
