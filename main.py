@@ -4,11 +4,8 @@ import asyncio
 import logging
 from datetime import datetime
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 
-import pandas as pd
 import asyncpg
-
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
@@ -28,8 +25,7 @@ PORT = int(os.getenv("PORT", 10000))
 HOST = "0.0.0.0"
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
-
-AUTHORS = [7079260196, 6117198446]  # ID авторов
+AUTHORS = [7079260196, 6117198446]
 
 if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME or not DATABASE_URL:
     print("❌ ENV не заданы или DATABASE_URL неверен")
@@ -102,15 +98,13 @@ async def update_balance(user_id: int, amount: float):
         )
 
 async def get_balance(user_id: int) -> float:
-    if DB_POOL is None:
-        raise RuntimeError("DB_POOL не инициализирован!")
     async with DB_POOL.acquire() as conn:
         val = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", user_id)
         return val or 0.0
 
 async def save_trade(user_id, pair, tf, direction, confidence, explanation):
-    async with DB_POOL.acquire() as c:
-        return await c.fetchval(
+    async with DB_POOL.acquire() as conn:
+        return await conn.fetchval(
             """INSERT INTO trades (user_id, pair, timeframe, direction, confidence, explanation)
                VALUES ($1,$2,$3,$4,$5,$6) RETURNING id""",
             user_id, pair, tf, direction, confidence, explanation
@@ -170,6 +164,21 @@ def result_kb(trade_id):
     kb.adjust(2)
     return kb.as_markup()
 
+# ===================== SIGNALS =====================
+async def get_signal_tv(pair: str, tf: str):
+    handler = TA_Handler(
+        symbol=pair,
+        screener="forex",
+        exchange="FX_IDC",
+        interval=tf
+    )
+    analysis = await asyncio.to_thread(handler.get_analysis)
+    direction = analysis.summary["RECOMMENDATION"]
+    # Пример уверенности: 50-100, можно расширить на индикаторы
+    conf = 70.0
+    expl = f"Сигнал TradingView: {direction}\nИндикаторы: {', '.join(analysis.indicators.keys())}"
+    return direction, conf, expl
+
 # ===================== HANDLERS =====================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
@@ -183,36 +192,34 @@ async def start(msg: types.Message):
         )
         return
 
-    # Инструкция + кнопка Начать
     kb = InlineKeyboardBuilder()
-    kb.button(text="Начать", callback_data="begin")
+    kb.button(text="Начать", callback_data="begin_instruction")
     kb.adjust(1)
     await msg.answer(
-        "📖 Добро пожаловать!\n\n"
-        "Бот анализирует свечи с TradingView, использует индикаторы SMA, EMA, RSI, MACD, Bollinger Bands и ADX для генерации сигналов.\n"
-        "Сигналы основаны на анализе текущего тренда и силы рынка.\n\n"
-        "Нажмите кнопку 'Начать' чтобы продолжить.",
+        "Привет! Я бот для анализа валютных пар.\n\n"
+        "Я использую TradingView для анализа свечей и индикаторов, чтобы генерировать сигналы на покупку и продажу.\n\n"
+        "Внизу нажмите кнопку Начать, чтобы получить инструкцию по регистрации и пополнению баланса.",
         reply_markup=kb.as_markup()
     )
 
-@dp.callback_query(lambda c: c.data=="begin")
-async def begin(cb: types.CallbackQuery):
+@dp.callback_query(lambda c: c.data == "begin_instruction")
+async def begin_instruction(cb: types.CallbackQuery):
     kb = InlineKeyboardBuilder()
-    kb.button(text="Зарегистрировать аккаунт", url=REF_LINK)
+    kb.button(text="Перейти к регистрации", url=REF_LINK)
     kb.adjust(1)
     await cb.message.answer(
-        f"🔗 Сначала зарегистрируйтесь по нашей ссылке.\n"
-        f"💰 Затем пополните баланс минимум на ${MIN_DEPOSIT}.",
+        f"1️⃣ Зарегистрируйте аккаунт по нашей ссылке.\n"
+        f"2️⃣ Пополните баланс на ${MIN_DEPOSIT}.\n"
+        f"3️⃣ После пополнения нажмите кнопку ниже для проверки пополнения.",
         reply_markup=kb.as_markup()
     )
-    # Кнопка проверки пополнения
-    kb2 = InlineKeyboardBuilder()
-    kb2.button(text="Проверить пополнение", callback_data="check_deposit")
-    kb2.adjust(1)
-    await cb.message.answer("Когда пополните, нажмите кнопку ниже:", reply_markup=kb2.as_markup())
+    kb_check = InlineKeyboardBuilder()
+    kb_check.button(text="Проверить пополнение", callback_data="check_deposit")
+    kb_check.adjust(1)
+    await cb.message.answer("Нажмите для проверки:", reply_markup=kb_check.as_markup())
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data=="check_deposit")
+@dp.callback_query(lambda c: c.data == "check_deposit")
 async def check_deposit(cb: types.CallbackQuery):
     balance = await get_balance(cb.from_user.id)
     if balance >= MIN_DEPOSIT:
@@ -227,7 +234,7 @@ async def pairs_page(cb: types.CallbackQuery):
     await cb.message.edit_text("📈 Выбери пару", reply_markup=pairs_kb(page))
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data=="pairs")
+@dp.callback_query(lambda c: c.data == "pairs")
 async def pairs(cb: types.CallbackQuery):
     await cb.message.edit_text("📈 Выбери пару", reply_markup=pairs_kb())
     await cb.answer()
@@ -241,57 +248,29 @@ async def pair(cb: types.CallbackQuery):
     )
     await cb.answer()
 
-# ===================== TRADINGVIEW TF HANDLER =====================
 @dp.callback_query(lambda c: c.data.startswith("tf:"))
 async def tf(cb: types.CallbackQuery):
-    _, pair, tf_raw = cb.data.split(":")
-    tf_map = {
-        "1": Interval.INTERVAL_1_MINUTE,
-        "2": Interval.INTERVAL_2_MINUTES,
-        "5": Interval.INTERVAL_5_MINUTES,
-        "15": Interval.INTERVAL_15_MINUTES
-    }
-    selected_tf = tf_map.get(tf_raw)
-    if not selected_tf:
-        await cb.message.answer("❌ Неверный таймфрейм")
-        await cb.answer()
-        return
-
-    handler = TA_Handler(
-        symbol=pair.replace("=X",""),
-        screener="forex",
-        exchange="FX_IDC",
-        interval=selected_tf
-    )
+    _, pair, tf = cb.data.split(":")
+    tf_map = {"1": "1m", "2": "2m", "5": "5m", "15": "15m"}
+    tf_tv = tf_map.get(tf, "5m")
 
     try:
-        loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor() as pool:
-            analysis = await loop.run_in_executor(pool, handler.get_analysis)
+        direction, conf, expl = await get_signal_tv(pair.replace("=X",""), tf_tv)
     except Exception as e:
-        await cb.message.answer(f"❌ Ошибка получения сигнала: {e}")
+        await cb.message.answer(f"Ошибка получения сигнала: {e}")
         await cb.answer()
         return
 
-    direction = analysis.summary["RECOMMENDATION"]
-    confidence = round(analysis.indicators.get("RSI", 50), 1)
-    expl = " | ".join([f"{k}: {v}" for k,v in analysis.indicators.items()])
-
-    try:
-        tid = await save_trade(cb.from_user.id, pair.replace("=X",""), int(tf_raw), direction, confidence, expl)
-    except Exception as e:
-        await cb.message.answer(f"❌ Ошибка при сохранении сделки: {e}")
-        await cb.answer()
-        return
+    trade_id = await save_trade(cb.from_user.id, pair.replace("=X",""), int(tf), direction, conf, expl)
 
     await cb.message.edit_text(
         f"📊 Сигнал\n\n"
         f"Пара: {pair.replace('=X','')}\n"
-        f"TF: {tf_raw} мин\n"
+        f"TF: {tf} мин\n"
         f"Направление: {direction}\n"
-        f"Уверенность: {confidence}%\n\n"
+        f"Уверенность: {conf}%\n\n"
         f"{expl}",
-        reply_markup=result_kb(tid)
+        reply_markup=result_kb(trade_id)
     )
     await cb.answer()
 
@@ -302,7 +281,7 @@ async def res(cb: types.CallbackQuery):
     await cb.message.edit_text("✅ Результат сохранён", reply_markup=main_menu())
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data=="history")
+@dp.callback_query(lambda c: c.data == "history")
 async def history(cb: types.CallbackQuery):
     trades = await get_history(cb.from_user.id)
     if not trades:
@@ -353,7 +332,7 @@ async def main():
     logging.info(f"🚀 BOT LIVE на {HOST}:{PORT}")
     await asyncio.Event().wait()
 
-if __name__=="__main__":
+if __name__ == "__main__":
     try:
         asyncio.run(main())
     finally:
