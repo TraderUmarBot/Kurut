@@ -3,9 +3,9 @@ import sys
 import asyncio
 import logging
 from datetime import datetime
-from collections import Counter
 
 import asyncpg
+import yfinance as yf
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
@@ -14,8 +14,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web
-
-from tradingview_ta import TA_Handler, Interval, Exchange
 
 # ===================== CONFIG =====================
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -26,6 +24,7 @@ HOST = "0.0.0.0"
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
 AUTHORS = [7079260196, 6117198446]
+MIN_DEPOSIT = 20.0
 
 if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME or not DATABASE_URL:
     print("❌ ENV не заданы или DATABASE_URL неверен")
@@ -47,9 +46,8 @@ PAIRS = [
     "EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X",
     "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
-EXPIRATIONS = ["1","2","3","5","10"]  # минуты
 PAIRS_PER_PAGE = 6
-MIN_DEPOSIT = 20.0
+EXPIRATIONS = [1, 2, 3, 5, 10]  # минуты
 
 # ===================== DB =====================
 async def init_db():
@@ -127,7 +125,7 @@ async def get_history(user_id):
 # ===================== FSM =====================
 class TradeState(StatesGroup):
     choosing_pair = State()
-    choosing_expiration = State()
+    choosing_exp = State()
 
 # ===================== KEYBOARDS =====================
 def main_menu():
@@ -165,18 +163,28 @@ def result_kb(trade_id):
     return kb.as_markup()
 
 # ===================== SIGNALS =====================
-async def get_signal_tv(pair: str, tf: str):
-    handler = TA_Handler(
-        symbol=pair,
-        screener="forex",
-        exchange="FX_IDC",
-        interval=tf
-    )
-    analysis = await asyncio.to_thread(handler.get_analysis)
-    direction = analysis.summary["RECOMMENDATION"]
-    conf = 70.0
-    expl = f"Сигнал TradingView: {direction}\nИндикаторы: {', '.join(analysis.indicators.keys())}"
-    return direction, conf, expl
+async def get_signal_efinance(pair: str, expiration: int):
+    """
+    Простая логика: если цена выше скользящей средней, сигнал BUY, иначе SELL
+    """
+    data = yf.download(pair, period="1d", interval="1m")
+    close_prices = data['Close']
+    if len(close_prices) < 5:
+        return "NEUTRAL", 50.0, "Недостаточно данных для анализа"
+
+    sma = close_prices[-5:].mean()
+    last_price = close_prices[-1]
+
+    if last_price > sma:
+        direction = "BUY"
+    elif last_price < sma:
+        direction = "SELL"
+    else:
+        direction = "NEUTRAL"
+
+    confidence = abs(last_price - sma) / sma * 100
+    explanation = f"Last price: {last_price:.5f}, SMA(5): {sma:.5f}"
+    return direction, confidence, explanation
 
 # ===================== HANDLERS =====================
 @dp.message(Command("start"))
@@ -196,7 +204,7 @@ async def start(msg: types.Message):
     kb.adjust(1)
     await msg.answer(
         "Привет! Я бот для анализа валютных пар.\n\n"
-        "Я использую TradingView для анализа свечей и индикаторов, чтобы генерировать сигналы на покупку и продажу.\n\n"
+        "Я использую рыночные данные для анализа и генерации сигналов.\n\n"
         "Внизу нажмите кнопку Начать, чтобы получить инструкцию по регистрации и пополнению баланса.",
         reply_markup=kb.as_markup()
     )
@@ -250,24 +258,22 @@ async def pair(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
 async def expiration(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
-    tf_map_tv = {"1":"1m","2":"2m","3":"3m","5":"5m","10":"10m"}
-    tf_tv = tf_map_tv.get(exp, "1m")
-
+    exp = int(exp)
     try:
-        direction, conf, expl = await get_signal_tv(pair.replace("=X",""), tf_tv)
+        direction, conf, expl = await get_signal_efinance(pair.replace("=X",""), exp)
     except Exception as e:
         await cb.message.answer(f"Ошибка получения сигнала: {e}")
         await cb.answer()
         return
 
-    trade_id = await save_trade(cb.from_user.id, pair.replace("=X",""), int(exp), direction, conf, expl)
+    trade_id = await save_trade(cb.from_user.id, pair.replace("=X",""), exp, direction, conf, expl)
 
     await cb.message.edit_text(
         f"📊 Сигнал\n\n"
         f"Пара: {pair.replace('=X','')}\n"
         f"Время экспирации: {exp} мин\n"
         f"Направление: {direction}\n"
-        f"Уверенность: {conf}%\n\n"
+        f"Уверенность: {conf:.2f}%\n\n"
         f"{expl}",
         reply_markup=result_kb(trade_id)
     )
