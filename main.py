@@ -4,10 +4,10 @@ import asyncio
 import logging
 from datetime import datetime
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
-import asyncpg
 import pandas as pd
-from tradingview_ta import TA_Handler, Interval, Exchange
+import asyncpg
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -17,6 +17,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web
+
+from tradingview_ta import TA_Handler, Interval, Exchange
 
 # ===================== CONFIG =====================
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -45,9 +47,9 @@ DB_POOL: asyncpg.pool.Pool | None = None
 
 # ===================== CONSTANTS =====================
 PAIRS = [
-    "EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF",
-    "EURJPY","GBPJPY","AUDJPY","EURGBP","EURAUD","GBPAUD",
-    "CADJPY","CHFJPY","EURCAD","GBPCAD","AUDCAD","AUDCHF","CADCHF"
+    "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X",
+    "EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X",
+    "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
 TIMEFRAMES = [1, 2, 5, 15]
 PAIRS_PER_PAGE = 6
@@ -145,7 +147,7 @@ def pairs_kb(page=0):
     kb = InlineKeyboardBuilder()
     start = page * PAIRS_PER_PAGE
     for p in PAIRS[start:start+PAIRS_PER_PAGE]:
-        kb.button(text=p, callback_data=f"pair:{p}")
+        kb.button(text=p.replace("=X",""), callback_data=f"pair:{p}")
     if page > 0:
         kb.button(text="⬅️ Назад", callback_data=f"pairs_page:{page-1}")
     if start + PAIRS_PER_PAGE < len(PAIRS):
@@ -168,42 +170,12 @@ def result_kb(trade_id):
     kb.adjust(2)
     return kb.as_markup()
 
-def start_kb():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🚀 Начать", callback_data="begin")
-    kb.adjust(1)
-    return kb.as_markup()
-
-def deposit_check_kb():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="💰 Проверить пополнение", callback_data="check_deposit")
-    kb.adjust(1)
-    return kb.as_markup()
-
-# ===================== ANALYSIS =====================
-def get_signal(pair: str, tf: int):
-    try:
-        handler = TA_Handler(
-            symbol=pair,
-            screener="forex",
-            exchange="FX_IDC",
-            interval=Interval.INTERVAL_1_MIN if tf==1 else
-                     Interval.INTERVAL_2_MIN if tf==2 else
-                     Interval.INTERVAL_5_MIN if tf==5 else
-                     Interval.INTERVAL_15_MIN
-        )
-        analysis = handler.get_analysis()
-        direction = analysis.summary['RECOMMENDATION']
-        confidence = round(sum(1 for v in analysis.indicators.values() if v in ["BUY","STRONG_BUY"]) / len(analysis.indicators) * 100,1)
-        explanation = " | ".join([f"{k}: {v}" for k,v in analysis.indicators.items()])
-        return direction, confidence, explanation
-    except Exception as e:
-        return "SELL", 50.0, f"Ошибка анализа: {e}"
-
 # ===================== HANDLERS =====================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     user_id = msg.from_user.id
+    balance = await get_balance(user_id)
+
     if user_id in AUTHORS:
         await msg.answer(
             "🏠 Главное меню (Авторский доступ)",
@@ -211,25 +183,36 @@ async def start(msg: types.Message):
         )
         return
 
-    text = (
-        "📊 Бот анализирует свечи с TradingView, рассчитывает сигналы на основе индикаторов:\n"
-        "- SMA, EMA\n"
-        "- RSI, MACD\n"
-        "- Bollinger Bands, ADX\n\n"
-        "Сигнал формируется после комплексного анализа выбранной валютной пары и таймфрейма.\n\n"
-        "Для начала работы:\n"
-        f"1️⃣ Зарегистрируйте аккаунт: {REF_LINK}\n"
-        f"2️⃣ Пополните баланс минимум на ${MIN_DEPOSIT}\n\n"
-        "Нажмите кнопку ниже чтобы начать:"
+    # Инструкция + кнопка Начать
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Начать", callback_data="begin")
+    kb.adjust(1)
+    await msg.answer(
+        "📖 Добро пожаловать!\n\n"
+        "Бот анализирует свечи с TradingView, использует индикаторы SMA, EMA, RSI, MACD, Bollinger Bands и ADX для генерации сигналов.\n"
+        "Сигналы основаны на анализе текущего тренда и силы рынка.\n\n"
+        "Нажмите кнопку 'Начать' чтобы продолжить.",
+        reply_markup=kb.as_markup()
     )
-    await msg.answer(text, reply_markup=start_kb())
 
 @dp.callback_query(lambda c: c.data=="begin")
 async def begin(cb: types.CallbackQuery):
-    await cb.message.answer(f"После регистрации пополните баланс минимум на ${MIN_DEPOSIT}", reply_markup=deposit_check_kb())
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Зарегистрировать аккаунт", url=REF_LINK)
+    kb.adjust(1)
+    await cb.message.answer(
+        f"🔗 Сначала зарегистрируйтесь по нашей ссылке.\n"
+        f"💰 Затем пополните баланс минимум на ${MIN_DEPOSIT}.",
+        reply_markup=kb.as_markup()
+    )
+    # Кнопка проверки пополнения
+    kb2 = InlineKeyboardBuilder()
+    kb2.button(text="Проверить пополнение", callback_data="check_deposit")
+    kb2.adjust(1)
+    await cb.message.answer("Когда пополните, нажмите кнопку ниже:", reply_markup=kb2.as_markup())
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data == "check_deposit")
+@dp.callback_query(lambda c: c.data=="check_deposit")
 async def check_deposit(cb: types.CallbackQuery):
     balance = await get_balance(cb.from_user.id)
     if balance >= MIN_DEPOSIT:
@@ -244,7 +227,7 @@ async def pairs_page(cb: types.CallbackQuery):
     await cb.message.edit_text("📈 Выбери пару", reply_markup=pairs_kb(page))
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data == "pairs")
+@dp.callback_query(lambda c: c.data=="pairs")
 async def pairs(cb: types.CallbackQuery):
     await cb.message.edit_text("📈 Выбери пару", reply_markup=pairs_kb())
     await cb.answer()
@@ -252,22 +235,63 @@ async def pairs(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
 async def pair(cb: types.CallbackQuery):
     pair = cb.data.split(":")[1]
-    await cb.message.edit_text(f"⏱ Пара {pair}, выбери таймфрейм", reply_markup=tf_kb(pair))
+    await cb.message.edit_text(
+        f"⏱ Пара {pair.replace('=X','')}, выбери TF",
+        reply_markup=tf_kb(pair)
+    )
     await cb.answer()
 
+# ===================== TRADINGVIEW TF HANDLER =====================
 @dp.callback_query(lambda c: c.data.startswith("tf:"))
 async def tf(cb: types.CallbackQuery):
-    _, pair, tf_str = cb.data.split(":")
-    tf = int(tf_str)
-    direction, confidence, expl = get_signal(pair, tf)
-    trade_id = await save_trade(cb.from_user.id, pair, tf, direction, confidence, expl)
+    _, pair, tf_raw = cb.data.split(":")
+    tf_map = {
+        "1": Interval.INTERVAL_1_MINUTE,
+        "2": Interval.INTERVAL_2_MINUTES,
+        "5": Interval.INTERVAL_5_MINUTES,
+        "15": Interval.INTERVAL_15_MINUTES
+    }
+    selected_tf = tf_map.get(tf_raw)
+    if not selected_tf:
+        await cb.message.answer("❌ Неверный таймфрейм")
+        await cb.answer()
+        return
+
+    handler = TA_Handler(
+        symbol=pair.replace("=X",""),
+        screener="forex",
+        exchange="FX_IDC",
+        interval=selected_tf
+    )
+
+    try:
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as pool:
+            analysis = await loop.run_in_executor(pool, handler.get_analysis)
+    except Exception as e:
+        await cb.message.answer(f"❌ Ошибка получения сигнала: {e}")
+        await cb.answer()
+        return
+
+    direction = analysis.summary["RECOMMENDATION"]
+    confidence = round(analysis.indicators.get("RSI", 50), 1)
+    expl = " | ".join([f"{k}: {v}" for k,v in analysis.indicators.items()])
+
+    try:
+        tid = await save_trade(cb.from_user.id, pair.replace("=X",""), int(tf_raw), direction, confidence, expl)
+    except Exception as e:
+        await cb.message.answer(f"❌ Ошибка при сохранении сделки: {e}")
+        await cb.answer()
+        return
+
     await cb.message.edit_text(
         f"📊 Сигнал\n\n"
-        f"Пара: {pair}\n"
-        f"TF: {tf} мин\n"
+        f"Пара: {pair.replace('=X','')}\n"
+        f"TF: {tf_raw} мин\n"
         f"Направление: {direction}\n"
-        f"Уверенность: {confidence}%\n\n{expl}",
-        reply_markup=result_kb(trade_id)
+        f"Уверенность: {confidence}%\n\n"
+        f"{expl}",
+        reply_markup=result_kb(tid)
     )
     await cb.answer()
 
@@ -278,7 +302,7 @@ async def res(cb: types.CallbackQuery):
     await cb.message.edit_text("✅ Результат сохранён", reply_markup=main_menu())
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data == "history")
+@dp.callback_query(lambda c: c.data=="history")
 async def history(cb: types.CallbackQuery):
     trades = await get_history(cb.from_user.id)
     if not trades:
@@ -329,7 +353,7 @@ async def main():
     logging.info(f"🚀 BOT LIVE на {HOST}:{PORT}")
     await asyncio.Event().wait()
 
-if __name__ == "__main__":
+if __name__=="__main__":
     try:
         asyncio.run(main())
     finally:
