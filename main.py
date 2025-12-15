@@ -26,7 +26,7 @@ PORT = int(os.getenv("PORT", 10000))
 HOST = "0.0.0.0"
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
-AUTHORS = [7079260196, 6117198446]  # два автора
+AUTHORS = [7079260196, 6117198446]
 MIN_DEPOSIT = 20.0
 
 if not TG_TOKEN or not DATABASE_URL or not RENDER_EXTERNAL_HOSTNAME:
@@ -50,7 +50,7 @@ PAIRS = [
     "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
 PAIRS_PER_PAGE = 6
-EXPIRATIONS = [1, 2, 3, 5, 10]  # минуты
+EXPIRATIONS = [1, 2, 3, 5, 10]
 
 # ================= DB =====================
 async def init_db():
@@ -125,80 +125,89 @@ def result_kb():
     return kb.as_markup()
 
 # ================= SIGNALS =================
+async def analyze_tf(pair: str, interval: str):
+    """
+    Анализ на одном таймфрейме с индикаторами
+    """
+    data = yf.download(pair, period="90d", interval=interval, progress=False)
+    if data.empty or len(data) < 30:
+        return "ПОКУПКА", "📈 Восходящий", "Данных недостаточно, сигнал по умолчанию ПОКУПКА"
+
+    close = data['Close']
+
+    # SMA и EMA
+    sma20 = close.rolling(20).mean()
+    ema10 = close.ewm(span=10, adjust=False).mean()
+
+    # RSI
+    delta = close.diff()
+    up, down = delta.clip(lower=0), -delta.clip(upper=0)
+    roll_up = up.rolling(14).mean()
+    roll_down = down.rolling(14).mean()
+    rs = roll_up / roll_down
+    rsi = 100 - (100 / (1 + rs))
+
+    # MACD
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal_line = macd.ewm(span=9, adjust=False).mean()
+    macd_hist = macd - signal_line
+
+    last_close = close.iloc[-1]
+    last_sma20 = sma20.iloc[-1]
+    last_ema10 = ema10.iloc[-1]
+    last_rsi = rsi.iloc[-1]
+    last_macd_hist = macd_hist.iloc[-1]
+
+    indicators = []
+    if last_close > last_sma20: indicators.append("BUY") 
+    else: indicators.append("SELL")
+    if last_close > last_ema10: indicators.append("BUY")
+    else: indicators.append("SELL")
+    if last_rsi > 50: indicators.append("BUY")
+    else: indicators.append("SELL")
+    if last_macd_hist > 0: indicators.append("BUY")
+    else: indicators.append("SELL")
+
+    buy_count = indicators.count("BUY")
+    sell_count = indicators.count("SELL")
+    if buy_count > sell_count:
+        direction = "ПОКУПКА"
+        trend = "📈 Восходящий"
+    else:
+        direction = "ПРОДАЖА"
+        trend = "📉 Нисходящий"
+
+    explanation = (
+        f"Цена: {last_close:.5f}, SMA20: {last_sma20:.5f}, EMA10: {last_ema10:.5f}\n"
+        f"RSI: {last_rsi:.1f}, MACD: {last_macd_hist:.5f}"
+    )
+
+    confidence = 50 + abs(buy_count - sell_count) * 12.5
+    return direction, trend, explanation, confidence
+
 async def get_signal(pair: str, expiration: int = 1):
     """
-    Максимально точный сигнал на основе 7 индикаторов.
-    Всегда BUY или SELL, NEUTRAL исключен.
+    Сигнал с анализом двух таймфреймов: 1ч и 4ч
     """
     try:
-        data = yf.download(pair, period="90d", interval="1h", progress=False)
-        if data.empty or len(data) < 30:
-            return "BUY", 70.0, "Недостаточно данных, сигнал по умолчанию BUY"
+        dir1, trend1, expl1, conf1 = await analyze_tf(pair, "1h")
+        dir2, trend2, expl2, conf2 = await analyze_tf(pair, "4h")
 
-        close = data['Close']
-        high = data['High']
-        low = data['Low']
+        if dir1 == dir2:
+            direction = dir1
+            trend = trend2
+        else:
+            direction = dir1
+            trend = f"{trend1}/{trend2}"
 
-        votes = []
-
-        # ===== SMA =====
-        for p in [5,10,20]:
-            sma = close.rolling(p).mean()
-            votes.append("BUY" if close.iloc[-1] > sma.iloc[-1] else "SELL")
-
-        # ===== EMA =====
-        for p in [5,10,20]:
-            ema = close.ewm(span=p, adjust=False).mean()
-            votes.append("BUY" if close.iloc[-1] > ema.iloc[-1] else "SELL")
-
-        # ===== RSI =====
-        delta = close.diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = -delta.clip(upper=0).rolling(14).mean()
-        rs = gain / (loss + 1e-9)
-        rsi = 100 - (100 / (1 + rs))
-        votes.append("BUY" if rsi.iloc[-1] < 40 else "SELL")
-
-        # ===== MACD =====
-        ema12 = close.ewm(span=12, adjust=False).mean()
-        ema26 = close.ewm(span=26, adjust=False).mean()
-        macd = ema12 - ema26
-        signal_line = macd.ewm(span=9, adjust=False).mean()
-        votes.append("BUY" if macd.iloc[-1] > signal_line.iloc[-1] else "SELL")
-
-        # ===== Stochastic =====
-        low14 = low.rolling(14).min()
-        high14 = high.rolling(14).max()
-        K = 100 * (close - low14) / (high14 - low14 + 1e-9)
-        D = K.rolling(3).mean()
-        votes.append("BUY" if K.iloc[-1] > D.iloc[-1] else "SELL")
-
-        # ===== ADX =====
-        tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
-        plus_dm = high.diff()
-        minus_dm = -low.diff()
-        plus_dm[plus_dm < 0] = 0
-        minus_dm[minus_dm < 0] = 0
-        tr14 = tr.rolling(14).sum()
-        plus_di = 100 * (plus_dm.rolling(14).sum() / tr14)
-        minus_di = 100 * (minus_dm.rolling(14).sum() / tr14)
-        votes.append("BUY" if plus_di.iloc[-1] > minus_di.iloc[-1] else "SELL")
-
-        # ===== Momentum =====
-        mom = close.iloc[-1] - close.iloc[-5]
-        votes.append("BUY" if mom > 0 else "SELL")
-
-        # ===== Final decision =====
-        buy_votes = votes.count("BUY")
-        sell_votes = votes.count("SELL")
-        direction = "BUY" if buy_votes >= sell_votes else "SELL"
-        confidence = max(buy_votes, sell_votes) / len(votes) * 100
-        explanation = f"Голоса индикаторов: BUY={buy_votes}, SELL={sell_votes}"
-
-        return direction, confidence, explanation
+        explanation = f"1ч: {expl1}\n4ч: {expl2}"
+        confidence = (conf1 + conf2) / 2
+        return direction, confidence, explanation, trend
 
     except Exception as e:
-        return "BUY", 70.0, f"Ошибка анализа: {e}"
+        return "ПОКУПКА", 70.0, f"Ошибка анализа: {e}", "📈 Восходящий"
 
 # ================= HANDLERS =================
 @dp.message(Command("start"))
@@ -214,38 +223,63 @@ async def start(msg: types.Message):
         return
 
     kb = InlineKeyboardBuilder()
-    kb.button(text="Начать", callback_data="begin_instruction")
+    kb.button(text="📖 Получить инструкцию", callback_data="begin_instruction")
     kb.adjust(1)
     await msg.answer(
-        "👋 Привет! Добро пожаловать!\nНажмите Начать для регистрации.",
+        "👋 Привет! Добро пожаловать!\nНажмите кнопку ниже, чтобы узнать, как работает бот.",
         reply_markup=kb.as_markup()
     )
 
 @dp.callback_query(lambda c: c.data == "begin_instruction")
 async def begin_instruction(cb: types.CallbackQuery):
     kb = InlineKeyboardBuilder()
-    kb.button(text="Продолжить", callback_data="continue_instruction")
+    kb.button(text="📤 Получить доступ к боту", callback_data="get_access")
     kb.adjust(1)
     await cb.message.answer(
-        "📝 Инструкция:\nБот анализирует валютные пары через данные YFinance.\nСигналы всегда BUY или SELL на основе последних изменений цен.",
+        "📝 Инструкция по боту:\n\n"
+        "Бот анализирует валютные пары через YFinance 📊.\n"
+        "Использует SMA20, EMA10, RSI14 и MACD для анализа.\n"
+        "Сигналы всегда ПОКУПКА или ПРОДАЖА.\n"
+        "Таймфреймы: 1 час и 4 часа ⏱️.\n"
+        "Выводит тренд и пояснение для каждого сигнала.",
         reply_markup=kb.as_markup()
     )
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data == "continue_instruction")
-async def continue_instruction(cb: types.CallbackQuery):
+@dp.callback_query(lambda c: c.data == "get_access")
+async def get_access(cb: types.CallbackQuery):
     kb = InlineKeyboardBuilder()
-    kb.button(text="Перейти к регистрации", url=REF_LINK)
+    kb.button(text="Перейти по ссылке", url=REF_LINK)
     kb.adjust(1)
-    await cb.message.answer(
-        "Регистрация и пополнение баланса",
-        reply_markup=kb.as_markup()
-    )
+    await cb.message.answer("Перейдите по ссылке для регистрации и пополнения баланса", reply_markup=kb.as_markup())
+
     kb_check = InlineKeyboardBuilder()
-    kb_check.button(text="Проверить пополнение", callback_data="check_deposit")
+    kb_check.button(text="Проверить ID", callback_data="check_id")
     kb_check.adjust(1)
-    await cb.message.answer("Нажмите для проверки:", reply_markup=kb_check.as_markup())
+    await cb.message.answer("Нажмите для проверки ID:", reply_markup=kb_check.as_markup())
     await cb.answer()
+
+@dp.callback_query(lambda c: c.data == "check_id")
+async def check_id(cb: types.CallbackQuery):
+    await cb.message.answer("Отправь свой ID для проверки:")
+    await cb.answer()
+
+@dp.message()
+async def id_response(msg: types.Message):
+    try:
+        user_id = int(msg.text)
+    except ValueError:
+        await msg.answer("❌ Неверный ID")
+        return
+
+    balance = await get_balance(user_id)
+    if balance >= MIN_DEPOSIT or user_id in AUTHORS:
+        await msg.answer("✅ Проверка успешна! Доступ к сигналам открыт.", reply_markup=main_menu())
+    else:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="Я пополнил свой баланс", callback_data="check_deposit")
+        kb.adjust(1)
+        await msg.answer(f"💰 Пополните баланс минимум на ${MIN_DEPOSIT}", reply_markup=kb.as_markup())
 
 @dp.callback_query(lambda c: c.data == "check_deposit")
 async def check_deposit(cb: types.CallbackQuery):
@@ -281,13 +315,15 @@ async def pair(cb: types.CallbackQuery):
 async def news(cb: types.CallbackQuery):
     pair = random.choice(PAIRS)
     exp = random.choice(EXPIRATIONS)
-    direction, conf, expl = await get_signal(pair, exp)
+    direction, conf, expl, trend = await get_signal(pair, exp)
     await cb.message.edit_text(
-        f"📰 Новости - Авто-сигнал\nПара: {pair.replace('=X','')}\n"
+        f"📰 Новости - Авто-сигнал\n"
+        f"Пара: {pair.replace('=X','')}\n"
         f"Время экспирации: {exp} мин\n"
         f"Направление: {direction}\n"
-        f"Уверенность: {conf:.2f}%\n\n"
-        f"{expl}",
+        f"Уверенность: {conf:.2f}%\n"
+        f"Тренд: {trend}\n"
+        f"Пояснение: {expl}",
         reply_markup=result_kb()
     )
     await cb.answer()
@@ -296,13 +332,15 @@ async def news(cb: types.CallbackQuery):
 async def expiration(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
     exp = int(exp)
-    direction, conf, expl = await get_signal(pair, exp)
+    direction, conf, expl, trend = await get_signal(pair, exp)
     await cb.message.edit_text(
-        f"📊 Сигнал\nПара: {pair.replace('=X','')}\n"
+        f"📊 Сигнал\n"
+        f"Пара: {pair.replace('=X','')}\n"
         f"Время экспирации: {exp} мин\n"
         f"Направление: {direction}\n"
-        f"Уверенность: {conf:.2f}%\n\n"
-        f"{expl}",
+        f"Уверенность: {conf:.2f}%\n"
+        f"Тренд: {trend}\n"
+        f"Пояснение: {expl}",
         reply_markup=result_kb()
     )
     await cb.answer()
