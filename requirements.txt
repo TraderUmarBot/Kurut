@@ -5,5 +5,3 @@ tradingview-ta
 yfinance
 numpy
 pandas
-textblob
-python-dotenv
