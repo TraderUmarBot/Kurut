@@ -17,6 +17,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web
+import aiogram.exceptions
 
 # ================= CONFIG =================
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -121,18 +122,19 @@ def result_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ ПЛЮС", callback_data="menu")
     kb.button(text="❌ МИНУС", callback_data="menu")
+    kb.button(text="🔄 Обновить сигнал", callback_data="refresh_signal")
     kb.adjust(2)
     return kb.as_markup()
 
 # ================= SIGNALS =================
 async def get_signal(pair: str, expiration: int = 1):
     """
-    Сигнал на основе 15 индикаторов, без NEUTRAL
+    Сигнал на основе индикаторов, безопасный от NaN
     """
     try:
         data = yf.download(pair, period="60d", interval="1h", progress=False)
         if data.empty:
-            return "BUY", 50.0, "Нет данных, генерируем сигнал BUY по умолчанию"
+            return "NEUTRAL", 50.0, "Нет данных"
 
         close = data['Close']
         high = data['High']
@@ -158,30 +160,39 @@ async def get_signal(pair: str, expiration: int = 1):
         rs = gain / (loss + 1e-9)
         rsi = 100 - (100 / (1 + rs))
         if not rsi.empty:
-            votes.append("BUY" if rsi.iloc[-1] < 50 else "SELL")  # Сигнал без NEUTRAL
+            if rsi.iloc[-1] < 30:
+                votes.append("BUY")
+            elif rsi.iloc[-1] > 70:
+                votes.append("SELL")
+            else:
+                votes.append("NEUTRAL")
 
         # ==== MACD ====
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
         macd = ema12 - ema26
         signal_line = macd.ewm(span=9, adjust=False).mean()
-        votes.append("BUY" if macd.iloc[-1] > signal_line.iloc[-1] else "SELL")
+        if not macd.empty:
+            votes.append("BUY" if macd.iloc[-1] > signal_line.iloc[-1] else "SELL")
 
         # ==== Stochastic ====
         low14 = low.rolling(14).min()
         high14 = high.rolling(14).max()
         stoch = (close - low14) / (high14 - low14 + 1e-9) * 100
-        votes.append("BUY" if stoch.iloc[-1] < 50 else "SELL")  # Без NEUTRAL
+        votes.append("BUY" if stoch.iloc[-1] < 20 else "SELL" if stoch.iloc[-1] > 80 else "NEUTRAL")
 
         # ==== Bollinger Bands ====
         sma20 = close.rolling(20).mean()
         std = close.rolling(20).std()
         upper = sma20 + 2*std
         lower = sma20 - 2*std
-        if close.iloc[-1] > upper.iloc[-1]:
-            votes.append("SELL")
-        else:
-            votes.append("BUY")
+        if not sma20.empty:
+            if close.iloc[-1] > upper.iloc[-1]:
+                votes.append("SELL")
+            elif close.iloc[-1] < lower.iloc[-1]:
+                votes.append("BUY")
+            else:
+                votes.append("NEUTRAL")
 
         # ==== Momentum ====
         if len(close) >= 10:
@@ -199,19 +210,30 @@ async def get_signal(pair: str, expiration: int = 1):
         minus_di = 100 * pd.Series(minus_dm).rolling(14).mean() / (atr14 + 1e-9)
         dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
         adx = dx.rolling(14).mean()
-        votes.append("BUY" if plus_di.iloc[-1] > minus_di.iloc[-1] else "SELL")
+        if plus_di.iloc[-1] > minus_di.iloc[-1]:
+            votes.append("BUY")
+        else:
+            votes.append("SELL")
 
         # ==== Final ====
         buy_votes = votes.count("BUY")
         sell_votes = votes.count("SELL")
-        direction = "BUY" if buy_votes >= sell_votes else "SELL"
-        confidence = max(buy_votes, sell_votes) / len(votes) * 100
-        explanation = f"Голоса индикаторов: BUY={buy_votes}, SELL={sell_votes}"
+        total_votes = buy_votes + sell_votes
+        if total_votes == 0:
+            direction = "NEUTRAL"
+            confidence = 50
+        elif buy_votes > sell_votes:
+            direction = "BUY"
+            confidence = buy_votes / total_votes * 100
+        else:
+            direction = "SELL"
+            confidence = sell_votes / total_votes * 100
 
+        explanation = f"Голоса индикаторов: BUY={buy_votes}, SELL={sell_votes}"
         return direction, confidence, explanation
 
     except Exception as e:
-        return "BUY", 50.0, f"Ошибка анализа: {e}"
+        return "NEUTRAL", 50.0, f"Ошибка анализа: {e}"
 
 # ================= HANDLERS =================
 @dp.message(Command("start"))
@@ -219,60 +241,28 @@ async def start(msg: types.Message):
     user_id = msg.from_user.id
     balance = await get_balance(user_id)
 
-    if user_id in AUTHORS:
-        await msg.answer(
-            "🏠 Главное меню (Авторский доступ)",
-            reply_markup=main_menu()
-        )
-        return
-
     kb = InlineKeyboardBuilder()
-    kb.button(text="Начать", callback_data="begin_instruction")
+    kb.button(text="Продолжить", callback_data="begin_instruction")
     kb.adjust(1)
+
     await msg.answer(
-        "👋 Привет! Добро пожаловать!\nНажмите Начать для регистрации.",
+        "👋 Привет!\n"
+        "Этот бот анализирует валютные пары с помощью индикаторов:\n"
+        "- SMA, EMA, RSI, MACD, Stochastic, Bollinger Bands, Momentum, ADX\n"
+        "- Сигналы BUY/SELL генерируются на основе голосов индикаторов\n\n"
+        "Нажми 'Продолжить', чтобы начать регистрацию.",
         reply_markup=kb.as_markup()
     )
 
 @dp.callback_query(lambda c: c.data == "begin_instruction")
 async def begin_instruction(cb: types.CallbackQuery):
-    instruction_text = (
-        "📝 Инструкция по работе бота:\n\n"
-        "Этот бот анализирует валютные пары и генерирует сигналы BUY/SELL с прогнозом и уровнем уверенности. "
-        "Сигналы формируются на основе 15 технических индикаторов, работающих с историческими данными за последние 60 дней.\n\n"
-        "**Используемые индикаторы:**\n"
-        "SMA, EMA, RSI, MACD, Stochastic, Bollinger Bands, Momentum, ADX.\n\n"
-        "Направление сигнала определяется большинством голосов индикаторов.\n\n"
-        "Нажмите 'Продолжить', чтобы перейти к регистрации и получить доступ к сигналам."
-    )
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Продолжить", callback_data="continue_registration")
-    kb.adjust(1)
-    await cb.message.answer(instruction_text, reply_markup=kb.as_markup())
-    await cb.answer()
-
-@dp.callback_query(lambda c: c.data == "continue_registration")
-async def continue_registration(cb: types.CallbackQuery):
     kb = InlineKeyboardBuilder()
     kb.button(text="Перейти к регистрации", url=REF_LINK)
     kb.adjust(1)
-    await cb.message.answer("📝 Зарегистрируйтесь через ссылку:", reply_markup=kb.as_markup())
-    kb_check = InlineKeyboardBuilder()
-    kb_check.button(text="Проверить пополнение", callback_data="check_deposit")
-    kb_check.adjust(1)
-    await cb.message.answer("После регистрации и пополнения нажмите здесь:", reply_markup=kb_check.as_markup())
+    await cb.message.answer("📝 Инструкция по регистрации и пополнению:", reply_markup=kb.as_markup())
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data == "check_deposit")
-async def check_deposit(cb: types.CallbackQuery):
-    balance = await get_balance(cb.from_user.id)
-    if balance >= MIN_DEPOSIT:
-        await cb.message.answer("✅ Доступ к сигналам открыт!", reply_markup=main_menu())
-    else:
-        await cb.message.answer(f"❌ Пополните баланс минимум на ${MIN_DEPOSIT}")
-    await cb.answer()
-
-# ======== Пары, экспирация, сигналы ========
+# --- Остальные обработчики (pairs, pair, expiration) ---
 @dp.callback_query(lambda c: c.data.startswith("pairs_page:"))
 async def pairs_page(cb: types.CallbackQuery):
     page = int(cb.data.split(":")[1])
@@ -293,20 +283,38 @@ async def pair(cb: types.CallbackQuery):
     )
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data.startswith("exp:"))
+@dp.callback_query(lambda c: c.data.startswith("exp:") or c.data == "refresh_signal")
 async def expiration(cb: types.CallbackQuery):
-    _, pair, exp = cb.data.split(":")
-    exp = int(exp)
+    if cb.data.startswith("exp:"):
+        _, pair, exp = cb.data.split(":")
+        exp = int(exp)
+    else:
+        # Кнопка "Обновить сигнал"
+        # Берём последнюю пару и экспирацию из текста сообщения
+        lines = cb.message.text.split("\n")
+        pair = lines[1].split(":")[1].strip()
+        exp = int(lines[2].split(":")[1].strip().split()[0])
+
     direction, conf, expl = await get_signal(pair, exp)
-    await cb.message.edit_text(
-        f"📊 Сигнал\nПара: {pair.replace('=X','')}\n"
+    new_text = (
+        f"📊 Сигнал\n"
+        f"Пара: {pair}\n"
         f"Время экспирации: {exp} мин\n"
         f"Направление: {direction}\n"
         f"Уверенность: {conf:.2f}%\n\n"
-        f"{expl}",
-        reply_markup=result_kb()
+        f"{expl}"
     )
-    await cb.answer()
+
+    try:
+        if cb.message.text != new_text:
+            await cb.message.edit_text(new_text, reply_markup=result_kb())
+        else:
+            await cb.answer("Сигнал уже показан. Обновите для нового сигнала.", show_alert=True)
+    except aiogram.exceptions.TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.answer("Сигнал уже показан. Обновите для нового сигнала.", show_alert=True)
+        else:
+            raise
 
 @dp.callback_query(lambda c: c.data == "news")
 async def news(cb: types.CallbackQuery):
