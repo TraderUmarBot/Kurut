@@ -3,7 +3,6 @@ import sys
 import asyncio
 import logging
 from datetime import datetime
-from collections import Counter
 
 import asyncpg
 from aiogram import Bot, Dispatcher, types
@@ -47,9 +46,9 @@ PAIRS = [
     "EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X",
     "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
-TIMEFRAMES = [1, 2, 5, 15]
 PAIRS_PER_PAGE = 6
 MIN_DEPOSIT = 20.0
+EXPIRATIONS = [1, 2, 3, 5, 10]  # время экспирации в минутах
 
 # ===================== DB =====================
 async def init_db():
@@ -75,7 +74,7 @@ async def init_db():
             user_id BIGINT,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             pair TEXT,
-            timeframe INT,
+            expiration INT,
             direction TEXT,
             confidence FLOAT,
             explanation TEXT,
@@ -102,12 +101,12 @@ async def get_balance(user_id: int) -> float:
         val = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", user_id)
         return val or 0.0
 
-async def save_trade(user_id, pair, tf, direction, confidence, explanation):
+async def save_trade(user_id, pair, expiration, direction, confidence, explanation):
     async with DB_POOL.acquire() as conn:
         return await conn.fetchval(
-            """INSERT INTO trades (user_id, pair, timeframe, direction, confidence, explanation)
+            """INSERT INTO trades (user_id, pair, expiration, direction, confidence, explanation)
                VALUES ($1,$2,$3,$4,$5,$6) RETURNING id""",
-            user_id, pair, tf, direction, confidence, explanation
+            user_id, pair, expiration, direction, confidence, explanation
         )
 
 async def update_trade(trade_id, result):
@@ -123,11 +122,6 @@ async def get_history(user_id):
             "SELECT * FROM trades WHERE user_id=$1 ORDER BY timestamp DESC LIMIT 20",
             user_id
         )
-
-# ===================== FSM =====================
-class TradeState(StatesGroup):
-    choosing_pair = State()
-    choosing_tf = State()
 
 # ===================== KEYBOARDS =====================
 def main_menu():
@@ -149,10 +143,10 @@ def pairs_kb(page=0):
     kb.adjust(2)
     return kb.as_markup()
 
-def tf_kb(pair):
+def expiration_kb(pair):
     kb = InlineKeyboardBuilder()
-    for tf in TIMEFRAMES:
-        kb.button(text=f"{tf} мин", callback_data=f"tf:{pair}:{tf}")
+    for exp in EXPIRATIONS:
+        kb.button(text=f"{exp} мин", callback_data=f"exp:{pair}:{exp}")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -165,38 +159,21 @@ def result_kb(trade_id):
     return kb.as_markup()
 
 # ===================== SIGNALS =====================
-TF_MAP = {
-    "1": Interval.INTERVAL_1_MINUTE,
-    "2": Interval.INTERVAL_2_MINUTES,
-    "5": Interval.INTERVAL_5_MINUTES,
-    "15": Interval.INTERVAL_15_MINUTES
-}
-
-async def get_signal_tv(pair: str, tf: str):
-    interval = TF_MAP.get(tf, Interval.INTERVAL_5_MINUTES)
+async def get_signal_tv(pair: str, expiration_minutes: int):
+    tf_map_tv = {1: "1m", 2: "2m", 3: "3m", 5: "5m", 10: "10m"}
+    tv_tf = tf_map_tv.get(expiration_minutes, "5m")
 
     handler = TA_Handler(
         symbol=pair,
         screener="forex",
         exchange="FX_IDC",
-        interval=interval
+        interval=tv_tf
     )
-
-    try:
-        analysis = await asyncio.to_thread(handler.get_analysis)
-
-        if not analysis.indicators:
-            return "NEUTRAL", 0.0, "Свечи ещё не сформированы или недостаточно данных"
-
-        direction = analysis.summary.get("RECOMMENDATION", "NEUTRAL")
-        indicators = analysis.indicators
-        conf = 50 + min(len([v for v in indicators.values() if v]), 50)
-        expl = f"Сигнал TradingView: {direction}\nИндикаторы: {', '.join(indicators.keys())}"
-
-        return direction, conf, expl
-
-    except Exception as e:
-        return "NEUTRAL", 0.0, f"Ошибка получения сигнала: {e}"
+    analysis = await asyncio.to_thread(handler.get_analysis)
+    direction = analysis.summary["RECOMMENDATION"]
+    conf = 70.0
+    expl = f"Сигнал TradingView ({tv_tf}): {direction}\nИндикаторы: {', '.join(analysis.indicators.keys())}"
+    return direction, conf, expl
 
 # ===================== HANDLERS =====================
 @dp.message(Command("start"))
@@ -262,30 +239,29 @@ async def pairs(cb: types.CallbackQuery):
 async def pair(cb: types.CallbackQuery):
     pair = cb.data.split(":")[1]
     await cb.message.edit_text(
-        f"⏱ Пара {pair.replace('=X','')}, выбери TF",
-        reply_markup=tf_kb(pair)
+        f"⏱ Пара {pair.replace('=X','')}, выберите время экспирации",
+        reply_markup=expiration_kb(pair)
     )
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data.startswith("tf:"))
-async def tf(cb: types.CallbackQuery):
-    _, pair, tf = cb.data.split(":")
-    tf_map = {"1": "1", "2": "2", "5": "5", "15": "15"}
-    tf_tv = tf_map.get(tf, "5")
+@dp.callback_query(lambda c: c.data.startswith("exp:"))
+async def expiration(cb: types.CallbackQuery):
+    _, pair, exp_val = cb.data.split(":")
+    expiration = int(exp_val)
 
     try:
-        direction, conf, expl = await get_signal_tv(pair.replace("=X",""), tf_tv)
+        direction, conf, expl = await get_signal_tv(pair.replace("=X",""), expiration)
     except Exception as e:
         await cb.message.answer(f"Ошибка получения сигнала: {e}")
         await cb.answer()
         return
 
-    trade_id = await save_trade(cb.from_user.id, pair.replace("=X",""), int(tf), direction, conf, expl)
+    trade_id = await save_trade(cb.from_user.id, pair.replace("=X",""), expiration, direction, conf, expl)
 
     await cb.message.edit_text(
         f"📊 Сигнал\n\n"
         f"Пара: {pair.replace('=X','')}\n"
-        f"TF: {tf} мин\n"
+        f"Время экспирации: {expiration} мин\n"
         f"Направление: {direction}\n"
         f"Уверенность: {conf}%\n\n"
         f"{expl}",
