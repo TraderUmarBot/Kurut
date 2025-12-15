@@ -25,7 +25,7 @@ PORT = int(os.getenv("PORT", 10000))
 HOST = "0.0.0.0"
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
-AUTHORS = [7079260196, 6117198446]  # 2 автора
+AUTHORS = [7079260196, 6117198446]
 MIN_DEPOSIT = 20.0
 
 if not TG_TOKEN or not DATABASE_URL or not RENDER_EXTERNAL_HOSTNAME:
@@ -95,10 +95,15 @@ async def get_balance(user_id: int) -> float:
         val = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", user_id)
         return val or 0.0
 
+async def has_access(user_id: int) -> bool:
+    if user_id in AUTHORS:
+        return True
+    balance = await get_balance(user_id)
+    return balance >= MIN_DEPOSIT
+
 # ================= FSM =====================
 class TradeState(StatesGroup):
-    choosing_pair = State()
-    choosing_exp = State()
+    checking_id = State()
 
 # ================= KEYBOARDS =================
 def main_menu():
@@ -145,11 +150,9 @@ def calculate_indicators(data: pd.DataFrame):
     # 1-2 SMA
     indicators.append('BUY' if close.iloc[-1] > close.rolling(10).mean().iloc[-1] else 'SELL')
     indicators.append('BUY' if close.iloc[-1] > close.rolling(20).mean().iloc[-1] else 'SELL')
-
     # 3-4 EMA
     indicators.append('BUY' if close.iloc[-1] > close.ewm(span=10).mean().iloc[-1] else 'SELL')
     indicators.append('BUY' if close.iloc[-1] > close.ewm(span=20).mean().iloc[-1] else 'SELL')
-
     # 5 RSI
     delta = close.diff()
     gain = delta.where(delta>0,0).rolling(14).mean()
@@ -157,56 +160,48 @@ def calculate_indicators(data: pd.DataFrame):
     rs = gain / loss
     rsi = 100 - (100/(1+rs))
     indicators.append('BUY' if rsi.iloc[-1] > 50 else 'SELL')
-
     # 6 MACD
     ema12 = close.ewm(span=12).mean()
     ema26 = close.ewm(span=26).mean()
     macd = ema12 - ema26
     signal = macd.ewm(span=9).mean()
     indicators.append('BUY' if macd.iloc[-1] > signal.iloc[-1] else 'SELL')
-
-    # 7 Bollinger Bands
+    # 7 Bollinger
     sma20 = close.rolling(20).mean()
     std = close.rolling(20).std()
+    upper = sma20 + 2*std
+    lower = sma20 - 2*std
     indicators.append('BUY' if close.iloc[-1] > sma20.iloc[-1] else 'SELL')
-
     # 8 Stochastic
     low14 = close.rolling(14).min()
     high14 = close.rolling(14).max()
     k = 100*(close - low14)/(high14 - low14)
     indicators.append('BUY' if k.iloc[-1] > 50 else 'SELL')
-
-    # 9 ATR (импульс)
+    # 9 ATR
     tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
     atr = tr.rolling(14).mean()
     indicators.append('BUY' if close.iloc[-1] > close.iloc[-2] else 'SELL')
-
     # 10 CCI
     tp = (high + low + close)/3
     cci = (tp - tp.rolling(20).mean())/(0.015*tp.rolling(20).std())
     indicators.append('BUY' if cci.iloc[-1] > 0 else 'SELL')
-
     # 11 ADX
     plus_dm = high.diff()
-    minus_dm = low.diff()*-1
+    minus_dm = low.diff() * -1
     tr14 = tr.rolling(14).sum()
-    plus_di = 100*plus_dm.rolling(14).sum()/tr14
-    minus_di = 100*minus_dm.rolling(14).sum()/tr14
-    adx = abs(plus_di - minus_di)/(plus_di + minus_di)*100
+    plus_di = 100 * plus_dm.rolling(14).sum() / tr14
+    minus_di = 100 * minus_dm.rolling(14).sum() / tr14
+    adx = (abs(plus_di - minus_di)/(plus_di + minus_di))*100
     indicators.append('BUY' if plus_di.iloc[-1] > minus_di.iloc[-1] else 'SELL')
-
     # 12 Williams %R
     indicators.append('BUY' if k.iloc[-1] < -50 else 'SELL')
-
     # 13 Momentum
     momentum = close.diff(4)
     indicators.append('BUY' if momentum.iloc[-1] > 0 else 'SELL')
-
     # 14 OBV
     obv = (np.sign(close.diff())*volume).cumsum()
     indicators.append('BUY' if obv.iloc[-1] > obv.iloc[-2] else 'SELL')
-
-    # 15 Ichimoku (Tenkan/Kijun simplified)
+    # 15 Ichimoku simplified
     tenkan = (high.rolling(9).max() + low.rolling(9).min())/2
     kijun = (high.rolling(26).max() + low.rolling(26).min())/2
     indicators.append('BUY' if tenkan.iloc[-1] > kijun.iloc[-1] else 'SELL')
@@ -225,27 +220,61 @@ async def get_signal(pair: str, expiration: int = 1):
         direction = 'ПОКУПКА' if buy_count >= sell_count else 'ПРОДАЖА'
         confidence = max(buy_count, sell_count)/len(indicators)*100
         return direction, confidence
-    except:
+    except Exception:
         return "ПОКУПКА", 70.0
 
 # ================= HANDLERS =================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     user_id = msg.from_user.id
-    balance = await get_balance(user_id)
+    async with DB_POOL.acquire() as conn:
+        user = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+
     if user_id in AUTHORS:
         await msg.answer("🏠 Главное меню (Авторский доступ)", reply_markup=main_menu())
         return
-    if balance < MIN_DEPOSIT:
-        kb = InlineKeyboardBuilder()
-        kb.button(text="Получить доступ к боту", url=REF_LINK)
-        kb.adjust(1)
-        await msg.answer(
-            f"👋 Привет! Добро пожаловать!\nДля доступа к сигналам нужно пополнить баланс ≥ ${MIN_DEPOSIT}",
-            reply_markup=kb.as_markup()
-        )
-    else:
-        await msg.answer("🏠 Главное меню", reply_markup=main_menu())
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📖 Инструкция по боту", callback_data="show_instruction")
+    kb.adjust(1)
+    await msg.answer(
+        "👋 Привет! Добро пожаловать!\nНажмите кнопку ниже для инструкции.",
+        reply_markup=kb.as_markup()
+    )
+
+@dp.callback_query(lambda c: c.data == "show_instruction")
+async def show_instruction(cb: types.CallbackQuery):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Получить доступ к боту", url=REF_LINK)
+    kb.button(text="Проверить ID", callback_data="check_id")
+    kb.adjust(1)
+    await cb.message.answer(
+        "📝 Бот анализирует рынок через 15 индикаторов.\n"
+        "Время экспирации: авто.\n"
+        "Сигнал: ПОКУПКА или ПРОДАЖА.\n"
+        "Уверенность рассчитывается на основе большинства индикаторов.",
+        reply_markup=kb.as_markup()
+    )
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data == "check_id")
+async def check_id(cb: types.CallbackQuery):
+    await cb.message.answer("✏️ Отправь свой Pocket Option ID для проверки пополнения.")
+    await cb.answer()
+    await TradeState.checking_id.set()
+
+@dp.message()
+async def receive_id(msg: types.Message, state: TradeState):
+    if state and await state.get_state() == TradeState.checking_id:
+        user_id = msg.from_user.id
+        pocket_id = msg.text.strip()
+        await add_user(user_id, pocket_id)
+        balance = await get_balance(user_id)
+        if balance >= MIN_DEPOSIT or user_id in AUTHORS:
+            await msg.answer("✔️ Проверка пройдена. Доступ к боту предоставлен!", reply_markup=main_menu())
+        else:
+            await msg.answer(f"❌ Недостаточно средств. Пополните баланс на {MIN_DEPOSIT}$")
+        await state.clear()
 
 # ================= CALLBACKS =================
 @dp.callback_query(lambda c: c.data == "pairs")
@@ -305,7 +334,7 @@ async def handle_postback(request: web.Request):
         return web.Response(text="No click_id", status=400)
     user_id = int(click_id)
     await add_user(user_id, pocket_id=str(click_id))
-    if event in ["deposit","reg"] and amount >= MIN_DEPOSIT:
+    if event in ["deposit","reg"] and amount > 0:
         await update_balance(user_id, amount)
     return web.Response(text="OK")
 
