@@ -3,6 +3,7 @@ import sys
 import asyncio
 import logging
 from datetime import datetime
+import random
 
 import asyncpg
 import yfinance as yf
@@ -25,11 +26,11 @@ PORT = int(os.getenv("PORT", 10000))
 HOST = "0.0.0.0"
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
-AUTHORS = [7079260196, 6117198446]
+AUTHORS = [7079260196, 6117198446]  # авторы
 MIN_DEPOSIT = 20.0
 
-if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME:
-    print("❌ ENV не заданы")
+if not TG_TOKEN or not RENDER_EXTERNAL_HOSTNAME or not DATABASE_URL:
+    print("❌ ENV не заданы или DATABASE_URL неверен")
     sys.exit(1)
 
 WEBHOOK_PATH = "/webhook"
@@ -44,9 +45,9 @@ DB_POOL: asyncpg.pool.Pool | None = None
 
 # ===================== CONSTANTS =====================
 PAIRS = [
-    "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X",
-    "EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X",
-    "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
+    "EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF",
+    "EURJPY","GBPJPY","AUDJPY","EURGBP","EURAUD","GBPAUD",
+    "CADJPY","CHFJPY","EURCAD","GBPCAD","AUDCAD","AUDCHF","CADCHF"
 ]
 PAIRS_PER_PAGE = 6
 EXPIRATIONS = [1, 2, 3, 5, 10]  # минуты
@@ -98,7 +99,7 @@ class TradeState(StatesGroup):
 def main_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="📈 Валютные пары", callback_data="pairs")
-    kb.button(text="📰 Новости", callback_data="news")
+    kb.button(text="📰 Новости", callback_data="news_signal")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -106,7 +107,7 @@ def pairs_kb(page=0):
     kb = InlineKeyboardBuilder()
     start = page * PAIRS_PER_PAGE
     for p in PAIRS[start:start+PAIRS_PER_PAGE]:
-        kb.button(text=p.replace("=X",""), callback_data=f"pair:{p}")
+        kb.button(text=p, callback_data=f"pair:{p}")
     if page > 0:
         kb.button(text="⬅️ Назад", callback_data=f"pairs_page:{page-1}")
     if start + PAIRS_PER_PAGE < len(PAIRS):
@@ -123,103 +124,116 @@ def expiration_kb(pair):
 
 def result_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ ПЛЮС", callback_data="res:return")
-    kb.button(text="❌ МИНУС", callback_data="res:return")
-    kb.button(text="🏠 Меню", callback_data="menu")
+    kb.button(text="✅ ПЛЮС", callback_data="menu")
+    kb.button(text="❌ МИНУС", callback_data="menu")
     kb.adjust(2)
     return kb.as_markup()
 
 # ===================== SIGNALS =====================
-async def get_signal_advanced(pair: str, expiration: int):
-    data = yf.download(pair, period="5d", interval="1m")
-    close = data['Close']
-    high = data['High']
-    low = data['Low']
+async def get_signal_efinance(pair: str, expiration: int):
+    """
+    Технический анализ с 15 индикаторами.
+    Возвращает: direction (BUY/SELL/NEUTRAL), confidence %, explanation
+    """
+    try:
+        data = yf.download(pair+"=X", period="60d", interval="1h")
+        close = data['Close']
+        high = data['High']
+        low = data['Low']
+        volume = data['Volume']
 
-    if len(close) < 20:
-        return "NEUTRAL", 50.0, "Недостаточно данных для анализа"
+        if len(close) < 30:
+            return "NEUTRAL", 50.0, "Недостаточно данных для анализа"
 
-    # SMA/EMA
-    sma5 = close.rolling(5).mean().iloc[-1]
-    sma10 = close.rolling(10).mean().iloc[-1]
-    sma20 = close.rolling(20).mean().iloc[-1]
-    ema5 = close.ewm(span=5, adjust=False).mean().iloc[-1]
-    ema10 = close.ewm(span=10, adjust=False).mean().iloc[-1]
-    ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
+        signals = []
 
-    # RSI
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(14).mean().iloc[-1]
-    avg_loss = loss.rolling(14).mean().iloc[-1]
-    rsi = 100 - (100 / (1 + avg_gain / (avg_loss+1e-6)))
+        # 1-3. SMA 5,10,20
+        sma5 = close.rolling(5).mean().iloc[-1]
+        sma10 = close.rolling(10).mean().iloc[-1]
+        sma20 = close.rolling(20).mean().iloc[-1]
+        signals += ["BUY" if close.iloc[-1] > sma else "SELL" for sma in [sma5, sma10, sma20]]
 
-    # MACD
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    macd_signal = macd.ewm(span=9, adjust=False).mean()
-    macd_diff = macd.iloc[-1] - macd_signal.iloc[-1]
+        # 4-6. EMA 5,10,20
+        ema5 = close.ewm(span=5).mean().iloc[-1]
+        ema10 = close.ewm(span=10).mean().iloc[-1]
+        ema20 = close.ewm(span=20).mean().iloc[-1]
+        signals += ["BUY" if close.iloc[-1] > ema else "SELL" for ema in [ema5, ema10, ema20]]
 
-    # Bollinger
-    sma20_full = close.rolling(20).mean()
-    std20 = close.rolling(20).std()
-    upper_bb = sma20_full.iloc[-1] + 2*std20.iloc[-1]
-    lower_bb = sma20_full.iloc[-1] - 2*std20.iloc[-1]
+        # 7. RSI
+        delta = close.diff()
+        gain = delta.clip(lower=0)
+        loss = -1*delta.clip(upper=0)
+        avg_gain = gain.rolling(14).mean().iloc[-1]
+        avg_loss = loss.rolling(14).mean().iloc[-1]
+        rs = avg_gain / avg_loss if avg_loss != 0 else 0
+        rsi = 100 - (100 / (1 + rs))
+        signals.append("BUY" if rsi < 30 else "SELL" if rsi > 70 else "NEUTRAL")
 
-    # Stochastic
-    low14 = low.rolling(14).min().iloc[-1]
-    high14 = high.rolling(14).max().iloc[-1]
-    k = 100 * (close.iloc[-1] - low14) / (high14 - low14 + 1e-6)
+        # 8. MACD
+        ema12 = close.ewm(span=12).mean()
+        ema26 = close.ewm(span=26).mean()
+        macd = ema12 - ema26
+        macd_signal = macd.ewm(span=9).mean()
+        signals.append("BUY" if macd.iloc[-1] > macd_signal.iloc[-1] else "SELL")
 
-    # ATR
-    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1)
-    atr = tr.max(axis=1).rolling(14).mean().iloc[-1]
+        # 9. Bollinger Bands
+        sma20 = close.rolling(20).mean()
+        std20 = close.rolling(20).std()
+        upper = sma20 + 2*std20
+        lower = sma20 - 2*std20
+        signals.append("BUY" if close.iloc[-1] < lower.iloc[-1] else "SELL" if close.iloc[-1] > upper.iloc[-1] else "NEUTRAL")
 
-    # Momentum
-    momentum = close.iloc[-1] - close.iloc[-10]
+        # 10. Stochastic Oscillator
+        k = ((close - low.rolling(14).min()) / (high.rolling(14).max() - low.rolling(14).min()))*100
+        signals.append("BUY" if k.iloc[-1] < 20 else "SELL" if k.iloc[-1] > 80 else "NEUTRAL")
 
-    # CCI
-    typical_price = (high + low + close) / 3
-    cci = (typical_price.iloc[-1] - typical_price.rolling(20).mean().iloc[-1]) / (0.015 * typical_price.rolling(20).std().iloc[-1] + 1e-6)
+        # 11. Momentum
+        momentum = close.iloc[-1] - close.iloc[-10]
+        signals.append("BUY" if momentum > 0 else "SELL")
 
-    # Логика
-    score = 0
-    if close.iloc[-1] > sma5: score += 1
-    if close.iloc[-1] > sma10: score += 1
-    if close.iloc[-1] > sma20: score += 1
-    if close.iloc[-1] > ema5: score += 1
-    if close.iloc[-1] > ema10: score += 1
-    if close.iloc[-1] > ema20: score += 1
-    if rsi < 30: score += 1
-    elif rsi > 70: score -= 1
-    if macd_diff > 0: score += 1
-    else: score -= 1
-    if close.iloc[-1] > upper_bb: score -= 1
-    elif close.iloc[-1] < lower_bb: score += 1
-    if k < 20: score +=1
-    elif k > 80: score -=1
-    if momentum > 0: score +=1
-    else: score -=1
-    if cci > 100: score -=1
-    elif cci < -100: score +=1
+        # 12. CCI
+        tp = (high + low + close)/3
+        cci = (tp.iloc[-1] - tp.rolling(20).mean().iloc[-1]) / (0.015*tp.rolling(20).std().iloc[-1])
+        signals.append("BUY" if cci < -100 else "SELL" if cci > 100 else "NEUTRAL")
 
-    if score > 3: direction = "BUY"
-    elif score < -3: direction = "SELL"
-    else: direction = "NEUTRAL"
+        # 13. Williams %R
+        wr = (high.rolling(14).max() - close) / (high.rolling(14).max() - low.rolling(14).min()) * -100
+        signals.append("BUY" if wr.iloc[-1] < -80 else "SELL" if wr.iloc[-1] > -20 else "NEUTRAL")
 
-    confidence = min(max(abs(score)/12*100, 10), 100)
-    explanation = f"SMA5:{sma5:.5f}, EMA5:{ema5:.5f}, RSI:{rsi:.2f}, MACD_diff:{macd_diff:.5f}, K:{k:.2f}, Momentum:{momentum:.5f}, CCI:{cci:.2f}"
+        # 14. SMA cross
+        signals.append("BUY" if sma5 > sma20 else "SELL")
 
-    return direction, confidence, explanation
+        # 15. EMA cross
+        signals.append("BUY" if ema5 > ema20 else "SELL")
+
+        # Финальный сигнал
+        buy_count = signals.count("BUY")
+        sell_count = signals.count("SELL")
+        if buy_count > sell_count and buy_count >= 8:
+            direction = "BUY"
+        elif sell_count > buy_count and sell_count >= 8:
+            direction = "SELL"
+        else:
+            direction = "NEUTRAL"
+
+        confidence = max(buy_count, sell_count)/15*100
+        explanation = f"Индикаторы: BUY {buy_count}, SELL {sell_count}, NEUTRAL {signals.count('NEUTRAL')}"
+        return direction, confidence, explanation
+
+    except Exception as e:
+        return "NEUTRAL", 50.0, f"Ошибка анализа: {e}"
 
 # ===================== HANDLERS =====================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     user_id = msg.from_user.id
+    balance = await get_balance(user_id)
+
     if user_id in AUTHORS:
-        await msg.answer("🏠 Главное меню (Авторский доступ)", reply_markup=main_menu())
+        await msg.answer(
+            "🏠 Главное меню (Авторский доступ)",
+            reply_markup=main_menu()
+        )
         return
 
     kb = InlineKeyboardBuilder()
@@ -227,8 +241,8 @@ async def start(msg: types.Message):
     kb.adjust(1)
     await msg.answer(
         "Привет! Я бот для анализа валютных пар.\n\n"
-        "Я использую рыночные данные для генерации сигналов.\n\n"
-        "Нажмите кнопку Начать для инструкции.",
+        "Я использую рыночные данные для анализа и генерации сигналов.\n\n"
+        "Внизу нажмите кнопку Начать, чтобы получить инструкцию по регистрации и пополнению баланса.",
         reply_markup=kb.as_markup()
     )
 
@@ -237,12 +251,17 @@ async def begin_instruction(cb: types.CallbackQuery):
     kb = InlineKeyboardBuilder()
     kb.button(text="Перейти к регистрации", url=REF_LINK)
     kb.adjust(1)
-    await cb.message.answer(f"1️⃣ Зарегистрируйтесь по ссылке\n2️⃣ Пополните баланс минимум на ${MIN_DEPOSIT}", reply_markup=kb.as_markup())
-    await cb.answer()
+    await cb.message.answer(
+        f"1️⃣ Зарегистрируйте аккаунт по нашей ссылке.\n"
+        f"2️⃣ Пополните баланс на ${MIN_DEPOSIT}.\n"
+        f"3️⃣ После пополнения нажмите кнопку ниже для проверки пополнения.",
+        reply_markup=kb.as_markup()
+    )
     kb_check = InlineKeyboardBuilder()
     kb_check.button(text="Проверить пополнение", callback_data="check_deposit")
     kb_check.adjust(1)
     await cb.message.answer("Нажмите для проверки:", reply_markup=kb_check.as_markup())
+    await cb.answer()
 
 @dp.callback_query(lambda c: c.data == "check_deposit")
 async def check_deposit(cb: types.CallbackQuery):
@@ -267,22 +286,20 @@ async def pairs(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
 async def pair(cb: types.CallbackQuery):
     pair = cb.data.split(":")[1]
-    await cb.message.edit_text(f"⏱ Пара {pair.replace('=X','')}, выбери время экспирации", reply_markup=expiration_kb(pair))
+    await cb.message.edit_text(
+        f"⏱ Пара {pair}, выбери время экспирации",
+        reply_markup=expiration_kb(pair)
+    )
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
 async def expiration(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
     exp = int(exp)
-    try:
-        direction, conf, expl = await get_signal_advanced(pair.replace("=X",""), exp)
-    except Exception as e:
-        await cb.message.answer(f"Ошибка получения сигнала: {e}")
-        await cb.answer()
-        return
+    direction, conf, expl = await get_signal_efinance(pair, exp)
     await cb.message.edit_text(
         f"📊 Сигнал\n\n"
-        f"Пара: {pair.replace('=X','')}\n"
+        f"Пара: {pair}\n"
         f"Время экспирации: {exp} мин\n"
         f"Направление: {direction}\n"
         f"Уверенность: {conf:.2f}%\n\n"
@@ -291,21 +308,20 @@ async def expiration(cb: types.CallbackQuery):
     )
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data.startswith("res:"))
-async def res(cb: types.CallbackQuery):
+@dp.callback_query(lambda c: c.data == "menu")
+async def menu(cb: types.CallbackQuery):
     await cb.message.edit_text("🏠 Главное меню", reply_markup=main_menu())
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data == "news")
-async def news(cb: types.CallbackQuery):
-    # Автоматически выбираем случайную пару и время
-    import random
+@dp.callback_query(lambda c: c.data == "news_signal")
+async def news_signal(cb: types.CallbackQuery):
+    # Бот выбирает случайную пару и время экспирации
     pair = random.choice(PAIRS)
     exp = random.choice(EXPIRATIONS)
-    direction, conf, expl = await get_signal_advanced(pair.replace("=X",""), exp)
+    direction, conf, expl = await get_signal_efinance(pair, exp)
     await cb.message.edit_text(
-        f"📰 Новость - сигнал\n\n"
-        f"Пара: {pair.replace('=X','')}\n"
+        f"📰 Новости — сигнал\n\n"
+        f"Пара: {pair}\n"
         f"Время экспирации: {exp} мин\n"
         f"Направление: {direction}\n"
         f"Уверенность: {conf:.2f}%\n\n"
