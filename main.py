@@ -3,7 +3,6 @@ import sys
 import asyncio
 import logging
 from datetime import datetime
-
 import asyncpg
 import pandas as pd
 import numpy as np
@@ -95,11 +94,9 @@ async def get_balance(user_id: int) -> float:
         val = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", user_id)
         return val or 0.0
 
-async def has_access(user_id: int) -> bool:
-    if user_id in AUTHORS:
-        return True
-    balance = await get_balance(user_id)
-    return balance >= MIN_DEPOSIT
+async def get_user(user_id: int):
+    async with DB_POOL.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
 
 # ================= FSM =====================
 class TradeState(StatesGroup):
@@ -139,6 +136,19 @@ def result_kb():
     kb.adjust(2)
     return kb.as_markup()
 
+def access_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Получить доступ", url=REF_LINK)
+    kb.button(text="Проверить ID", callback_data="check_id")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def deposit_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Я пополнил баланс", callback_data="check_balance")
+    kb.adjust(1)
+    return kb.as_markup()
+
 # ================= INDICATORS =================
 def calculate_indicators(data: pd.DataFrame):
     indicators = []
@@ -148,11 +158,11 @@ def calculate_indicators(data: pd.DataFrame):
     volume = data['Volume']
 
     # 1-2 SMA
-    indicators.append('BUY' if close.iloc[-1] > close.rolling(10).mean().iloc[-1] else 'SELL')
-    indicators.append('BUY' if close.iloc[-1] > close.rolling(20).mean().iloc[-1] else 'SELL')
+    indicators.append('BUY' if close[-1] > close.rolling(10).mean().iloc[-1] else 'SELL')
+    indicators.append('BUY' if close[-1] > close.rolling(20).mean().iloc[-1] else 'SELL')
     # 3-4 EMA
-    indicators.append('BUY' if close.iloc[-1] > close.ewm(span=10).mean().iloc[-1] else 'SELL')
-    indicators.append('BUY' if close.iloc[-1] > close.ewm(span=20).mean().iloc[-1] else 'SELL')
+    indicators.append('BUY' if close[-1] > close.ewm(span=10).mean().iloc[-1] else 'SELL')
+    indicators.append('BUY' if close[-1] > close.ewm(span=20).mean().iloc[-1] else 'SELL')
     # 5 RSI
     delta = close.diff()
     gain = delta.where(delta>0,0).rolling(14).mean()
@@ -169,8 +179,6 @@ def calculate_indicators(data: pd.DataFrame):
     # 7 Bollinger
     sma20 = close.rolling(20).mean()
     std = close.rolling(20).std()
-    upper = sma20 + 2*std
-    lower = sma20 - 2*std
     indicators.append('BUY' if close.iloc[-1] > sma20.iloc[-1] else 'SELL')
     # 8 Stochastic
     low14 = close.rolling(14).min()
@@ -191,7 +199,6 @@ def calculate_indicators(data: pd.DataFrame):
     tr14 = tr.rolling(14).sum()
     plus_di = 100 * plus_dm.rolling(14).sum() / tr14
     minus_di = 100 * minus_dm.rolling(14).sum() / tr14
-    adx = (abs(plus_di - minus_di)/(plus_di + minus_di))*100
     indicators.append('BUY' if plus_di.iloc[-1] > minus_di.iloc[-1] else 'SELL')
     # 12 Williams %R
     indicators.append('BUY' if k.iloc[-1] < -50 else 'SELL')
@@ -201,11 +208,10 @@ def calculate_indicators(data: pd.DataFrame):
     # 14 OBV
     obv = (np.sign(close.diff())*volume).cumsum()
     indicators.append('BUY' if obv.iloc[-1] > obv.iloc[-2] else 'SELL')
-    # 15 Ichimoku simplified
+    # 15 Ichimoku (tenkan-sen vs kijun-sen simplified)
     tenkan = (high.rolling(9).max() + low.rolling(9).min())/2
     kijun = (high.rolling(26).max() + low.rolling(26).min())/2
     indicators.append('BUY' if tenkan.iloc[-1] > kijun.iloc[-1] else 'SELL')
-
     return indicators
 
 # ================= SIGNALS =================
@@ -213,7 +219,7 @@ async def get_signal(pair: str, expiration: int = 1):
     try:
         data = yf.download(pair, period="60d", interval="1h", progress=False)
         if data.empty or len(data) < 30:
-            return "ПОКУПКА", 70.0
+            return "ПОКУПКА", 50.0
         indicators = calculate_indicators(data)
         buy_count = indicators.count('BUY')
         sell_count = indicators.count('SELL')
@@ -221,75 +227,61 @@ async def get_signal(pair: str, expiration: int = 1):
         confidence = max(buy_count, sell_count)/len(indicators)*100
         return direction, confidence
     except Exception:
-        return "ПОКУПКА", 70.0
+        return "ПОКУПКА", 50.0
 
 # ================= HANDLERS =================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     user_id = msg.from_user.id
-    async with DB_POOL.acquire() as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
-
     if user_id in AUTHORS:
         await msg.answer("🏠 Главное меню (Авторский доступ)", reply_markup=main_menu())
         return
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📖 Инструкция по боту", callback_data="show_instruction")
-    kb.adjust(1)
+    # Полная инструкция
     await msg.answer(
-        "👋 Привет! Добро пожаловать!\nНажмите кнопку ниже для инструкции.",
-        reply_markup=kb.as_markup()
+        "👋 Привет!\n\n"
+        "Бот создан с помощью команды KURUT TRADE.\n"
+        "Что умеет бот:\n"
+        "1. Анализирует рынок через 15 индикаторов\n"
+        "2. Определяет направление: ПОКУПКА / ПРОДАЖА\n"
+        "3. Учитывает свечные паттерны\n"
+        "4. Подсказывает время экспирации\n"
+        "5. Выдаёт сигналы с кнопками ПЛЮС / МИНУС\n\n"
+        "Нажмите кнопку ниже для получения доступа к боту.",
+        reply_markup=access_kb()
     )
-
-@dp.callback_query(lambda c: c.data == "show_instruction")
-async def show_instruction(cb: types.CallbackQuery):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Получить доступ к боту", url=REF_LINK)
-    kb.button(text="Проверить ID", callback_data="check_id")
-    kb.adjust(1)
-    await cb.message.answer(
-        "📝 Бот анализирует рынок через 15 индикаторов.\n"
-        "Время экспирации: авто.\n"
-        "Сигнал: ПОКУПКА или ПРОДАЖА.\n"
-        "Уверенность рассчитывается на основе большинства индикаторов.",
-        reply_markup=kb.as_markup()
-    )
-    await cb.answer()
 
 @dp.callback_query(lambda c: c.data == "check_id")
 async def check_id(cb: types.CallbackQuery):
-    await cb.message.answer("✏️ Отправь свой Pocket Option ID для проверки пополнения.")
-    await cb.answer()
+    await cb.message.answer("✏️ Отправьте ваш Pocket Option ID:")
     await TradeState.checking_id.set()
+    await cb.answer()
 
-@dp.message()
-async def receive_id(msg: types.Message, state: TradeState):
-    if state and await state.get_state() == TradeState.checking_id:
-        user_id = msg.from_user.id
-        pocket_id = msg.text.strip()
-        await add_user(user_id, pocket_id)
-        balance = await get_balance(user_id)
-        if balance >= MIN_DEPOSIT or user_id in AUTHORS:
-            await msg.answer("✔️ Проверка пройдена. Доступ к боту предоставлен!", reply_markup=main_menu())
-        else:
-            await msg.answer(f"❌ Недостаточно средств. Пополните баланс на {MIN_DEPOSIT}$")
-        await state.clear()
+@dp.message(lambda m: True, state=TradeState.checking_id)
+async def handle_id(msg: types.Message):
+    user_id = msg.from_user.id
+    pocket_id = msg.text.strip()
+    await add_user(user_id, pocket_id)
+    balance = await get_balance(user_id)
+    if balance >= MIN_DEPOSIT:
+        await msg.answer("✅ У вас есть доступ к боту!", reply_markup=main_menu())
+    else:
+        await msg.answer("⚠️ Чтобы получить доступ, пополните баланс ≥ 20$.", reply_markup=deposit_kb())
+    await dp.storage.close()  # сброс состояния
 
 # ================= CALLBACKS =================
 @dp.callback_query(lambda c: c.data == "pairs")
-async def pairs(cb: types.CallbackQuery):
+async def pairs_cb(cb: types.CallbackQuery):
     await cb.message.edit_text("📈 Выберите пару", reply_markup=pairs_kb())
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("pairs_page:"))
-async def pairs_page(cb: types.CallbackQuery):
+async def pairs_page_cb(cb: types.CallbackQuery):
     page = int(cb.data.split(":")[1])
     await cb.message.edit_text("📈 Выберите пару", reply_markup=pairs_kb(page))
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
-async def pair(cb: types.CallbackQuery):
+async def pair_cb(cb: types.CallbackQuery):
     pair = cb.data.split(":")[1]
     await cb.message.edit_text(
         f"⏱ Пара {pair.replace('=X','')}, выберите время экспирации",
@@ -298,7 +290,7 @@ async def pair(cb: types.CallbackQuery):
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
-async def expiration(cb: types.CallbackQuery):
+async def expiration_cb(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
     exp = int(exp)
     direction, conf = await get_signal(pair, exp)
@@ -309,7 +301,8 @@ async def expiration(cb: types.CallbackQuery):
             user_id, pair, direction, conf, exp
         )
     await cb.message.edit_text(
-        f"📊 Сигнал\nПара: {pair.replace('=X','')}\n"
+        f"📊 Сигнал\n"
+        f"Пара: {pair.replace('=X','')}\n"
         f"Время экспирации: {exp} мин\n"
         f"Направление: {direction}\n"
         f"Уверенность: {conf:.2f}%",
@@ -318,8 +311,25 @@ async def expiration(cb: types.CallbackQuery):
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data == "menu")
-async def result_menu(cb: types.CallbackQuery):
+async def result_menu_cb(cb: types.CallbackQuery):
     await cb.message.edit_text("🏠 Главное меню", reply_markup=main_menu())
+    await cb.answer()
+
+# ================= NEWS =================
+@dp.callback_query(lambda c: c.data == "news")
+async def news_cb(cb: types.CallbackQuery):
+    import random
+    pair = random.choice(PAIRS)
+    exp = random.choice(EXPIRATIONS)
+    direction, conf = await get_signal(pair, exp)
+    await cb.message.edit_text(
+        f"📰 Новость / Случайный сигнал\n"
+        f"Пара: {pair.replace('=X','')}\n"
+        f"Время экспирации: {exp} мин\n"
+        f"Направление: {direction}\n"
+        f"Уверенность: {conf:.2f}%",
+        reply_markup=result_kb()
+    )
     await cb.answer()
 
 # ================= POSTBACK =================
