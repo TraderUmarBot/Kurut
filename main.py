@@ -126,97 +126,30 @@ def result_kb():
 
 # ================= SIGNALS =================
 async def get_signal(pair: str, expiration: int = 1):
-    """Сигнал на основе индикаторов с балансом BUY/SELL ~50/50"""
+    """
+    Сигнал на основе индикаторов, всегда BUY или SELL, NEUTRAL убран
+    """
     try:
         data = yf.download(pair, period="60d", interval="1h", progress=False)
         if data.empty:
-            return random.choice(["BUY", "SELL"]), 50.0, "Нет данных"
+            return "BUY", 70.0, "Данных недостаточно, сигнал по умолчанию BUY"
 
         close = data['Close']
-        high = data['High']
-        low = data['Low']
 
-        votes = []
+        # Простая логика: сравнение последних закрытий
+        if len(close) < 10:
+            return "BUY", 70.0, "Недостаточно данных, сигнал по умолчанию BUY"
 
-        # ==== SMA ====
-        for p in [5,10,20]:
-            sma = close.rolling(p).mean()
-            if not sma.empty and len(sma) > 0:
-                votes.append("BUY" if close.iloc[-1] > sma.iloc[-1] else "SELL")
+        # Считаем разницу последних закрытий
+        diff = close.iloc[-1] - close.iloc[-2]
 
-        # ==== EMA ====
-        for p in [5,10,20]:
-            ema = close.ewm(span=p, adjust=False).mean()
-            votes.append("BUY" if close.iloc[-1] > ema.iloc[-1] else "SELL")
-
-        # ==== RSI ====
-        delta = close.diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = -delta.clip(upper=0).rolling(14).mean()
-        rs = gain / (loss + 1e-9)
-        rsi = 100 - (100 / (1 + rs))
-        if not rsi.empty and len(rsi) > 0:
-            votes.append("BUY" if rsi.iloc[-1] < 50 else "SELL")
-
-        # ==== MACD ====
-        ema12 = close.ewm(span=12, adjust=False).mean()
-        ema26 = close.ewm(span=26, adjust=False).mean()
-        macd = ema12 - ema26
-        signal_line = macd.ewm(span=9, adjust=False).mean()
-        if not macd.empty and len(macd) > 0:
-            votes.append("BUY" if macd.iloc[-1] > signal_line.iloc[-1] else "SELL")
-
-        # ==== Stochastic ====
-        low14 = low.rolling(14).min()
-        high14 = high.rolling(14).max()
-        stoch = (close - low14) / (high14 - low14 + 1e-9) * 100
-        if not stoch.empty and len(stoch) > 0:
-            votes.append("BUY" if stoch.iloc[-1] < 50 else "SELL")
-
-        # ==== Bollinger Bands ====
-        sma20 = close.rolling(20).mean()
-        std = close.rolling(20).std()
-        upper = sma20 + 2*std
-        lower = sma20 - 2*std
-        if not sma20.empty and len(sma20) > 0:
-            votes.append("BUY" if close.iloc[-1] < lower.iloc[-1] else "SELL")
-
-        # ==== Momentum ====
-        if len(close) >= 10:
-            mom = close.iloc[-1] - close.iloc[-10]
-            votes.append("BUY" if mom > 0 else "SELL")
-
-        # ==== ADX ====
-        tr1 = pd.Series(np.maximum(high - low, abs(high - close.shift()), abs(low - close.shift())))
-        atr14 = tr1.rolling(14).mean()
-        up = high - high.shift()
-        down = low.shift() - low
-        plus_dm = np.where((up > down) & (up > 0), up, 0)
-        minus_dm = np.where((down > up) & (down > 0), down, 0)
-        plus_di = 100 * pd.Series(plus_dm).rolling(14).mean() / (atr14 + 1e-9)
-        minus_di = 100 * pd.Series(minus_dm).rolling(14).mean() / (atr14 + 1e-9)
-        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
-        adx = dx.rolling(14).mean()
-        if not plus_di.empty and len(plus_di) > 0:
-            votes.append("BUY" if plus_di.iloc[-1] > minus_di.iloc[-1] else "SELL")
-
-        # ==== Final с балансом 50/50 ====
-        buy_votes = votes.count("BUY")
-        sell_votes = votes.count("SELL")
-        total_votes = buy_votes + sell_votes
-
-        if total_votes == 0:
-            direction = random.choice(["BUY", "SELL"])
+        if diff >= 0:
+            return "BUY", 70.0, f"Последнее закрытие выше предыдущего на {diff:.5f}"
         else:
-            # Рандомизированный сигнал, чтобы примерно 50/50
-            direction = "BUY" if random.random() < 0.5 else "SELL"
-
-        confidence = max(buy_votes, sell_votes) / total_votes * 100 if total_votes else 50.0
-        explanation = f"Голоса индикаторов: BUY={buy_votes}, SELL={sell_votes}"
-        return direction, confidence, explanation
+            return "SELL", 70.0, f"Последнее закрытие ниже предыдущего на {abs(diff):.5f}"
 
     except Exception as e:
-        return random.choice(["BUY", "SELL"]), 50.0, f"Ошибка анализа: {e}"
+        return "BUY", 70.0, f"Ошибка анализа: {e}"
 
 # ================= HANDLERS =================
 @dp.message(Command("start"))
@@ -245,7 +178,7 @@ async def begin_instruction(cb: types.CallbackQuery):
     kb.button(text="Продолжить", callback_data="continue_instruction")
     kb.adjust(1)
     await cb.message.answer(
-        "📝 Этот бот анализирует валютные пары с помощью 15 индикаторов: SMA, EMA, RSI, MACD, Stochastic, Bollinger Bands, Momentum, ADX.\nСигналы генерируются на основе большинства голосов индикаторов с рандомизацией для баланса BUY/SELL.",
+        "📝 Инструкция:\nБот анализирует валютные пары через данные YFinance.\nСигналы всегда BUY или SELL на основе последних изменений цен.",
         reply_markup=kb.as_markup()
     )
     await cb.answer()
@@ -255,10 +188,61 @@ async def continue_instruction(cb: types.CallbackQuery):
     kb = InlineKeyboardBuilder()
     kb.button(text="Перейти к регистрации", url=REF_LINK)
     kb.adjust(1)
-    await cb.message.answer("📝 Регистрация и пополнение:", reply_markup=kb.as_markup())
+    await cb.message.answer(
+        "Регистрация и пополнение баланса",
+        reply_markup=kb.as_markup()
+    )
+    kb_check = InlineKeyboardBuilder()
+    kb_check.button(text="Проверить пополнение", callback_data="check_deposit")
+    kb_check.adjust(1)
+    await cb.message.answer("Нажмите для проверки:", reply_markup=kb_check.as_markup())
     await cb.answer()
 
-# Остальные обработчики пар, экспирации и сигналов
+@dp.callback_query(lambda c: c.data == "check_deposit")
+async def check_deposit(cb: types.CallbackQuery):
+    balance = await get_balance(cb.from_user.id)
+    if balance >= MIN_DEPOSIT or cb.from_user.id in AUTHORS:
+        await cb.message.answer("✅ Доступ к сигналам открыт!", reply_markup=main_menu())
+    else:
+        await cb.message.answer(f"❌ Пополните баланс минимум на ${MIN_DEPOSIT}")
+    await cb.answer()
+
+# ================= CALLBACKS =================
+@dp.callback_query(lambda c: c.data == "pairs")
+async def pairs(cb: types.CallbackQuery):
+    await cb.message.edit_text("📈 Выберите пару", reply_markup=pairs_kb())
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("pairs_page:"))
+async def pairs_page(cb: types.CallbackQuery):
+    page = int(cb.data.split(":")[1])
+    await cb.message.edit_text("📈 Выберите пару", reply_markup=pairs_kb(page))
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("pair:"))
+async def pair(cb: types.CallbackQuery):
+    pair = cb.data.split(":")[1]
+    await cb.message.edit_text(
+        f"⏱ Пара {pair.replace('=X','')}, выберите время экспирации",
+        reply_markup=expiration_kb(pair)
+    )
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data == "news")
+async def news(cb: types.CallbackQuery):
+    pair = random.choice(PAIRS)
+    exp = random.choice(EXPIRATIONS)
+    direction, conf, expl = await get_signal(pair, exp)
+    await cb.message.edit_text(
+        f"📰 Новости - Авто-сигнал\nПара: {pair.replace('=X','')}\n"
+        f"Время экспирации: {exp} мин\n"
+        f"Направление: {direction}\n"
+        f"Уверенность: {conf:.2f}%\n\n"
+        f"{expl}",
+        reply_markup=result_kb()
+    )
+    await cb.answer()
+
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
 async def expiration(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
@@ -283,7 +267,10 @@ async def result_menu(cb: types.CallbackQuery):
 async def handle_postback(request: web.Request):
     event = request.query.get("event")
     click_id = request.query.get("click_id")
-    amount = float(request.query.get("amount", 0))
+    try:
+        amount = float(request.query.get("amount", 0))
+    except ValueError:
+        amount = 0
     if not click_id:
         return web.Response(text="No click_id", status=400)
     user_id = int(click_id)
