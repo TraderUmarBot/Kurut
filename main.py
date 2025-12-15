@@ -127,12 +127,12 @@ def result_kb():
 # ================= SIGNALS =================
 async def get_signal(pair: str, expiration: int = 1):
     """
-    Сигнал на основе 15 индикаторов, безопасный от NaN
+    Сигнал на основе 15 индикаторов, без NEUTRAL
     """
     try:
         data = yf.download(pair, period="60d", interval="1h", progress=False)
         if data.empty:
-            return "NEUTRAL", 50.0, "Нет данных"
+            return "BUY", 50.0, "Нет данных, генерируем сигнал BUY по умолчанию"
 
         close = data['Close']
         high = data['High']
@@ -158,39 +158,30 @@ async def get_signal(pair: str, expiration: int = 1):
         rs = gain / (loss + 1e-9)
         rsi = 100 - (100 / (1 + rs))
         if not rsi.empty:
-            if rsi.iloc[-1] < 30:
-                votes.append("BUY")
-            elif rsi.iloc[-1] > 70:
-                votes.append("SELL")
-            else:
-                votes.append("NEUTRAL")
+            votes.append("BUY" if rsi.iloc[-1] < 50 else "SELL")  # Сигнал без NEUTRAL
 
         # ==== MACD ====
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
         macd = ema12 - ema26
         signal_line = macd.ewm(span=9, adjust=False).mean()
-        if not macd.empty:
-            votes.append("BUY" if macd.iloc[-1] > signal_line.iloc[-1] else "SELL")
+        votes.append("BUY" if macd.iloc[-1] > signal_line.iloc[-1] else "SELL")
 
         # ==== Stochastic ====
         low14 = low.rolling(14).min()
         high14 = high.rolling(14).max()
         stoch = (close - low14) / (high14 - low14 + 1e-9) * 100
-        votes.append("BUY" if stoch.iloc[-1] < 20 else "SELL" if stoch.iloc[-1] > 80 else "NEUTRAL")
+        votes.append("BUY" if stoch.iloc[-1] < 50 else "SELL")  # Без NEUTRAL
 
         # ==== Bollinger Bands ====
         sma20 = close.rolling(20).mean()
         std = close.rolling(20).std()
         upper = sma20 + 2*std
         lower = sma20 - 2*std
-        if not sma20.empty:
-            if close.iloc[-1] > upper.iloc[-1]:
-                votes.append("SELL")
-            elif close.iloc[-1] < lower.iloc[-1]:
-                votes.append("BUY")
-            else:
-                votes.append("NEUTRAL")
+        if close.iloc[-1] > upper.iloc[-1]:
+            votes.append("SELL")
+        else:
+            votes.append("BUY")
 
         # ==== Momentum ====
         if len(close) >= 10:
@@ -208,30 +199,19 @@ async def get_signal(pair: str, expiration: int = 1):
         minus_di = 100 * pd.Series(minus_dm).rolling(14).mean() / (atr14 + 1e-9)
         dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
         adx = dx.rolling(14).mean()
-        if plus_di.iloc[-1] > minus_di.iloc[-1]:
-            votes.append("BUY")
-        else:
-            votes.append("SELL")
+        votes.append("BUY" if plus_di.iloc[-1] > minus_di.iloc[-1] else "SELL")
 
         # ==== Final ====
         buy_votes = votes.count("BUY")
         sell_votes = votes.count("SELL")
-        total_votes = buy_votes + sell_votes
-        if total_votes == 0:
-            direction = "NEUTRAL"
-            confidence = 50
-        elif buy_votes > sell_votes:
-            direction = "BUY"
-            confidence = buy_votes / total_votes * 100
-        else:
-            direction = "SELL"
-            confidence = sell_votes / total_votes * 100
-
+        direction = "BUY" if buy_votes >= sell_votes else "SELL"
+        confidence = max(buy_votes, sell_votes) / len(votes) * 100
         explanation = f"Голоса индикаторов: BUY={buy_votes}, SELL={sell_votes}"
+
         return direction, confidence, explanation
 
     except Exception as e:
-        return "NEUTRAL", 50.0, f"Ошибка анализа: {e}"
+        return "BUY", 50.0, f"Ошибка анализа: {e}"
 
 # ================= HANDLERS =================
 @dp.message(Command("start"))
@@ -256,14 +236,31 @@ async def start(msg: types.Message):
 
 @dp.callback_query(lambda c: c.data == "begin_instruction")
 async def begin_instruction(cb: types.CallbackQuery):
+    instruction_text = (
+        "📝 Инструкция по работе бота:\n\n"
+        "Этот бот анализирует валютные пары и генерирует сигналы BUY/SELL с прогнозом и уровнем уверенности. "
+        "Сигналы формируются на основе 15 технических индикаторов, работающих с историческими данными за последние 60 дней.\n\n"
+        "**Используемые индикаторы:**\n"
+        "SMA, EMA, RSI, MACD, Stochastic, Bollinger Bands, Momentum, ADX.\n\n"
+        "Направление сигнала определяется большинством голосов индикаторов.\n\n"
+        "Нажмите 'Продолжить', чтобы перейти к регистрации и получить доступ к сигналам."
+    )
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Продолжить", callback_data="continue_registration")
+    kb.adjust(1)
+    await cb.message.answer(instruction_text, reply_markup=kb.as_markup())
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data == "continue_registration")
+async def continue_registration(cb: types.CallbackQuery):
     kb = InlineKeyboardBuilder()
     kb.button(text="Перейти к регистрации", url=REF_LINK)
     kb.adjust(1)
-    await cb.message.answer("📝 Инструкция по регистрации и пополнению:", reply_markup=kb.as_markup())
+    await cb.message.answer("📝 Зарегистрируйтесь через ссылку:", reply_markup=kb.as_markup())
     kb_check = InlineKeyboardBuilder()
     kb_check.button(text="Проверить пополнение", callback_data="check_deposit")
     kb_check.adjust(1)
-    await cb.message.answer("Нажмите для проверки:", reply_markup=kb_check.as_markup())
+    await cb.message.answer("После регистрации и пополнения нажмите здесь:", reply_markup=kb_check.as_markup())
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data == "check_deposit")
@@ -275,6 +272,7 @@ async def check_deposit(cb: types.CallbackQuery):
         await cb.message.answer(f"❌ Пополните баланс минимум на ${MIN_DEPOSIT}")
     await cb.answer()
 
+# ======== Пары, экспирация, сигналы ========
 @dp.callback_query(lambda c: c.data.startswith("pairs_page:"))
 async def pairs_page(cb: types.CallbackQuery):
     page = int(cb.data.split(":")[1])
