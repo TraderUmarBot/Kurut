@@ -3,6 +3,7 @@ import sys
 import asyncio
 import logging
 from datetime import datetime
+from collections import Counter
 
 import asyncpg
 from aiogram import Bot, Dispatcher, types
@@ -76,7 +77,7 @@ async def init_db():
             pair TEXT,
             timeframe INT,
             direction TEXT,
-            confidence FLOAT DEFAULT 0,
+            confidence FLOAT,
             explanation TEXT,
             result TEXT
         );
@@ -164,29 +165,38 @@ def result_kb(trade_id):
     return kb.as_markup()
 
 # ===================== SIGNALS =====================
+TF_MAP = {
+    "1": Interval.INTERVAL_1_MINUTE,
+    "2": Interval.INTERVAL_2_MINUTES,
+    "5": Interval.INTERVAL_5_MINUTES,
+    "15": Interval.INTERVAL_15_MINUTES
+}
+
 async def get_signal_tv(pair: str, tf: str):
-    tf_map = {"1m": Interval.INTERVAL_1_MINUTE,
-              "2m": Interval.INTERVAL_5_MINUTES,  # 2m нет в TA, берем 5m
-              "5m": Interval.INTERVAL_5_MINUTES,
-              "15m": Interval.INTERVAL_15_MINUTES}
-    interval_tv = tf_map.get(tf, Interval.INTERVAL_5_MINUTES)
+    interval = TF_MAP.get(tf, Interval.INTERVAL_5_MINUTES)
 
     handler = TA_Handler(
         symbol=pair,
         screener="forex",
         exchange="FX_IDC",
-        interval=interval_tv
+        interval=interval
     )
+
     try:
         analysis = await asyncio.to_thread(handler.get_analysis)
+
+        if not analysis.indicators:
+            return "NEUTRAL", 0.0, "Свечи ещё не сформированы или недостаточно данных"
+
         direction = analysis.summary.get("RECOMMENDATION", "NEUTRAL")
-        indicators_count = len(analysis.indicators)
-        conf = min(100.0, 50.0 + indicators_count)
-        expl = f"Сигнал TradingView: {direction}\nИндикаторы: {', '.join(analysis.indicators.keys())}"
+        indicators = analysis.indicators
+        conf = 50 + min(len([v for v in indicators.values() if v]), 50)
+        expl = f"Сигнал TradingView: {direction}\nИндикаторы: {', '.join(indicators.keys())}"
+
         return direction, conf, expl
+
     except Exception as e:
-        logging.error(f"Ошибка TradingView: {e}")
-        return "NEUTRAL", 0.0, f"Ошибка анализа: {e}"
+        return "NEUTRAL", 0.0, f"Ошибка получения сигнала: {e}"
 
 # ===================== HANDLERS =====================
 @dp.message(Command("start"))
@@ -260,24 +270,24 @@ async def pair(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("tf:"))
 async def tf(cb: types.CallbackQuery):
     _, pair, tf = cb.data.split(":")
-    tf_map_user = {"1": "1m", "2": "2m", "5": "5m", "15": "15m"}
-    tf_tv = tf_map_user.get(tf, "5m")
+    tf_map = {"1": "1", "2": "2", "5": "5", "15": "15"}
+    tf_tv = tf_map.get(tf, "5")
 
     try:
-        direction, conf, expl = await get_signal_tv(pair.replace("=X", ""), tf_tv)
+        direction, conf, expl = await get_signal_tv(pair.replace("=X",""), tf_tv)
     except Exception as e:
         await cb.message.answer(f"Ошибка получения сигнала: {e}")
         await cb.answer()
         return
 
-    trade_id = await save_trade(cb.from_user.id, pair.replace("=X", ""), int(tf), direction, conf, expl)
+    trade_id = await save_trade(cb.from_user.id, pair.replace("=X",""), int(tf), direction, conf, expl)
 
     await cb.message.edit_text(
         f"📊 Сигнал\n\n"
         f"Пара: {pair.replace('=X','')}\n"
         f"TF: {tf} мин\n"
         f"Направление: {direction}\n"
-        f"Уверенность: {conf:.1f}%\n\n"
+        f"Уверенность: {conf}%\n\n"
         f"{expl}",
         reply_markup=result_kb(trade_id)
     )
