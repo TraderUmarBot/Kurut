@@ -17,7 +17,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web
-import aiogram.exceptions
 
 # ================= CONFIG =================
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -122,14 +121,14 @@ def result_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ ПЛЮС", callback_data="menu")
     kb.button(text="❌ МИНУС", callback_data="menu")
-    kb.button(text="🔄 Обновить сигнал", callback_data="refresh_signal")
     kb.adjust(2)
     return kb.as_markup()
 
 # ================= SIGNALS =================
 async def get_signal(pair: str, expiration: int = 1):
     """
-    Сигнал на основе индикаторов, безопасный от NaN
+    Сигнал на основе 8 индикаторов, безопасный от NaN.
+    Возвращает direction, confidence, explanation
     """
     try:
         data = yf.download(pair, period="60d", interval="1h", progress=False)
@@ -145,7 +144,7 @@ async def get_signal(pair: str, expiration: int = 1):
         # ==== SMA ====
         for p in [5,10,20]:
             sma = close.rolling(p).mean().dropna()
-            if len(sma) > 0:
+            if not sma.empty:
                 votes.append("BUY" if close.iloc[-1] > sma.iloc[-1] else "SELL")
 
         # ==== EMA ====
@@ -160,12 +159,7 @@ async def get_signal(pair: str, expiration: int = 1):
         rs = gain / (loss + 1e-9)
         rsi = 100 - (100 / (1 + rs))
         if not rsi.empty:
-            if rsi.iloc[-1] < 30:
-                votes.append("BUY")
-            elif rsi.iloc[-1] > 70:
-                votes.append("SELL")
-            else:
-                votes.append("NEUTRAL")
+            votes.append("BUY" if rsi.iloc[-1] < 30 else "SELL" if rsi.iloc[-1] > 70 else "BUY")  # минимизируем NEUTRAL
 
         # ==== MACD ====
         ema12 = close.ewm(span=12, adjust=False).mean()
@@ -179,7 +173,7 @@ async def get_signal(pair: str, expiration: int = 1):
         low14 = low.rolling(14).min()
         high14 = high.rolling(14).max()
         stoch = (close - low14) / (high14 - low14 + 1e-9) * 100
-        votes.append("BUY" if stoch.iloc[-1] < 20 else "SELL" if stoch.iloc[-1] > 80 else "NEUTRAL")
+        votes.append("BUY" if stoch.iloc[-1] < 50 else "SELL")  # убираем NEUTRAL
 
         # ==== Bollinger Bands ====
         sma20 = close.rolling(20).mean()
@@ -192,7 +186,7 @@ async def get_signal(pair: str, expiration: int = 1):
             elif close.iloc[-1] < lower.iloc[-1]:
                 votes.append("BUY")
             else:
-                votes.append("NEUTRAL")
+                votes.append("BUY")  # вместо NEUTRAL ставим BUY для ясного сигнала
 
         # ==== Momentum ====
         if len(close) >= 10:
@@ -222,7 +216,7 @@ async def get_signal(pair: str, expiration: int = 1):
         if total_votes == 0:
             direction = "NEUTRAL"
             confidence = 50
-        elif buy_votes > sell_votes:
+        elif buy_votes >= sell_votes:
             direction = "BUY"
             confidence = buy_votes / total_votes * 100
         else:
@@ -239,7 +233,13 @@ async def get_signal(pair: str, expiration: int = 1):
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     user_id = msg.from_user.id
-    balance = await get_balance(user_id)
+
+    if user_id in AUTHORS:
+        await msg.answer(
+            "🏠 Главное меню (Авторский доступ — сигналы доступны бесплатно)",
+            reply_markup=main_menu()
+        )
+        return
 
     kb = InlineKeyboardBuilder()
     kb.button(text="Продолжить", callback_data="begin_instruction")
@@ -260,9 +260,21 @@ async def begin_instruction(cb: types.CallbackQuery):
     kb.button(text="Перейти к регистрации", url=REF_LINK)
     kb.adjust(1)
     await cb.message.answer("📝 Инструкция по регистрации и пополнению:", reply_markup=kb.as_markup())
+    kb_check = InlineKeyboardBuilder()
+    kb_check.button(text="Проверить пополнение", callback_data="check_deposit")
+    kb_check.adjust(1)
+    await cb.message.answer("Нажмите для проверки:", reply_markup=kb_check.as_markup())
     await cb.answer()
 
-# --- Остальные обработчики (pairs, pair, expiration) ---
+@dp.callback_query(lambda c: c.data == "check_deposit")
+async def check_deposit(cb: types.CallbackQuery):
+    balance = await get_balance(cb.from_user.id)
+    if balance >= MIN_DEPOSIT:
+        await cb.message.answer("✅ Доступ к сигналам открыт!", reply_markup=main_menu())
+    else:
+        await cb.message.answer(f"❌ Пополните баланс минимум на ${MIN_DEPOSIT}")
+    await cb.answer()
+
 @dp.callback_query(lambda c: c.data.startswith("pairs_page:"))
 async def pairs_page(cb: types.CallbackQuery):
     page = int(cb.data.split(":")[1])
@@ -283,38 +295,22 @@ async def pair(cb: types.CallbackQuery):
     )
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data.startswith("exp:") or c.data == "refresh_signal")
+@dp.callback_query(lambda c: c.data.startswith("exp:"))
 async def expiration(cb: types.CallbackQuery):
-    if cb.data.startswith("exp:"):
-        _, pair, exp = cb.data.split(":")
-        exp = int(exp)
-    else:
-        # Кнопка "Обновить сигнал"
-        # Берём последнюю пару и экспирацию из текста сообщения
-        lines = cb.message.text.split("\n")
-        pair = lines[1].split(":")[1].strip()
-        exp = int(lines[2].split(":")[1].strip().split()[0])
-
+    _, pair, exp = cb.data.split(":")
+    exp = int(exp)
     direction, conf, expl = await get_signal(pair, exp)
-    new_text = (
-        f"📊 Сигнал\n"
-        f"Пара: {pair}\n"
+    # Проверяем, не идентична ли информация предыдущей
+    text_new = (
+        f"📊 Сигнал\nПара: {pair.replace('=X','')}\n"
         f"Время экспирации: {exp} мин\n"
         f"Направление: {direction}\n"
         f"Уверенность: {conf:.2f}%\n\n"
         f"{expl}"
     )
-
-    try:
-        if cb.message.text != new_text:
-            await cb.message.edit_text(new_text, reply_markup=result_kb())
-        else:
-            await cb.answer("Сигнал уже показан. Обновите для нового сигнала.", show_alert=True)
-    except aiogram.exceptions.TelegramBadRequest as e:
-        if "message is not modified" in str(e):
-            await cb.answer("Сигнал уже показан. Обновите для нового сигнала.", show_alert=True)
-        else:
-            raise
+    if cb.message.text != text_new:
+        await cb.message.edit_text(text_new, reply_markup=result_kb())
+    await cb.answer()
 
 @dp.callback_query(lambda c: c.data == "news")
 async def news(cb: types.CallbackQuery):
@@ -335,7 +331,10 @@ async def news(cb: types.CallbackQuery):
 async def handle_postback(request: web.Request):
     event = request.query.get("event")
     click_id = request.query.get("click_id")
-    amount = float(request.query.get("amount", 0))
+    try:
+        amount = float(request.query.get("amount", 0))
+    except:
+        amount = 0
     if not click_id:
         return web.Response(text="No click_id", status=400)
     user_id = int(click_id)
