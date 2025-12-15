@@ -3,15 +3,12 @@ import sys
 import asyncio
 import logging
 import random
-import io
 from datetime import datetime
 
 import asyncpg
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
@@ -29,7 +26,7 @@ PORT = int(os.getenv("PORT", 10000))
 HOST = "0.0.0.0"
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
-AUTHORS = [7079260196, 6117198446]  # бесплатный доступ авторам
+AUTHORS = [7079260196, 6117198446]  # два автора
 MIN_DEPOSIT = 20.0
 
 if not TG_TOKEN or not DATABASE_URL or not RENDER_EXTERNAL_HOSTNAME:
@@ -128,81 +125,80 @@ def result_kb():
     return kb.as_markup()
 
 # ================= SIGNALS =================
-async def get_signal_with_chart(pair: str, expiration: int = 1):
+async def get_signal(pair: str, expiration: int = 1):
+    """
+    Максимально точный сигнал на основе 7 индикаторов.
+    Всегда BUY или SELL, NEUTRAL исключен.
+    """
     try:
-        data = yf.download(pair, period="60d", interval="1h", progress=False)
-        if data.empty or len(data) < 20:
-            direction = random.choice(["BUY","SELL"])
-            confidence = 60.0
-            explanation = "Недостаточно данных, сигнал по умолчанию"
-        else:
-            close = data['Close']
-            high = data['High']
-            low = data['Low']
-            votes = []
+        data = yf.download(pair, period="90d", interval="1h", progress=False)
+        if data.empty or len(data) < 30:
+            return "BUY", 70.0, "Недостаточно данных, сигнал по умолчанию BUY"
 
-            # ==== Индикаторы ====
-            for p in [5,10,20]:
-                sma = close.rolling(p).mean()
-                votes.append("BUY" if close.iloc[-1] > sma.iloc[-1] else "SELL")
+        close = data['Close']
+        high = data['High']
+        low = data['Low']
 
-            for p in [5,10,20]:
-                ema = close.ewm(span=p, adjust=False).mean()
-                votes.append("BUY" if close.iloc[-1] > ema.iloc[-1] else "SELL")
+        votes = []
 
-            delta = close.diff()
-            gain = delta.clip(lower=0).rolling(14).mean()
-            loss = -delta.clip(upper=0).rolling(14).mean()
-            rs = gain / (loss + 1e-9)
-            rsi = 100 - (100/(1+rs))
-            votes.append("BUY" if rsi.iloc[-1] > 50 else "SELL")
+        # ===== SMA =====
+        for p in [5,10,20]:
+            sma = close.rolling(p).mean()
+            votes.append("BUY" if close.iloc[-1] > sma.iloc[-1] else "SELL")
 
-            ema12 = close.ewm(span=12, adjust=False).mean()
-            ema26 = close.ewm(span=26, adjust=False).mean()
-            macd = ema12 - ema26
-            signal_line = macd.ewm(span=9, adjust=False).mean()
-            votes.append("BUY" if macd.iloc[-1] > signal_line.iloc[-1] else "SELL")
+        # ===== EMA =====
+        for p in [5,10,20]:
+            ema = close.ewm(span=p, adjust=False).mean()
+            votes.append("BUY" if close.iloc[-1] > ema.iloc[-1] else "SELL")
 
-            low14 = low.rolling(14).min()
-            high14 = high.rolling(14).max()
-            stoch = (close - low14) / (high14 - low14 + 1e-9) * 100
-            votes.append("BUY" if stoch.iloc[-1] < 50 else "SELL")
+        # ===== RSI =====
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = -delta.clip(upper=0).rolling(14).mean()
+        rs = gain / (loss + 1e-9)
+        rsi = 100 - (100 / (1 + rs))
+        votes.append("BUY" if rsi.iloc[-1] < 40 else "SELL")
 
-            sma20 = close.rolling(20).mean()
-            std = close.rolling(20).std()
-            upper = sma20 + 2*std
-            lower = sma20 - 2*std
-            votes.append("SELL" if close.iloc[-1] > upper.iloc[-1] else "BUY")
+        # ===== MACD =====
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd = ema12 - ema26
+        signal_line = macd.ewm(span=9, adjust=False).mean()
+        votes.append("BUY" if macd.iloc[-1] > signal_line.iloc[-1] else "SELL")
 
-            mom = close.iloc[-1] - close.iloc[-10]
-            votes.append("BUY" if mom > 0 else "SELL")
+        # ===== Stochastic =====
+        low14 = low.rolling(14).min()
+        high14 = high.rolling(14).max()
+        K = 100 * (close - low14) / (high14 - low14 + 1e-9)
+        D = K.rolling(3).mean()
+        votes.append("BUY" if K.iloc[-1] > D.iloc[-1] else "SELL")
 
-            buy_votes = votes.count("BUY")
-            sell_votes = votes.count("SELL")
-            direction = "BUY" if buy_votes >= sell_votes else "SELL"
-            confidence = max(buy_votes, sell_votes) / len(votes) * 100
-            explanation = f"Голоса индикаторов: BUY={buy_votes}, SELL={sell_votes}"
+        # ===== ADX =====
+        tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm < 0] = 0
+        tr14 = tr.rolling(14).sum()
+        plus_di = 100 * (plus_dm.rolling(14).sum() / tr14)
+        minus_di = 100 * (minus_dm.rolling(14).sum() / tr14)
+        votes.append("BUY" if plus_di.iloc[-1] > minus_di.iloc[-1] else "SELL")
 
-        # ==== Построение графика ====
-        fig, ax = plt.subplots(figsize=(6,3))
-        ax.plot(data['Close'][-30:], label='Close', color='blue')
-        ax.set_title(f"{pair.replace('=X','')} - последние 30 свечей")
-        ax.set_xlabel("Время")
-        ax.set_ylabel("Цена")
-        ax.grid(True)
-        buf = io.BytesIO()
-        plt.tight_layout()
-        plt.savefig(buf, format='png')
-        buf.seek(0)
-        plt.close(fig)
+        # ===== Momentum =====
+        mom = close.iloc[-1] - close.iloc[-5]
+        votes.append("BUY" if mom > 0 else "SELL")
 
-        return direction, confidence, explanation, buf
+        # ===== Final decision =====
+        buy_votes = votes.count("BUY")
+        sell_votes = votes.count("SELL")
+        direction = "BUY" if buy_votes >= sell_votes else "SELL"
+        confidence = max(buy_votes, sell_votes) / len(votes) * 100
+        explanation = f"Голоса индикаторов: BUY={buy_votes}, SELL={sell_votes}"
+
+        return direction, confidence, explanation
 
     except Exception as e:
-        direction = random.choice(["BUY","SELL"])
-        confidence = 60.0
-        explanation = f"Ошибка анализа: {e}"
-        return direction, confidence, explanation, None
+        return "BUY", 70.0, f"Ошибка анализа: {e}"
 
 # ================= HANDLERS =================
 @dp.message(Command("start"))
@@ -227,24 +223,24 @@ async def start(msg: types.Message):
 
 @dp.callback_query(lambda c: c.data == "begin_instruction")
 async def begin_instruction(cb: types.CallbackQuery):
-    explanation = (
-        "📌 Бот анализирует валютные пары с использованием более 15 индикаторов:\n"
-        "- SMA, EMA, RSI, MACD, Stochastic, Bollinger, Momentum и др.\n"
-        "⚡ Сигналы всегда BUY или SELL, NEUTRAL нет.\n"
-        "🔹 После нажатия ПЛЮС/МИНУС вы возвращаетесь в главное меню."
-    )
     kb = InlineKeyboardBuilder()
-    kb.button(text="Продолжить", callback_data="begin_registration")
+    kb.button(text="Продолжить", callback_data="continue_instruction")
     kb.adjust(1)
-    await cb.message.answer(explanation, reply_markup=kb.as_markup())
+    await cb.message.answer(
+        "📝 Инструкция:\nБот анализирует валютные пары через данные YFinance.\nСигналы всегда BUY или SELL на основе последних изменений цен.",
+        reply_markup=kb.as_markup()
+    )
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data == "begin_registration")
-async def begin_registration(cb: types.CallbackQuery):
+@dp.callback_query(lambda c: c.data == "continue_instruction")
+async def continue_instruction(cb: types.CallbackQuery):
     kb = InlineKeyboardBuilder()
     kb.button(text="Перейти к регистрации", url=REF_LINK)
     kb.adjust(1)
-    await cb.message.answer("📝 Регистрация и пополнение:", reply_markup=kb.as_markup())
+    await cb.message.answer(
+        "Регистрация и пополнение баланса",
+        reply_markup=kb.as_markup()
+    )
     kb_check = InlineKeyboardBuilder()
     kb_check.button(text="Проверить пополнение", callback_data="check_deposit")
     kb_check.adjust(1)
@@ -253,35 +249,46 @@ async def begin_registration(cb: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "check_deposit")
 async def check_deposit(cb: types.CallbackQuery):
-    if cb.from_user.id in AUTHORS:
-        await cb.message.answer("✅ Доступ к сигналам открыт (автор)", reply_markup=main_menu())
-        await cb.answer()
-        return
-
     balance = await get_balance(cb.from_user.id)
-    if balance >= MIN_DEPOSIT:
+    if balance >= MIN_DEPOSIT or cb.from_user.id in AUTHORS:
         await cb.message.answer("✅ Доступ к сигналам открыт!", reply_markup=main_menu())
     else:
         await cb.message.answer(f"❌ Пополните баланс минимум на ${MIN_DEPOSIT}")
     await cb.answer()
 
+# ================= CALLBACKS =================
+@dp.callback_query(lambda c: c.data == "pairs")
+async def pairs(cb: types.CallbackQuery):
+    await cb.message.edit_text("📈 Выберите пару", reply_markup=pairs_kb())
+    await cb.answer()
+
 @dp.callback_query(lambda c: c.data.startswith("pairs_page:"))
 async def pairs_page(cb: types.CallbackQuery):
     page = int(cb.data.split(":")[1])
-    await cb.message.edit_text("📈 Выбери пару", reply_markup=pairs_kb(page))
-    await cb.answer()
-
-@dp.callback_query(lambda c: c.data == "pairs")
-async def pairs(cb: types.CallbackQuery):
-    await cb.message.edit_text("📈 Выбери пару", reply_markup=pairs_kb())
+    await cb.message.edit_text("📈 Выберите пару", reply_markup=pairs_kb(page))
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
 async def pair(cb: types.CallbackQuery):
     pair = cb.data.split(":")[1]
     await cb.message.edit_text(
-        f"⏱ Пара {pair.replace('=X','')}, выбери время экспирации",
+        f"⏱ Пара {pair.replace('=X','')}, выберите время экспирации",
         reply_markup=expiration_kb(pair)
+    )
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data == "news")
+async def news(cb: types.CallbackQuery):
+    pair = random.choice(PAIRS)
+    exp = random.choice(EXPIRATIONS)
+    direction, conf, expl = await get_signal(pair, exp)
+    await cb.message.edit_text(
+        f"📰 Новости - Авто-сигнал\nПара: {pair.replace('=X','')}\n"
+        f"Время экспирации: {exp} мин\n"
+        f"Направление: {direction}\n"
+        f"Уверенность: {conf:.2f}%\n\n"
+        f"{expl}",
+        reply_markup=result_kb()
     )
     await cb.answer()
 
@@ -289,73 +296,20 @@ async def pair(cb: types.CallbackQuery):
 async def expiration(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
     exp = int(exp)
-    direction, conf, expl, chart_buf = await get_signal_with_chart(pair, exp)
-
-    kb_result = InlineKeyboardBuilder()
-    kb_result.button(text="✅ ПЛЮС", callback_data="menu")
-    kb_result.button(text="❌ МИНУС", callback_data="menu")
-    kb_result.adjust(2)
-
-    if chart_buf:
-        await cb.message.answer_photo(
-            photo=chart_buf,
-            caption=(
-                f"📊 Сигнал\nПара: {pair.replace('=X','')}\n"
-                f"Время экспирации: {exp} мин\n"
-                f"Направление: {direction}\n"
-                f"Уверенность: {conf:.2f}%\n\n"
-                f"{expl}"
-            ),
-            reply_markup=kb_result.as_markup()
-        )
-    else:
-        await cb.message.answer(
-            f"📊 Сигнал\nПара: {pair.replace('=X','')}\n"
-            f"Время экспирации: {exp} мин\n"
-            f"Направление: {direction}\n"
-            f"Уверенность: {conf:.2f}%\n\n"
-            f"{expl}",
-            reply_markup=kb_result.as_markup()
-        )
-    await cb.answer()
-
-@dp.callback_query(lambda c: c.data == "news")
-async def news(cb: types.CallbackQuery):
-    pair = random.choice(PAIRS)
-    exp = random.choice(EXPIRATIONS)
-    direction, conf, expl, chart_buf = await get_signal_with_chart(pair, exp)
-
-    kb_result = InlineKeyboardBuilder()
-    kb_result.button(text="✅ ПЛЮС", callback_data="menu")
-    kb_result.button(text="❌ МИНУС", callback_data="menu")
-    kb_result.adjust(2)
-
-    if chart_buf:
-        await cb.message.answer_photo(
-            photo=chart_buf,
-            caption=(
-                f"📰 Новости - Авто-сигнал\nПара: {pair.replace('=X','')}\n"
-                f"Время экспирации: {exp} мин\n"
-                f"Направление: {direction}\n"
-                f"Уверенность: {conf:.2f}%\n\n"
-                f"{expl}"
-            ),
-            reply_markup=kb_result.as_markup()
-        )
-    else:
-        await cb.message.answer(
-            f"📰 Новости - Авто-сигнал\nПара: {pair.replace('=X','')}\n"
-            f"Время экспирации: {exp} мин\n"
-            f"Направление: {direction}\n"
-            f"Уверенность: {conf:.2f}%\n\n"
-            f"{expl}",
-            reply_markup=kb_result.as_markup()
-        )
+    direction, conf, expl = await get_signal(pair, exp)
+    await cb.message.edit_text(
+        f"📊 Сигнал\nПара: {pair.replace('=X','')}\n"
+        f"Время экспирации: {exp} мин\n"
+        f"Направление: {direction}\n"
+        f"Уверенность: {conf:.2f}%\n\n"
+        f"{expl}",
+        reply_markup=result_kb()
+    )
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data == "menu")
-async def menu(cb: types.CallbackQuery):
-    await cb.message.answer("🏠 Главное меню", reply_markup=main_menu())
+async def result_menu(cb: types.CallbackQuery):
+    await cb.message.edit_text("🏠 Главное меню", reply_markup=main_menu())
     await cb.answer()
 
 # ================= POSTBACK =================
@@ -364,7 +318,7 @@ async def handle_postback(request: web.Request):
     click_id = request.query.get("click_id")
     try:
         amount = float(request.query.get("amount", 0))
-    except:
+    except ValueError:
         amount = 0
     if not click_id:
         return web.Response(text="No click_id", status=400)
