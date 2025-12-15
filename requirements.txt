@@ -1,7 +1,6 @@
 aiogram
 asyncpg
 aiohttp
-tradingview-ta
 yfinance
 numpy
 pandas
