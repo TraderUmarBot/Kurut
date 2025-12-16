@@ -161,70 +161,73 @@ def result_kb():
 
 # ================= INDICATORS =================
 
-def calculate_indicators(df: pd.DataFrame) -> list[str]:
-    df = df.bfill().ffill()  # безопасное заполнение NaN
-    votes = []
+async def get_signal(pair: str) -> Tuple[Optional[str], Optional[float]]:
+    """
+    Получает сигнал по валютной паре.
+    Возвращает направление ("ВВЕРХ 📈" / "ВНИЗ 📉") и уверенность в %.
+    """
 
-    close = df["Close"]
-    high = df["High"]
-    low = df["Low"]
-    volume = df["Volume"]
+    def calculate_indicators(df: pd.DataFrame) -> list[str]:
+        df = df.bfill().ffill()  # безопасное заполнение NaN
+        votes = []
 
-    # SMA
-    sma10 = close.rolling(10).mean().iloc[-1] or close.iloc[-1]
-    sma20 = close.rolling(20).mean().iloc[-1] or close.iloc[-1]
-    votes.append("BUY" if close.iloc[-1] > sma10 else "SELL")
-    votes.append("BUY" if close.iloc[-1] > sma20 else "SELL")
+        close = df["Close"]
+        high = df["High"]
+        low = df["Low"]
+        volume = df["Volume"]
 
-    # EMA
-    ema10 = close.ewm(span=10).mean().iloc[-1] or close.iloc[-1]
-    ema20 = close.ewm(span=20).mean().iloc[-1] or close.iloc[-1]
-    votes.append("BUY" if close.iloc[-1] > ema10 else "SELL")
-    votes.append("BUY" if close.iloc[-1] > ema20 else "SELL")
+        def safe_last(series, default=0):
+            val = series.iloc[-1]
+            return val if pd.notna(val) else default
 
-    # RSI
-    delta = close.diff().fillna(0)
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rsi = 100 - (100 / (1 + gain / loss))
-    votes.append("BUY" if (rsi.iloc[-1] if pd.notna(rsi.iloc[-1]) else 0) > 50 else "SELL")
+        # SMA
+        votes.append("BUY" if safe_last(close) > safe_last(close.rolling(10).mean(), close.iloc[-1]) else "SELL")
+        votes.append("BUY" if safe_last(close) > safe_last(close.rolling(20).mean(), close.iloc[-1]) else "SELL")
 
-    # MACD
-    macd = close.ewm(span=12).mean() - close.ewm(span=26).mean()
-    votes.append("BUY" if (macd.iloc[-1] if pd.notna(macd.iloc[-1]) else 0) > 0 else "SELL")
+        # EMA
+        votes.append("BUY" if safe_last(close) > safe_last(close.ewm(span=10).mean(), close.iloc[-1]) else "SELL")
+        votes.append("BUY" if safe_last(close) > safe_last(close.ewm(span=20).mean(), close.iloc[-1]) else "SELL")
 
-    # Stochastic
-    low14 = low.rolling(14).min()
-    high14 = high.rolling(14).max()
-    stoch = 100 * (close - low14) / (high14 - low14)
-    votes.append("BUY" if (stoch.iloc[-1] if pd.notna(stoch.iloc[-1]) else 0) > 50 else "SELL")
+        # RSI
+        delta = close.diff().fillna(0)
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rsi = 100 - (100 / (1 + gain / loss))
+        votes.append("BUY" if safe_last(rsi) > 50 else "SELL")
 
-    # Momentum
-    momentum = close.diff(5).iloc[-1] if pd.notna(close.diff(5).iloc[-1]) else 0
-    votes.append("BUY" if momentum > 0 else "SELL")
+        # MACD
+        macd = close.ewm(span=12).mean() - close.ewm(span=26).mean()
+        votes.append("BUY" if safe_last(macd) > 0 else "SELL")
 
-    # CCI
-    tp = (high + low + close) / 3
-    cci = (tp - tp.rolling(20).mean()) / (0.015 * tp.rolling(20).std())
-    votes.append("BUY" if (cci.iloc[-1] if pd.notna(cci.iloc[-1]) else 0) > 0 else "SELL")
+        # Stochastic
+        low14 = low.rolling(14).min()
+        high14 = high.rolling(14).max()
+        stoch = 100 * (close - low14) / (high14 - low14)
+        votes.append("BUY" if safe_last(stoch) > 50 else "SELL")
 
-    # OBV
-    obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
-    obv_val = obv.iloc[-1] if pd.notna(obv.iloc[-1]) else 0
-    obv_prev = obv.iloc[-2] if pd.notna(obv.iloc[-2]) else 0
-    votes.append("BUY" if obv_val > obv_prev else "SELL")
+        # Momentum
+        momentum = close.diff(5)
+        votes.append("BUY" if safe_last(momentum) > 0 else "SELL")
 
-    # ADX упрощённый
-    trend = (high.diff().iloc[-1] - low.diff().iloc[-1]) if pd.notna(high.diff().iloc[-1]) and pd.notna(low.diff().iloc[-1]) else 0
-    votes.append("BUY" if trend > 0 else "SELL")
+        # CCI
+        tp = (high + low + close) / 3
+        cci = (tp - tp.rolling(20).mean()) / (0.015 * tp.rolling(20).std())
+        votes.append("BUY" if safe_last(cci) > 0 else "SELL")
 
-    # +5 фильтров тренда
-    trend_filter = close.iloc[-1] > close.iloc[-2] if pd.notna(close.iloc[-1]) and pd.notna(close.iloc[-2]) else False
-    votes += ["BUY" if trend_filter else "SELL"] * 5
+        # OBV
+        obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
+        votes.append("BUY" if safe_last(obv) > safe_last(obv.shift(1), 0) else "SELL")
 
-    return votes
+        # ADX (упрощённый)
+        trend = safe_last(high.diff()) - safe_last(low.diff())
+        votes.append("BUY" if trend > 0 else "SELL")
 
-async def get_signal(pair: str):
+        # +5 фильтров тренда
+        trend_filter = safe_last(close) > safe_last(close.shift(1))
+        votes += ["BUY" if trend_filter else "SELL"] * 5
+
+        return votes
+
     try:
         df = yf.download(pair, period="2d", interval="15m", progress=False, auto_adjust=True)
         if df.empty or len(df) < 30:
@@ -240,10 +243,9 @@ async def get_signal(pair: str):
         direction = "ВВЕРХ 📈" if buy > sell else "ВНИЗ 📉"
         confidence = round(max(buy, sell) / len(votes) * 100, 1)
         return direction, confidence
-    except Exception as e:
-        logging.error(f"get_signal error: {e}")
-        return None, None
 
+    except Exception as e:
+        logging.error(f"get_signal error: {e}") return None, None
 # ================= HANDLERS =================
 
 @dp.message(Command("start"))
