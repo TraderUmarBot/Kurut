@@ -162,55 +162,69 @@ def result_kb():
 # ================= INDICATORS =================
 
 def calculate_indicators(df: pd.DataFrame) -> list[str]:
+    df = df.fillna(method='bfill')  # Заполняем NaN с конца
+    votes = []
+
     close = df["Close"]
     high = df["High"]
     low = df["Low"]
     volume = df["Volume"]
 
-    votes = []
-
     # SMA
     votes.append("BUY" if close.iloc[-1] > close.rolling(10).mean().iloc[-1] else "SELL")
     votes.append("BUY" if close.iloc[-1] > close.rolling(20).mean().iloc[-1] else "SELL")
+
     # EMA
     votes.append("BUY" if close.iloc[-1] > close.ewm(span=10).mean().iloc[-1] else "SELL")
     votes.append("BUY" if close.iloc[-1] > close.ewm(span=20).mean().iloc[-1] else "SELL")
+
     # RSI
-    delta = close.diff()
+    delta = close.diff().fillna(0)
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
     rsi = 100 - (100 / (1 + gain / loss))
     votes.append("BUY" if rsi.iloc[-1] > 50 else "SELL")
+
     # MACD
     macd = close.ewm(span=12).mean() - close.ewm(span=26).mean()
     votes.append("BUY" if macd.iloc[-1] > 0 else "SELL")
+
     # Stochastic
     low14 = low.rolling(14).min()
     high14 = high.rolling(14).max()
     stoch = 100 * (close - low14) / (high14 - low14)
     votes.append("BUY" if stoch.iloc[-1] > 50 else "SELL")
+
     # Momentum
-    votes.append("BUY" if close.iloc[-1] > close.iloc[-5] else "SELL")
+    votes.append("BUY" if close.iloc[-1] > close.shift(5).iloc[-1] else "SELL")
+
     # CCI
     tp = (high + low + close)/3
     cci = (tp - tp.rolling(20).mean()) / (0.015 * tp.rolling(20).std())
     votes.append("BUY" if cci.iloc[-1] > 0 else "SELL")
+
     # OBV
     obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
     votes.append("BUY" if obv.iloc[-1] > obv.iloc[-2] else "SELL")
-    # ADX (упрощённый)
-    votes.append("BUY" if (high.diff().iloc[-1] > low.diff().iloc[-1]) else "SELL")
-    # +5 фильтров
-    votes += ["BUY" if close.iloc[-1] > close.iloc[-2] else "SELL"]*5
+
+    # ADX упрощённый
+    trend = high.diff().iloc[-1] - low.diff().iloc[-1]
+    votes.append("BUY" if trend > 0 else "SELL")
+
+    # +5 фильтров тренда
+    for _ in range(5):
+        votes.append("BUY" if close.iloc[-1] > close.iloc[-2] else "SELL")
 
     return votes
 
+
 async def get_signal(pair: str):
     try:
-        df = yf.download(pair, period="2d", interval="15m", progress=False)
-        if df.empty or len(df) < 20:
+        df = yf.download(pair, period="2d", interval="15m", progress=False, auto_adjust=True)
+        if df.empty or len(df) < 30:
             return None, None
 
+        df = df.fillna(method='bfill')  # На всякий случай
         votes = calculate_indicators(df)
         buy = votes.count("BUY")
         sell = votes.count("SELL")
@@ -219,7 +233,7 @@ async def get_signal(pair: str):
             return None, None
 
         direction = "ВВЕРХ 📈" if buy > sell else "ВНИЗ 📉"
-        confidence = round(max(buy, sell)/len(votes)*100,1)
+        confidence = round(max(buy, sell) / len(votes) * 100, 1)
         return direction, confidence
     except Exception as e:
         logging.error(f"get_signal error: {e}")
