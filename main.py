@@ -348,13 +348,17 @@ async def menu(cb: types.CallbackQuery):
 async def postback(request: web.Request):
     click_id = request.query.get("click_id", "").strip()
     amount_raw = request.query.get("amount", "0")
+
     if not click_id.isdigit():
         return web.Response(text="NO CLICK_ID", status=200)
+
     try:
-        await upsert_user(int(click_id))
-        await update_balance(int(click_id), float(amount_raw))
-    except:
-        pass
+        user_id = int(click_id)
+        await upsert_user(user_id)
+        await update_balance(user_id, float(amount_raw))
+    except Exception as e:
+        logging.error(f"Postback error: {e}")
+
     return web.Response(text="OK")
 
 # ================= START =================
