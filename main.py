@@ -162,7 +162,7 @@ def result_kb():
 # ================= INDICATORS =================
 
 def calculate_indicators(df: pd.DataFrame) -> list[str]:
-    df = df.fillna(method='bfill')  # Заполняем NaN с конца
+    df = df.bfill().ffill()  # безопасное заполнение NaN
     votes = []
 
     close = df["Close"]
@@ -171,52 +171,58 @@ def calculate_indicators(df: pd.DataFrame) -> list[str]:
     volume = df["Volume"]
 
     # SMA
-    votes.append("BUY" if close.iloc[-1] > close.rolling(10).mean().iloc[-1] else "SELL")
-    votes.append("BUY" if close.iloc[-1] > close.rolling(20).mean().iloc[-1] else "SELL")
+    sma10 = close.rolling(10).mean().iloc[-1] or close.iloc[-1]
+    sma20 = close.rolling(20).mean().iloc[-1] or close.iloc[-1]
+    votes.append("BUY" if close.iloc[-1] > sma10 else "SELL")
+    votes.append("BUY" if close.iloc[-1] > sma20 else "SELL")
 
     # EMA
-    votes.append("BUY" if close.iloc[-1] > close.ewm(span=10).mean().iloc[-1] else "SELL")
-    votes.append("BUY" if close.iloc[-1] > close.ewm(span=20).mean().iloc[-1] else "SELL")
+    ema10 = close.ewm(span=10).mean().iloc[-1] or close.iloc[-1]
+    ema20 = close.ewm(span=20).mean().iloc[-1] or close.iloc[-1]
+    votes.append("BUY" if close.iloc[-1] > ema10 else "SELL")
+    votes.append("BUY" if close.iloc[-1] > ema20 else "SELL")
 
     # RSI
     delta = close.diff().fillna(0)
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
     rsi = 100 - (100 / (1 + gain / loss))
-    votes.append("BUY" if rsi.iloc[-1] > 50 else "SELL")
+    votes.append("BUY" if (rsi.iloc[-1] if pd.notna(rsi.iloc[-1]) else 0) > 50 else "SELL")
 
     # MACD
     macd = close.ewm(span=12).mean() - close.ewm(span=26).mean()
-    votes.append("BUY" if macd.iloc[-1] > 0 else "SELL")
+    votes.append("BUY" if (macd.iloc[-1] if pd.notna(macd.iloc[-1]) else 0) > 0 else "SELL")
 
     # Stochastic
     low14 = low.rolling(14).min()
     high14 = high.rolling(14).max()
     stoch = 100 * (close - low14) / (high14 - low14)
-    votes.append("BUY" if stoch.iloc[-1] > 50 else "SELL")
+    votes.append("BUY" if (stoch.iloc[-1] if pd.notna(stoch.iloc[-1]) else 0) > 50 else "SELL")
 
     # Momentum
-    votes.append("BUY" if close.iloc[-1] > close.shift(5).iloc[-1] else "SELL")
+    momentum = close.diff(5).iloc[-1] if pd.notna(close.diff(5).iloc[-1]) else 0
+    votes.append("BUY" if momentum > 0 else "SELL")
 
     # CCI
-    tp = (high + low + close)/3
+    tp = (high + low + close) / 3
     cci = (tp - tp.rolling(20).mean()) / (0.015 * tp.rolling(20).std())
-    votes.append("BUY" if cci.iloc[-1] > 0 else "SELL")
+    votes.append("BUY" if (cci.iloc[-1] if pd.notna(cci.iloc[-1]) else 0) > 0 else "SELL")
 
     # OBV
     obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
-    votes.append("BUY" if obv.iloc[-1] > obv.iloc[-2] else "SELL")
+    obv_val = obv.iloc[-1] if pd.notna(obv.iloc[-1]) else 0
+    obv_prev = obv.iloc[-2] if pd.notna(obv.iloc[-2]) else 0
+    votes.append("BUY" if obv_val > obv_prev else "SELL")
 
     # ADX упрощённый
-    trend = high.diff().iloc[-1] - low.diff().iloc[-1]
+    trend = (high.diff().iloc[-1] - low.diff().iloc[-1]) if pd.notna(high.diff().iloc[-1]) and pd.notna(low.diff().iloc[-1]) else 0
     votes.append("BUY" if trend > 0 else "SELL")
 
     # +5 фильтров тренда
-    for _ in range(5):
-        votes.append("BUY" if close.iloc[-1] > close.iloc[-2] else "SELL")
+    trend_filter = close.iloc[-1] > close.iloc[-2] if pd.notna(close.iloc[-1]) and pd.notna(close.iloc[-2]) else False
+    votes += ["BUY" if trend_filter else "SELL"] * 5
 
     return votes
-
 
 async def get_signal(pair: str):
     try:
@@ -224,12 +230,11 @@ async def get_signal(pair: str):
         if df.empty or len(df) < 30:
             return None, None
 
-        df = df.fillna(method='bfill')  # На всякий случай
         votes = calculate_indicators(df)
         buy = votes.count("BUY")
         sell = votes.count("SELL")
 
-        if buy == sell:
+        if buy == sell:  # нет перевеса
             return None, None
 
         direction = "ВВЕРХ 📈" if buy > sell else "ВНИЗ 📉"
