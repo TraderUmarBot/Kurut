@@ -3,4 +3,4 @@ asyncpg
 pandas
 numpy
 aiohttp
-yfinanc
+yfinance
