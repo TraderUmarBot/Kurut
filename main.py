@@ -7,8 +7,7 @@ from datetime import datetime
 import asyncpg
 import pandas as pd
 import numpy as np
-
-from tvDatafeed import TvDatafeed, Interval
+import yfinance as yf
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -19,7 +18,9 @@ from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiogram.methods import DeleteWebhook, SetWebhook
 
+
 # ================= CONFIG =================
+
 TG_TOKEN = os.getenv("TG_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
@@ -39,23 +40,28 @@ WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 
 logging.basicConfig(level=logging.INFO)
 
+
 # ================= BOT =================
+
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-
 DB_POOL: asyncpg.Pool | None = None
-tv = TvDatafeed()
+
 
 # ================= CONSTANTS =================
+
 PAIRS = [
-    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF",
-    "EURJPY", "GBPJPY", "AUDJPY", "EURGBP", "EURAUD", "GBPAUD",
-    "CADJPY", "CHFJPY", "EURCAD", "GBPCAD", "AUDCAD", "AUDCHF", "CADCHF"
+    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X", "USDCHF=X",
+    "EURJPY=X", "GBPJPY=X", "AUDJPY=X", "EURGBP=X", "EURAUD=X", "GBPAUD=X",
+    "CADJPY=X", "CHFJPY=X", "EURCAD=X", "GBPCAD=X", "AUDCAD=X", "AUDCHF=X", "CADCHF=X"
 ]
+
 PAIRS_PER_PAGE = 6
 EXPIRATIONS = [1, 2, 3, 5, 10]
 
+
 # ================= DATABASE =================
+
 async def init_db():
     global DB_POOL
     DB_POOL = await asyncpg.create_pool(DATABASE_URL)
@@ -68,6 +74,7 @@ async def init_db():
             balance FLOAT DEFAULT 0
         );
         """)
+
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS logs (
             id SERIAL PRIMARY KEY,
@@ -80,9 +87,11 @@ async def init_db():
         );
         """)
 
+
 async def get_user(user_id: int):
     async with DB_POOL.acquire() as conn:
         return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+
 
 async def upsert_user(user_id: int, pocket_id: str):
     async with DB_POOL.acquire() as conn:
@@ -93,11 +102,12 @@ async def upsert_user(user_id: int, pocket_id: str):
         SET pocket_id = EXCLUDED.pocket_id
         """, user_id, pocket_id)
 
+
 async def update_balance(user_id: int, amount: float):
     async with DB_POOL.acquire() as conn:
         await conn.execute("UPDATE users SET balance=$1 WHERE user_id=$2", amount, user_id)
 
-# ================= ACCESS =================
+
 async def has_access(user_id: int) -> bool:
     if user_id in AUTHORS:
         return True
@@ -106,7 +116,9 @@ async def has_access(user_id: int) -> bool:
         return False
     return user["balance"] >= MIN_DEPOSIT
 
+
 # ================= KEYBOARDS =================
+
 def main_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="📈 Валютные пары", callback_data="pairs")
@@ -114,17 +126,19 @@ def main_menu():
     kb.adjust(1)
     return kb.as_markup()
 
+
 def pairs_kb(page=0):
     kb = InlineKeyboardBuilder()
     start = page * PAIRS_PER_PAGE
     for p in PAIRS[start:start + PAIRS_PER_PAGE]:
-        kb.button(text=p, callback_data=f"pair:{p}")
+        kb.button(text=p.replace("=X", ""), callback_data=f"pair:{p}")
     if page > 0:
-        kb.button(text="⬅️ Назад", callback_data=f"page:{page-1}")
+        kb.button(text="⬅️ Назад", callback_data=f"page:{page - 1}")
     if start + PAIRS_PER_PAGE < len(PAIRS):
-        kb.button(text="➡️ Вперёд", callback_data=f"page:{page+1}")
+        kb.button(text="➡️ Вперёд", callback_data=f"page:{page + 1}")
     kb.adjust(2)
     return kb.as_markup()
+
 
 def expiration_kb(pair):
     kb = InlineKeyboardBuilder()
@@ -133,6 +147,7 @@ def expiration_kb(pair):
     kb.adjust(2)
     return kb.as_markup()
 
+
 def result_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ ПЛЮС", callback_data="menu")
@@ -140,15 +155,18 @@ def result_kb():
     kb.adjust(2)
     return kb.as_markup()
 
+
 # ================= INDICATORS =================
+
 def calculate_indicators(df: pd.DataFrame):
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
-    volume = df["volume"]
+    close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
+    volume = df["Volume"]
+
     votes = []
 
-    # SMA & EMA
+    # SMA, EMA
     votes.append("BUY" if close.iloc[-1] > close.rolling(10).mean().iloc[-1] else "SELL")
     votes.append("BUY" if close.iloc[-1] > close.rolling(20).mean().iloc[-1] else "SELL")
     votes.append("BUY" if close.iloc[-1] > close.ewm(span=10).mean().iloc[-1] else "SELL")
@@ -176,50 +194,51 @@ def calculate_indicators(df: pd.DataFrame):
     stoch = 100 * (close - low14) / (high14 - low14)
     votes.append("BUY" if stoch.iloc[-1] > 50 else "SELL")
 
-    # Price change
+    # Momentum
     votes.append("BUY" if close.iloc[-1] > close.iloc[-2] else "SELL")
-
-    # CCI
     tp = (high + low + close) / 3
     cci = (tp - tp.rolling(20).mean()) / (0.015 * tp.rolling(20).std())
     votes.append("BUY" if cci.iloc[-1] > 0 else "SELL")
-
-    # Momentum
     momentum = close.diff(4)
     votes.append("BUY" if momentum.iloc[-1] > 0 else "SELL")
-
-    # OBV
     obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
     votes.append("BUY" if obv.iloc[-1] > obv.iloc[-2] else "SELL")
-
-    # Ichimoku
     tenkan = (high.rolling(9).max() + low.rolling(9).min()) / 2
     kijun = (high.rolling(26).max() + low.rolling(26).min()) / 2
     votes.append("BUY" if tenkan.iloc[-1] > kijun.iloc[-1] else "SELL")
 
     return votes
 
+
 # ================= SIGNAL =================
+
 async def get_signal(pair: str):
-    df = tv.get_hist(symbol=pair, exchange="FX_IDC", interval=Interval.in_15_minute, n_bars=30)
-    if df is None or len(df) < 30:
+    try:
+        df = yf.download(pair, period="7d", interval="15m", progress=False, auto_adjust=True)
+        df = df[-30:]
+        if df.empty or len(df) < 30:
+            return None, None
+        votes = calculate_indicators(df)
+        buy = votes.count("BUY")
+        sell = votes.count("SELL")
+        if buy == sell:
+            return None, None
+        confidence = round(max(buy, sell) / len(votes) * 100, 1)
+        direction = "ПОКУПКА" if buy > sell else "ПРОДАЖА"
+        return direction, confidence
+    except Exception as e:
+        print(f"Signal error: {e}")
         return None, None
-    votes = calculate_indicators(df)
-    buy = votes.count("BUY")
-    sell = votes.count("SELL")
-    if buy == sell:
-        return None, None
-    direction = "ПОКУПКА" if buy > sell else "ПРОДАЖА"
-    confidence = round(max(buy, sell) / len(votes) * 100, 1)
-    return direction, confidence
+
 
 # ================= HANDLERS =================
+
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     text = (
         "🤖 Бот KURUT TRADE\n\n"
         "📊 Анализ рынка:\n"
-        "• TradingView данные\n"
+        "• Данные Yahoo Finance\n"
         "• 15 индикаторов\n"
         "• 30 свечей M15\n\n"
         "📈 Сигналы:\n"
@@ -227,12 +246,13 @@ async def start(msg: types.Message):
         "• Реальная уверенность\n\n"
         "🔐 Доступ:\n"
         "• Регистрация по ссылке\n"
-        "• Депозит от 20$\n"
+        "• Депозит от 20$"
     )
     kb = InlineKeyboardBuilder()
     kb.button(text="Получить доступ", url=REF_LINK)
     kb.adjust(1)
     await msg.answer(text, reply_markup=kb.as_markup())
+
 
 @dp.callback_query(lambda c: c.data == "pairs")
 async def pairs(cb: types.CallbackQuery):
@@ -242,17 +262,20 @@ async def pairs(cb: types.CallbackQuery):
     await cb.message.edit_text("Выберите валютную пару", reply_markup=pairs_kb())
     await cb.answer()
 
+
 @dp.callback_query(lambda c: c.data.startswith("page:"))
 async def page(cb: types.CallbackQuery):
     page = int(cb.data.split(":")[1])
     await cb.message.edit_text("Выберите валютную пару", reply_markup=pairs_kb(page))
     await cb.answer()
 
+
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
 async def choose_pair(cb: types.CallbackQuery):
     pair = cb.data.split(":")[1]
     await cb.message.edit_text(f"Пара {pair}\nВыберите экспирацию", reply_markup=expiration_kb(pair))
     await cb.answer()
+
 
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
 async def signal(cb: types.CallbackQuery):
@@ -278,12 +301,15 @@ async def signal(cb: types.CallbackQuery):
     )
     await cb.answer()
 
+
 @dp.callback_query(lambda c: c.data == "menu")
 async def back_menu(cb: types.CallbackQuery):
     await cb.message.edit_text("Главное меню", reply_markup=main_menu())
     await cb.answer()
 
+
 # ================= POSTBACK =================
+
 async def postback(request: web.Request):
     click_id = request.query.get("click_id")
     amount = float(request.query.get("amount", 0))
@@ -294,21 +320,26 @@ async def postback(request: web.Request):
     await update_balance(user_id, amount)
     return web.Response(text="OK")
 
+
 # ================= START =================
+
 async def main():
     await init_db()
     await bot(DeleteWebhook(drop_pending_updates=True))
     await bot(SetWebhook(url=WEBHOOK_URL))
+
     app = web.Application()
     handler = SimpleRequestHandler(dp, bot)
     handler.register(app, WEBHOOK_PATH)
     app.router.add_get("/postback", postback)
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, HOST, PORT)
     await site.start()
     logging.info("BOT STARTED")
     await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
