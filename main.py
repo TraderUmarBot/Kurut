@@ -163,15 +163,11 @@ def calculate_indicators(data: pd.DataFrame):
     low = data['Low']
     volume = data['Volume']
 
-    # 1-2 SMA
     indicators.append('BUY' if close.iloc[-1] > close.rolling(10).mean().iloc[-1] else 'SELL')
     indicators.append('BUY' if close.iloc[-1] > close.rolling(20).mean().iloc[-1] else 'SELL')
-
-    # 3-4 EMA
     indicators.append('BUY' if close.iloc[-1] > close.ewm(span=10).mean().iloc[-1] else 'SELL')
     indicators.append('BUY' if close.iloc[-1] > close.ewm(span=20).mean().iloc[-1] else 'SELL')
 
-    # 5 RSI
     delta = close.diff()
     gain = delta.where(delta>0,0).rolling(14).mean()
     loss = -delta.where(delta<0,0).rolling(14).mean()
@@ -179,34 +175,28 @@ def calculate_indicators(data: pd.DataFrame):
     rsi = 100 - (100/(1+rs))
     indicators.append('BUY' if rsi.iloc[-1] > 50 else 'SELL')
 
-    # 6 MACD
     ema12 = close.ewm(span=12).mean()
     ema26 = close.ewm(span=26).mean()
     macd = ema12 - ema26
     signal = macd.ewm(span=9).mean()
     indicators.append('BUY' if macd.iloc[-1] > signal.iloc[-1] else 'SELL')
 
-    # 7 Bollinger
     sma20 = close.rolling(20).mean()
     indicators.append('BUY' if close.iloc[-1] > sma20.iloc[-1] else 'SELL')
 
-    # 8 Stochastic
     low14 = close.rolling(14).min()
     high14 = close.rolling(14).max()
     k = 100*(close - low14)/(high14 - low14)
     indicators.append('BUY' if k.iloc[-1] > 50 else 'SELL')
 
-    # 9 ATR
     tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
     atr = tr.rolling(14).mean()
     indicators.append('BUY' if close.iloc[-1] > close.iloc[-2] else 'SELL')
 
-    # 10 CCI
     tp = (high + low + close)/3
     cci = (tp - tp.rolling(20).mean())/(0.015*tp.rolling(20).std())
     indicators.append('BUY' if cci.iloc[-1] > 0 else 'SELL')
 
-    # 11 ADX
     plus_dm = high.diff()
     minus_dm = low.diff() * -1
     tr14 = tr.rolling(14).sum()
@@ -215,18 +205,12 @@ def calculate_indicators(data: pd.DataFrame):
     adx = (abs(plus_di - minus_di)/(plus_di + minus_di))*100
     indicators.append('BUY' if plus_di.iloc[-1] > minus_di.iloc[-1] else 'SELL')
 
-    # 12 Williams %R
     indicators.append('BUY' if k.iloc[-1] < -50 else 'SELL')
-
-    # 13 Momentum
     momentum = close.diff(4)
     indicators.append('BUY' if momentum.iloc[-1] > 0 else 'SELL')
-
-    # 14 OBV
     obv = (np.sign(close.diff())*volume).cumsum()
     indicators.append('BUY' if obv.iloc[-1] > obv.iloc[-2] else 'SELL')
 
-    # 15 Ichimoku (Tenkan vs Kijun simplified)
     tenkan = (high.rolling(9).max() + low.rolling(9).min())/2
     kijun = (high.rolling(26).max() + low.rolling(26).min())/2
     indicators.append('BUY' if tenkan.iloc[-1] > kijun.iloc[-1] else 'SELL')
@@ -235,22 +219,62 @@ def calculate_indicators(data: pd.DataFrame):
 
 # ================= SIGNALS =================
 async def get_signal(pair: str, expiration: int = 1):
+    """
+    Более точный сигнал с фильтрами и взвешенными индикаторами
+    """
     try:
         interval = f"{expiration}m"
-        data = yf.download(pair, period="1d", interval=interval, progress=False)
+        data = yf.download(pair, period="8h", interval=interval, progress=False)
         if data.empty or len(data) < 20:
-            return "ПОКУПКА", 50.0
+            return "НЕОПРЕДЕЛЕНО", 50.0
 
         indicators = calculate_indicators(data)
-        buy_count = indicators.count('BUY')
-        sell_count = indicators.count('SELL')
+        weights = [2,2,2,2,1.5,2,1,1,1,1,1,1,1,1,2]
+        weighted_buy = sum(w for i, w in enumerate(weights) if indicators[i] == "BUY")
+        weighted_sell = sum(w for i, w in enumerate(weights) if indicators[i] == "SELL")
+        total_weight = sum(weights)
 
-        if buy_count > sell_count:
-            direction = 'ПОКУПКА'
-            confidence = buy_count / len(indicators) * 100
+        confidence_buy = weighted_buy / total_weight * 100
+        confidence_sell = weighted_sell / total_weight * 100
+
+        if confidence_buy > confidence_sell:
+            direction = "ПОКУПКА"
+            confidence = confidence_buy
         else:
-            direction = 'ПРОДАЖА'
-            confidence = sell_count / len(indicators) * 100
+            direction = "ПРОДАЖА"
+            confidence = confidence_sell
+
+        # Фильтры тренда SMA
+        if len(data) >= 200:
+            sma50 = data['Close'].rolling(50).mean().iloc[-1]
+            sma200 = data['Close'].rolling(200).mean().iloc[-1]
+            if direction == "ПОКУПКА" and sma50 < sma200:
+                direction = "НЕОПРЕДЕЛЕНО"
+            if direction == "ПРОДАЖА" and sma50 > sma200:
+                direction = "НЕОПРЕДЕЛЕНО"
+
+        # Фильтр ADX
+        high = data['High']; low = data['Low']; close = data['Close']
+        tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+        plus_dm = high.diff()
+        minus_dm = low.diff() * -1
+        tr14 = tr.rolling(14).sum()
+        plus_di = 100 * plus_dm.rolling(14).sum() / tr14
+        minus_di = 100 * minus_dm.rolling(14).sum() / tr14
+        adx = (abs(plus_di - minus_di)/(plus_di + minus_di))*100
+        if adx.iloc[-1] < 20:
+            direction = "НЕОПРЕДЕЛЕНО"
+
+        # Проверка последних 3 свечей
+        last_closes = close[-3:]
+        if direction == "ПОКУПКА" and not all(last_closes.diff().dropna() > 0):
+            direction = "НЕОПРЕДЕЛЕНО"
+        if direction == "ПРОДАЖА" and not all(last_closes.diff().dropna() < 0):
+            direction = "НЕОПРЕДЕЛЕНО"
+
+        # Минимальная уверенность
+        if confidence < 70:
+            direction = "НЕОПРЕДЕЛЕНО"
 
         return direction, confidence
 
@@ -261,6 +285,11 @@ async def get_signal(pair: str, expiration: int = 1):
 # ================= START & REGISTRATION =================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
+    user_id = msg.from_user.id
+    if user_id in AUTHORS:
+        await msg.answer("🏠 Главное меню (Авторский доступ)", reply_markup=main_menu())
+        return
+
     text = (
         "👋 Привет! Добро пожаловать!\n\n"
         "📌 Бот создан командой KURUT TRADE.\n"
@@ -293,19 +322,26 @@ async def receive_id(msg: types.Message, state: FSMContext):
 
     user_id = msg.from_user.id
     pocket_id = msg.text.strip()
+
     await add_user(user_id, pocket_id)
 
     await msg.answer(
         "✅ ID зарегистрирован. Теперь пополните баланс ≥20$ и нажмите 'Я пополнил баланс'.",
         reply_markup=after_access_kb()
     )
+
     await state.clear()
 
 @dp.callback_query(lambda c: c.data == "check_balance")
 async def check_balance(cb: types.CallbackQuery):
     user_id = cb.from_user.id
-    balance = await get_balance(user_id)
 
+    if user_id in AUTHORS:
+        await cb.message.answer("🎉 Доступ к боту подтвержден! (Авторский доступ)", reply_markup=main_menu())
+        await cb.answer()
+        return
+
+    balance = await get_balance(user_id)
     if balance >= MIN_DEPOSIT:
         await cb.message.answer("🎉 Доступ к боту подтвержден!", reply_markup=main_menu())
     else:
@@ -333,6 +369,16 @@ async def handle_postback(request: web.Request):
 
     if event in ["deposit", "reg"] and amount > 0:
         await update_balance(user_id, amount)
+        balance = await get_balance(user_id)
+        if balance >= MIN_DEPOSIT:
+            try:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=f"🎉 Ваш баланс {balance}$.\nДоступ к боту подтвержден!",
+                    reply_markup=main_menu()
+                )
+            except Exception as e:
+                print(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
 
     return web.Response(text="OK")
 
