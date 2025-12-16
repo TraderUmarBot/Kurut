@@ -142,96 +142,100 @@ def result_kb():
 
 # ================= SIGNAL & INDICATORS =================
 
-async def get_signal(pair: str) -> Tuple[str, float]:
+async def get_signal_with_expiration(pair: str, requested_exp: int) -> Tuple[str, float, int]:
     """
-    Получает сигнал по валютной паре.
-    Всегда возвращает направление ("ВВЕРХ 📈" / "ВНИЗ 📉") и уверенность в %.
+    Возвращает направление, уверенность и оптимальную экспирацию.
+    requested_exp — запрошенная пользователем экспирация в минутах.
+    Бот проверяет разные таймфреймы и выбирает лучший сигнал.
     """
+    expirations_to_try = [requested_exp, 3, 5, 10]  # порядок проверки
+    best_conf = 0
+    best_direction = "ВВЕРХ 📈"
+    best_exp = requested_exp
 
-    def calculate_indicators(df: pd.DataFrame) -> list[str]:
-        df = df.bfill().ffill()  # безопасное заполнение NaN
-        votes = []
+    for exp in expirations_to_try:
+        # Получаем данные с Yahoo Finance с учётом экспирации
+        interval = f"{exp}m"  # пример: 1m, 3m, 5m, 10m
+        try:
+            df = yf.download(pair, period="2d", interval=interval, progress=False, auto_adjust=True)
+            if df.empty:
+                continue
 
-        close = df["Close"]
-        high = df["High"]
-        low = df["Low"]
-        volume = df["Volume"]
+            # Внутренняя функция анализа индикаторов (копируем calculate_indicators из get_signal)
+            def calculate_indicators(df: pd.DataFrame) -> list[str]:
+                df = df.bfill().ffill()
+                votes = []
 
-        def safe_last(series, default=0):
-            if isinstance(series, (pd.Series, pd.DataFrame)):
-                val = series.iloc[-1] if len(series) > 0 else default
-            else:
-                val = series
-            return val if pd.notna(val) else default
+                close = df["Close"]
+                high = df["High"]
+                low = df["Low"]
+                volume = df["Volume"]
 
-        # SMA
-        votes.append("BUY" if safe_last(close) > safe_last(close.rolling(10).mean().iloc[-1], close.iloc[-1]) else "SELL")
-        votes.append("BUY" if safe_last(close) > safe_last(close.rolling(20).mean().iloc[-1], close.iloc[-1]) else "SELL")
+                def safe_last(series, default=0):
+                    if isinstance(series, (pd.Series, pd.DataFrame)):
+                        val = series.iloc[-1] if len(series) > 0 else default
+                    else:
+                        val = series
+                    return val if pd.notna(val) else default
 
-        # EMA
-        votes.append("BUY" if safe_last(close) > safe_last(close.ewm(span=10).mean().iloc[-1], close.iloc[-1]) else "SELL")
-        votes.append("BUY" if safe_last(close) > safe_last(close.ewm(span=20).mean().iloc[-1], close.iloc[-1]) else "SELL")
+                votes.append("BUY" if safe_last(close) > safe_last(close.rolling(10).mean().iloc[-1], close.iloc[-1]) else "SELL")
+                votes.append("BUY" if safe_last(close) > safe_last(close.rolling(20).mean().iloc[-1], close.iloc[-1]) else "SELL")
+                votes.append("BUY" if safe_last(close) > safe_last(close.ewm(span=10).mean().iloc[-1], close.iloc[-1]) else "SELL")
+                votes.append("BUY" if safe_last(close) > safe_last(close.ewm(span=20).mean().iloc[-1], close.iloc[-1]) else "SELL")
 
-        # RSI
-        delta = close.diff().fillna(0)
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rsi = 100 - (100 / (1 + safe_last(gain) / safe_last(loss, 1)))
-        votes.append("BUY" if rsi > 50 else "SELL")
+                delta = close.diff().fillna(0)
+                gain = delta.clip(lower=0).rolling(14).mean()
+                loss = (-delta.clip(upper=0)).rolling(14).mean()
+                rsi = 100 - (100 / (1 + safe_last(gain) / safe_last(loss, 1)))
+                votes.append("BUY" if rsi > 50 else "SELL")
 
-        # MACD
-        macd = close.ewm(span=12).mean() - close.ewm(span=26).mean()
-        votes.append("BUY" if safe_last(macd) > 0 else "SELL")
+                macd = close.ewm(span=12).mean() - close.ewm(span=26).mean()
+                votes.append("BUY" if safe_last(macd) > 0 else "SELL")
 
-        # Stochastic
-        low14 = low.rolling(14).min()
-        high14 = high.rolling(14).max()
-        stoch = 100 * (close - low14) / (high14 - low14)
-        votes.append("BUY" if safe_last(stoch) > 50 else "SELL")
+                low14 = low.rolling(14).min()
+                high14 = high.rolling(14).max()
+                stoch = 100 * (close - low14) / (high14 - low14)
+                votes.append("BUY" if safe_last(stoch) > 50 else "SELL")
 
-        # Momentum
-        momentum = close.diff(5)
-        votes.append("BUY" if safe_last(momentum) > 0 else "SELL")
+                momentum = close.diff(5)
+                votes.append("BUY" if safe_last(momentum) > 0 else "SELL")
 
-        # CCI
-        tp = (high + low + close) / 3
-        cci = (tp - tp.rolling(20).mean()) / (0.015 * tp.rolling(20).std())
-        votes.append("BUY" if safe_last(cci) > 0 else "SELL")
+                tp = (high + low + close) / 3
+                cci = (tp - tp.rolling(20).mean()) / (0.015 * tp.rolling(20).std())
+                votes.append("BUY" if safe_last(cci) > 0 else "SELL")
 
-        # OBV
-        obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
-        votes.append("BUY" if safe_last(obv) > safe_last(obv.shift(1), 0) else "SELL")
+                obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
+                votes.append("BUY" if safe_last(obv) > safe_last(obv.shift(1), 0) else "SELL")
 
-        # ADX (упрощённый)
-        trend = safe_last(high.diff()) - safe_last(low.diff())
-        votes.append("BUY" if trend > 0 else "SELL")
+                trend = safe_last(high.diff()) - safe_last(low.diff())
+                votes.append("BUY" if trend > 0 else "SELL")
 
-        # +5 фильтров тренда
-        trend_filter = safe_last(close) > safe_last(close.shift(1))
-        votes += ["BUY" if trend_filter else "SELL"] * 5
+                trend_filter = safe_last(close) > safe_last(close.shift(1))
+                votes += ["BUY" if trend_filter else "SELL"] * 5
 
-        return votes
+                return votes
 
-    try:
-        df = yf.download(pair, period="2d", interval="15m", progress=False, auto_adjust=True)
-        if df.empty:
-            # если данных нет, создаем "нейтральный" сигнал
-            return "ВВЕРХ 📈", 50.0
+            votes = calculate_indicators(df)
+            buy = votes.count("BUY")
+            sell = votes.count("SELL")
+            direction = "ВВЕРХ 📈" if buy >= sell else "ВНИЗ 📉"
+            confidence = round(max(buy, sell) / len(votes) * 100, 1)
 
-        votes = calculate_indicators(df)
-        buy = votes.count("BUY")
-        sell = votes.count("SELL")
+            # выбираем лучший сигнал
+            if confidence > best_conf:
+                best_conf = confidence
+                best_direction = direction
+                best_exp = exp
 
-        # Направление: если равны, считаем BUY
-        direction = "ВВЕРХ 📈" if buy >= sell else "ВНИЗ 📉"
-        confidence = round(max(buy, sell) / len(votes) * 100, 1)
+        except Exception as e:
+            logging.error(f"get_signal_with_expiration error: {e}")
+            continue
 
-        return direction, confidence
+    # если вообще нет данных, возвращаем дефолт
+    if best_conf == 0:
+        return "ВВЕРХ 📈", 50.0, requested_exp
 
-    except Exception as e:
-        logging.error(f"get_signal error: {e}")
-        # если ошибка, возвращаем нейтральный сигнал
-        return "ВВЕРХ 📈", 50.0
+    return best_direction, best_conf, best_exp
 
     
 
