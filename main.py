@@ -57,7 +57,6 @@ async def init_db():
     if DB_POOL is None:
         DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     async with DB_POOL.acquire() as conn:
-        # Проверяем существование колонки pocket_id
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
@@ -144,7 +143,7 @@ def result_kb():
 
 def access_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="Перейти к боту", url=REF_LINK)
+    kb.button(text="Получить доступ", url=REF_LINK)
     kb.button(text="Проверить ID", callback_data="check_id")
     kb.adjust(1)
     return kb.as_markup()
@@ -164,35 +163,40 @@ def calculate_indicators(data: pd.DataFrame):
     low = data['Low']
     volume = data['Volume']
 
-    # 15 индикаторов, как раньше
     indicators.append('BUY' if close.iloc[-1] > close.rolling(10).mean().iloc[-1] else 'SELL')
     indicators.append('BUY' if close.iloc[-1] > close.rolling(20).mean().iloc[-1] else 'SELL')
     indicators.append('BUY' if close.iloc[-1] > close.ewm(span=10).mean().iloc[-1] else 'SELL')
     indicators.append('BUY' if close.iloc[-1] > close.ewm(span=20).mean().iloc[-1] else 'SELL')
+
     delta = close.diff()
     gain = delta.where(delta>0,0).rolling(14).mean()
     loss = -delta.where(delta<0,0).rolling(14).mean()
     rs = gain / loss
     rsi = 100 - (100/(1+rs))
     indicators.append('BUY' if rsi.iloc[-1] > 50 else 'SELL')
+
     ema12 = close.ewm(span=12).mean()
     ema26 = close.ewm(span=26).mean()
     macd = ema12 - ema26
     signal = macd.ewm(span=9).mean()
     indicators.append('BUY' if macd.iloc[-1] > signal.iloc[-1] else 'SELL')
+
     sma20 = close.rolling(20).mean()
-    std = close.rolling(20).std()
     indicators.append('BUY' if close.iloc[-1] > sma20.iloc[-1] else 'SELL')
+
     low14 = close.rolling(14).min()
     high14 = close.rolling(14).max()
     k = 100*(close - low14)/(high14 - low14)
     indicators.append('BUY' if k.iloc[-1] > 50 else 'SELL')
+
     tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
     atr = tr.rolling(14).mean()
     indicators.append('BUY' if close.iloc[-1] > close.iloc[-2] else 'SELL')
+
     tp = (high + low + close)/3
     cci = (tp - tp.rolling(20).mean())/(0.015*tp.rolling(20).std())
     indicators.append('BUY' if cci.iloc[-1] > 0 else 'SELL')
+
     plus_dm = high.diff()
     minus_dm = low.diff() * -1
     tr14 = tr.rolling(14).sum()
@@ -200,21 +204,26 @@ def calculate_indicators(data: pd.DataFrame):
     minus_di = 100 * minus_dm.rolling(14).sum() / tr14
     adx = (abs(plus_di - minus_di)/(plus_di + minus_di))*100
     indicators.append('BUY' if plus_di.iloc[-1] > minus_di.iloc[-1] else 'SELL')
+
     indicators.append('BUY' if k.iloc[-1] < -50 else 'SELL')
+
     momentum = close.diff(4)
     indicators.append('BUY' if momentum.iloc[-1] > 0 else 'SELL')
+
     obv = (np.sign(close.diff())*volume).cumsum()
     indicators.append('BUY' if obv.iloc[-1] > obv.iloc[-2] else 'SELL')
+
     tenkan = (high.rolling(9).max() + low.rolling(9).min())/2
     kijun = (high.rolling(26).max() + low.rolling(26).min())/2
     indicators.append('BUY' if tenkan.iloc[-1] > kijun.iloc[-1] else 'SELL')
+
     return indicators
 
 # ================= SIGNALS =================
 async def get_signal(pair: str, interval="8h"):
     try:
         data = yf.download(pair, period="15d", interval=interval, progress=False)
-        if data.empty or len(data) < 20:
+        if data.empty or len(data) < 15:
             return "ПОКУПКА", 50.0
         indicators = calculate_indicators(data)
         buy_count = indicators.count('BUY')
@@ -234,6 +243,9 @@ async def get_signal(pair: str, interval="8h"):
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     user_id = msg.from_user.id
+    async with DB_POOL.acquire() as conn:
+        user = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+
     if user_id in AUTHORS:
         await msg.answer("🏠 Главное меню (Авторский доступ)", reply_markup=main_menu())
         return
@@ -255,72 +267,65 @@ async def start(msg: types.Message):
     )
     await msg.answer(text, reply_markup=access_kb())
 
-@dp.callback_query(lambda c: c.data == "check_id")
-async def check_id(cb: types.CallbackQuery):
-    await cb.message.answer("✏️ Отправьте свой Pocket Option ID:")
-    await TradeState.waiting_id.set()
+# ================= HANDLERS ДЛЯ ВАЛЮТНЫХ ПАР И НОВОСТЕЙ =================
+
+@dp.callback_query(lambda c: c.data == "pairs")
+async def pairs(cb: types.CallbackQuery):
+    await cb.message.edit_text("📈 Выберите валютную пару", reply_markup=pairs_kb())
     await cb.answer()
 
-@dp.message()
-async def receive_id(msg: types.Message):
-    state = await dp.storage.get_state(user=msg.from_user.id)
-    if state != TradeState.waiting_id.state:
-        return
-    user_id = msg.from_user.id
-    pocket_id = msg.text.strip()
-    await add_user(user_id, pocket_id)
-    await msg.answer("✅ ID зарегистрирован. Теперь пополните баланс ≥20$ и нажмите 'Я пополнил баланс'.", reply_markup=after_access_kb())
-    await dp.storage.set_state(user=msg.from_user.id, state=None)
+@dp.callback_query(lambda c: c.data.startswith("pairs_page:"))
+async def pairs_page(cb: types.CallbackQuery):
+    page = int(cb.data.split(":")[1])
+    await cb.message.edit_text("📈 Выберите валютную пару", reply_markup=pairs_kb(page))
+    await cb.answer()
 
-@dp.callback_query(lambda c: c.data == "check_balance")
-async def check_balance(cb: types.CallbackQuery):
+@dp.callback_query(lambda c: c.data.startswith("pair:"))
+async def pair(cb: types.CallbackQuery):
+    pair = cb.data.split(":")[1]
+    await cb.message.edit_text(
+        f"⏱ Вы выбрали пару {pair.replace('=X','')}. Выберите время экспирации:",
+        reply_markup=expiration_kb(pair)
+    )
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("exp:"))
+async def expiration(cb: types.CallbackQuery):
+    _, pair, exp = cb.data.split(":")
+    exp = int(exp)
+    direction, confidence = await get_signal(pair, interval="8h")
     user_id = cb.from_user.id
-    access = await check_user_access(user_id)
-    if access:
-        await cb.message.answer("🎉 Доступ к боту подтвержден!", reply_markup=main_menu())
-    else:
-        await cb.message.answer(f"❌ Доступ не подтвержден. Минимальный депозит {MIN_DEPOSIT}$")
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO logs(user_id,pair,direction,confidence,exp_minutes) VALUES($1,$2,$3,$4,$5)",
+            user_id, pair, direction, confidence, exp
+        )
+    await cb.message.edit_text(
+        f"📊 Сигнал\n"
+        f"Пара: {pair.replace('=X','')}\n"
+        f"Время экспирации: {exp} мин\n"
+        f"Направление: {direction}\n"
+        f"Уверенность: {confidence:.2f}%",
+        reply_markup=result_kb()
+    )
     await cb.answer()
 
-# Остальные callback_handlers для валютных пар и сигналов здесь (pairs, pair, exp, menu, news) остаются с lambda, как раньше
+@dp.callback_query(lambda c: c.data == "menu")
+async def result_menu(cb: types.CallbackQuery):
+    await cb.message.edit_text("🏠 Главное меню", reply_markup=main_menu())
+    await cb.answer()
 
-# ================= POSTBACK =================
-async def handle_postback(request: web.Request):
-    click_id = request.query.get("click_id")
-    event = request.query.get("event")
-    try:
-        amount = float(request.query.get("amount", 0))
-    except:
-        amount = 0
-    if not click_id:
-        return web.Response(text="No click_id", status=400)
-    user_id = int(click_id)
-    await add_user(user_id, pocket_id=str(click_id))
-    if event in ["deposit", "reg"] and amount > 0:
-        await update_balance(user_id, amount)
-    return web.Response(text="OK")
-
-# ================= WEBHOOK =================
-async def main():
-    await init_db()
-    await bot(DeleteWebhook(drop_pending_updates=True))
-    await bot(SetWebhook(url=WEBHOOK_URL))
-
-    app = web.Application()
-    handler = SimpleRequestHandler(dp, bot)
-    handler.register(app, WEBHOOK_PATH)
-    app.router.add_get("/postback", handle_postback)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, HOST, PORT)
-    await site.start()
-
-    logging.info(f"🚀 BOT LIVE на {HOST}:{PORT}")
-    await asyncio.Event().wait()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    finally:
-        asyncio.run(bot.session.close())
+@dp.callback_query(lambda c: c.data == "news")
+async def news(cb: types.CallbackQuery):
+    pair = PAIRS[0]  # Берём первую пару, можно менять на логику
+    exp = EXPIRATIONS[0]
+    direction, confidence = await get_signal(pair, interval="8h")
+    await cb.message.edit_text(
+        f"📰 Новости / Сигнал выбранной пары\n"
+        f"Пара: {pair.replace('=X','')}\n"
+        f"Время экспирации: {exp} мин\n"
+        f"Направление: {direction}\n"
+        f"Уверенность: {confidence:.2f}%",
+        reply_markup=result_kb()
+    )
+    await cb.answer()
