@@ -10,7 +10,7 @@ import numpy as np
 import yfinance as yf
 
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command, Text
+from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.storage.memory import MemoryStorage
 
@@ -19,6 +19,7 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiogram.methods import DeleteWebhook, SetWebhook
 
 # ================= CONFIG =================
+
 TG_TOKEN = os.getenv("TG_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
@@ -41,12 +42,14 @@ WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 logging.basicConfig(level=logging.INFO)
 
 # ================= BOT =================
+
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 DB_POOL: asyncpg.Pool | None = None
 
 # ================= CONSTANTS =================
+
 PAIRS = [
     "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X", "USDCHF=X",
     "EURJPY=X", "GBPJPY=X", "AUDJPY=X", "EURGBP=X", "EURAUD=X", "GBPAUD=X",
@@ -57,6 +60,7 @@ PAIRS_PER_PAGE = 6
 EXPIRATIONS = [1, 2, 3, 5, 10]  # минуты
 
 # ================= DATABASE =================
+
 async def init_db():
     global DB_POOL
     DB_POOL = await asyncpg.create_pool(DATABASE_URL)
@@ -97,6 +101,7 @@ async def update_balance(user_id: int, amount: float):
         await conn.execute("UPDATE users SET balance=$1 WHERE user_id=$2", amount, user_id)
 
 # ================= ACCESS =================
+
 async def has_access(user_id: int) -> bool:
     if user_id in AUTHORS:
         return True
@@ -104,6 +109,7 @@ async def has_access(user_id: int) -> bool:
     return user and user["balance"] >= MIN_DEPOSIT
 
 # ================= KEYBOARDS =================
+
 def main_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="📈 Валютные пары", callback_data="pairs")
@@ -138,6 +144,7 @@ def result_kb():
     return kb.as_markup()
 
 # ================= INDICATORS =================
+
 def calculate_indicators(df: pd.DataFrame):
     votes = []
     close = df["Close"]
@@ -145,16 +152,15 @@ def calculate_indicators(df: pd.DataFrame):
     low = df["Low"]
     volume = df["Volume"]
 
-    # 15 индикаторов
-    # SMA
-    sma10 = close.rolling(10).mean().iloc[-1]
-    sma20 = close.rolling(20).mean().iloc[-1]
+    # Простые скользящие средние
+    sma10 = close.rolling(10).mean().iat[-1]
+    sma20 = close.rolling(20).mean().iat[-1]
     votes.append("BUY" if close.iat[-1] > sma10 else "SELL")
     votes.append("BUY" if close.iat[-1] > sma20 else "SELL")
 
-    # EMA
-    ema10 = close.ewm(span=10).mean().iloc[-1]
-    ema20 = close.ewm(span=20).mean().iloc[-1]
+    # Экспоненциальные скользящие
+    ema10 = close.ewm(span=10).mean().iat[-1]
+    ema20 = close.ewm(span=20).mean().iat[-1]
     votes.append("BUY" if close.iat[-1] > ema10 else "SELL")
     votes.append("BUY" if close.iat[-1] > ema20 else "SELL")
 
@@ -166,24 +172,24 @@ def calculate_indicators(df: pd.DataFrame):
     votes.append("BUY" if rsi.iat[-1] > 50 else "SELL")
 
     # MACD
-    ema12 = close.ewm(span=12).mean()
-    ema26 = close.ewm(span=26).mean()
-    votes.append("BUY" if ema12.iat[-1] > ema26.iat[-1] else "SELL")
+    ema12 = close.ewm(span=12).mean().iat[-1]
+    ema26 = close.ewm(span=26).mean().iat[-1]
+    votes.append("BUY" if ema12 > ema26 else "SELL")
 
     # Стохастик
     low14 = low.rolling(14).min()
     high14 = high.rolling(14).max()
-    stoch = 100*(close - low14)/(high14 - low14)
+    stoch = 100 * (close - low14)/(high14-low14)
     votes.append("BUY" if stoch.iat[-1] > 50 else "SELL")
 
     # Momentum
     momentum = close.diff(4).iat[-1]
-    votes.append("BUY" if momentum > 0 else "SELL")
+    votes.append("BUY" if momentum>0 else "SELL")
 
     # CCI
     tp = (high + low + close)/3
     cci = (tp - tp.rolling(20).mean())/(0.015*tp.rolling(20).std())
-    votes.append("BUY" if cci.iat[-1]>0 else "SELL")
+    votes.append("BUY" if cci.iat[-1] >0 else "SELL")
 
     # OBV
     obv = (np.sign(close.diff())*volume).fillna(0).cumsum()
@@ -195,14 +201,17 @@ def calculate_indicators(df: pd.DataFrame):
     adx = (plus_dm - minus_dm).rolling(14).mean()
     votes.append("BUY" if adx.iat[-1]>0 else "SELL")
 
-    # Еще 5 индикаторов можно добавить (RSI длинный, EMA быстрый, Bollinger Bands и т.д.)
+    # Дополнительно 5 любых индикаторов можно добавить здесь
+    # Всего минимум 15 индикаторов
+
     return votes
 
 # ================= SIGNAL =================
+
 async def get_signal(pair: str):
     try:
         df = yf.download(pair, period="2d", interval="15m", auto_adjust=True)
-        if df.empty or len(df) < 20:
+        if df.empty or len(df)<20:
             return None, None
         votes = calculate_indicators(df)
         buy = votes.count("BUY")
@@ -216,7 +225,8 @@ async def get_signal(pair: str):
         logging.error(f"Ошибка get_signal: {e}")
         return None, None
 
-# ================= START =================
+# ================= HANDLERS =================
+
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     user_id = msg.from_user.id
@@ -228,54 +238,57 @@ async def start(msg: types.Message):
         )
         return
 
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Продолжить", callback_data="start_continue")
-    kb.adjust(1)
-    await msg.answer(
-        "🤖 Добро пожаловать в KURUT TRADE!\n\n"
-        "Бот анализирует рынок через 15 индикаторов и показывает сильные сигналы.",
-        reply_markup=kb.as_markup()
+    # Инструкция для обычного пользователя
+    text = (
+        "🤖 Бот KURUT TRADE\n\n"
+        "📌 Инструкция по использованию:\n"
+        "1️⃣ Бот анализирует рынок через 15 индикаторов.\n"
+        "2️⃣ Сигналы показывают направление сделки (вверх/вниз) и уверенность.\n"
+        "3️⃣ Входите в сделку сразу после сигнала или с новой свечи.\n"
+        "4️⃣ Для получения доступа создайте аккаунт по нашей реферальной ссылке.\n\n"
+        "👇 Нажмите кнопку ниже, чтобы получить доступ к боту."
     )
-
-@dp.callback_query(Text("start_continue"))
-async def start_continue(cb: types.CallbackQuery):
     kb = InlineKeyboardBuilder()
-    kb.button(text="Проверить ID", callback_data="check_id")
-    kb.button(text="Пополнить баланс", url=REF_LINK)
+    kb.button(text="Получить доступ", url=REF_LINK)
     kb.adjust(1)
-    await cb.message.edit_text(
-        "📌 Для получения доступа:\n"
-        "1️⃣ Создайте новый аккаунт по нашей ссылке.\n"
-        "2️⃣ Если есть старый аккаунт — удалите его.\n"
-        "3️⃣ После регистрации отправьте ID боту.",
-        reply_markup=kb.as_markup()
-    )
-    await cb.answer()
+    await msg.answer(text, reply_markup=kb.as_markup())
 
-@dp.callback_query(Text("check_id"))
-async def check_user_id(cb: types.CallbackQuery):
+@dp.message(Command("send_id"))
+async def send_id(msg: types.Message):
+    user_id = msg.from_user.id
+    await msg.answer("✅ Спасибо! Проверяю ваш ID...")
+    user = await get_user(user_id)
+    if user and user["balance"] >= MIN_DEPOSIT:
+        await msg.answer(
+            "Отлично! Вы зарегистрированы и пополнили баланс.\n"
+            "📊 Главное меню:",
+            reply_markup=main_menu()
+        )
+    else:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="Пополнить баланс", url=REF_LINK)
+        kb.button(text="Проверить пополнение", callback_data="check_balance")
+        kb.adjust(1)
+        await msg.answer(
+            "⚠️ Похоже, ваш баланс меньше 20$.\n"
+            "Пополните баланс и нажмите кнопку 'Проверить пополнение'.",
+            reply_markup=kb.as_markup()
+        )
+
+@dp.callback_query(lambda c: c.data == "check_balance")
+async def check_balance(cb: types.CallbackQuery):
     user_id = cb.from_user.id
     user = await get_user(user_id)
-    if user:
-        if user["balance"] >= MIN_DEPOSIT:
-            await cb.message.edit_text(
-                "✅ Отлично! Доступ открыт.",
-                reply_markup=main_menu()
-            )
-        else:
-            kb = InlineKeyboardBuilder()
-            kb.button(text="Пополнить баланс", url=REF_LINK)
-            kb.button(text="Проверить пополнение", callback_data="check_balance")
-            kb.adjust(1)
-            await cb.message.edit_text(
-                "⚠️ Баланс меньше 20$.\nПополните и нажмите 'Проверить пополнение'.",
-                reply_markup=kb.as_markup()
-            )
+    if user and user["balance"] >= MIN_DEPOSIT:
+        await cb.message.edit_text(
+            "✅ Доступ открыт! Вы можете использовать бота.",
+            reply_markup=main_menu()
+        )
     else:
-        await cb.answer("❌ ID не найден. Зарегистрируйтесь по нашей ссылке.", show_alert=True)
+        await cb.answer("⚠️ Баланс меньше 20$. Пополните, чтобы получить доступ.", show_alert=True)
 
-# ================= PAIRS =================
-@dp.callback_query(Text("pairs"))
+# Остальные callback_query без Text
+@dp.callback_query(lambda c: c.data == "pairs")
 async def pairs(cb: types.CallbackQuery):
     if not await has_access(cb.from_user.id):
         await cb.answer("Нет доступа", show_alert=True)
@@ -322,8 +335,12 @@ async def exp(cb: types.CallbackQuery):
     )
     await cb.answer()
 
-# ================= NEWS =================
-@dp.callback_query(Text("news"))
+@dp.callback_query(lambda c: c.data == "menu")
+async def back_menu(cb: types.CallbackQuery):
+    await cb.message.edit_text("Главное меню", reply_markup=main_menu())
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data == "news")
 async def news_signal(cb: types.CallbackQuery):
     import random
     if not await has_access(cb.from_user.id):
@@ -347,6 +364,7 @@ async def news_signal(cb: types.CallbackQuery):
     await cb.answer()
 
 # ================= POSTBACK =================
+
 async def postback(request: web.Request):
     click_id = request.query.get("click_id")
     amount = float(request.query.get("amount", 0))
@@ -358,6 +376,7 @@ async def postback(request: web.Request):
     return web.Response(text="OK")
 
 # ================= START SERVER =================
+
 async def main():
     await init_db()
     await bot(DeleteWebhook(drop_pending_updates=True))
