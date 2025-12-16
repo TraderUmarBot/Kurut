@@ -8,10 +8,9 @@ import asyncpg
 import pandas as pd
 import numpy as np
 import yfinance as yf
+
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
@@ -25,11 +24,12 @@ PORT = int(os.getenv("PORT", 10000))
 HOST = "0.0.0.0"
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut&code=50START"
+
 AUTHORS = [6117198446, 7079260196]
 MIN_DEPOSIT = 20.0
 
 if not TG_TOKEN or not DATABASE_URL or not RENDER_EXTERNAL_HOSTNAME:
-    print("❌ ENV не заданы")
+    print("❌ ENV variables not set")
     sys.exit(1)
 
 WEBHOOK_PATH = "/webhook"
@@ -37,97 +37,81 @@ WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 
 logging.basicConfig(level=logging.INFO)
 
-# ================= BOT ===================
+# ================= BOT =================
 bot = Bot(token=TG_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-DB_POOL: asyncpg.pool.Pool | None = None
+dp = Dispatcher()
+DB_POOL: asyncpg.Pool | None = None
 
-# ================= CONSTANTS ==============
+# ================= DATA =================
 PAIRS = [
     "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X",
     "EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X",
     "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
-PAIRS_PER_PAGE = 6
-EXPIRATIONS = [1,2,3,5,10]  # минуты
 
-# ================= DB =====================
+PAIRS_PER_PAGE = 6
+EXPIRATIONS = [1, 2, 3, 5, 10]
+
+# ================= DATABASE =================
 async def init_db():
     global DB_POOL
-    if DB_POOL is None:
-        DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    DB_POOL = await asyncpg.create_pool(DATABASE_URL)
+
     async with DB_POOL.acquire() as conn:
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
             pocket_id TEXT,
-            balance FLOAT DEFAULT 0
+            balance FLOAT DEFAULT 0,
+            registered BOOLEAN DEFAULT FALSE
         );
         """)
+
         await conn.execute("""
-        CREATE TABLE IF NOT EXISTS logs (
+        CREATE TABLE IF NOT EXISTS signals (
             id SERIAL PRIMARY KEY,
             user_id BIGINT,
             pair TEXT,
             direction TEXT,
             confidence FLOAT,
-            exp_minutes INT,
-            timestamp TIMESTAMP DEFAULT now()
+            expiration INT,
+            created_at TIMESTAMP DEFAULT now()
         );
         """)
 
-async def add_user(user_id: int, pocket_id: str):
-    async with DB_POOL.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO users (user_id, pocket_id) VALUES ($1,$2) ON CONFLICT (user_id) DO UPDATE SET pocket_id = $2",
-            user_id, pocket_id
-        )
-
-async def update_balance(user_id: int, amount: float):
-    async with DB_POOL.acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET balance = balance + $1 WHERE user_id=$2",
-            amount, user_id
-        )
-
-async def get_balance(user_id: int) -> float:
-    async with DB_POOL.acquire() as conn:
-        val = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", user_id)
-        return val or 0.0
-
-async def check_user_access(user_id: int) -> bool:
+async def has_access(user_id: int) -> bool:
     if user_id in AUTHORS:
         return True
-    balance = await get_balance(user_id)
-    return balance >= MIN_DEPOSIT
-
-# ================= FSM =====================
-class TradeState(StatesGroup):
-    waiting_id = State()
-    choosing_pair = State()
-    choosing_exp = State()
+    async with DB_POOL.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT balance FROM users WHERE user_id=$1", user_id
+        )
+        return row and row["balance"] >= MIN_DEPOSIT
 
 # ================= KEYBOARDS =================
 def main_menu():
     kb = InlineKeyboardBuilder()
-    kb.button(text="📈 Валютные пары", callback_data="pairs")
-    kb.button(text="📰 Новости", callback_data="news")
+    kb.button(text="📈 Получить сигнал", callback_data="pairs:0")
     kb.adjust(1)
     return kb.as_markup()
 
-def pairs_kb(page=0):
+def pairs_kb(page: int):
     kb = InlineKeyboardBuilder()
     start = page * PAIRS_PER_PAGE
-    for p in PAIRS[start:start+PAIRS_PER_PAGE]:
-        kb.button(text=p.replace("=X",""), callback_data=f"pair:{p}")
+    end = start + PAIRS_PER_PAGE
+
+    for pair in PAIRS[start:end]:
+        kb.button(text=pair.replace("=X", ""), callback_data=f"pair:{pair}")
+
     if page > 0:
-        kb.button(text="⬅️ Назад", callback_data=f"pairs_page:{page-1}")
-    if start + PAIRS_PER_PAGE < len(PAIRS):
-        kb.button(text="➡️ Вперёд", callback_data=f"pairs_page:{page+1}")
+        kb.button(text="⬅ Назад", callback_data=f"pairs:{page-1}")
+    if end < len(PAIRS):
+        kb.button(text="➡ Вперёд", callback_data=f"pairs:{page+1}")
+
     kb.adjust(2)
     return kb.as_markup()
 
-def expiration_kb(pair):
+def expiration_kb(pair: str):
     kb = InlineKeyboardBuilder()
     for exp in EXPIRATIONS:
         kb.button(text=f"{exp} мин", callback_data=f"exp:{pair}:{exp}")
@@ -141,191 +125,181 @@ def result_kb():
     kb.adjust(2)
     return kb.as_markup()
 
-def access_kb():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Получить доступ", url=REF_LINK)
-    kb.button(text="Проверить ID", callback_data="check_id")
-    kb.adjust(1)
-    return kb.as_markup()
-
-def after_access_kb():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Я пополнил баланс", callback_data="check_balance")
-    kb.adjust(1)
-    return kb.as_markup()
-
 # ================= INDICATORS =================
-def calculate_indicators(data: pd.DataFrame):
-    indicators = []
+def calculate_indicators(df: pd.DataFrame):
+    votes = []
 
-    close = data['Close']
-    high = data['High']
-    low = data['Low']
-    volume = data['Volume']
+    close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
+    volume = df["Volume"]
 
-    indicators.append('BUY' if close.iloc[-1] > close.rolling(10).mean().iloc[-1] else 'SELL')
-    indicators.append('BUY' if close.iloc[-1] > close.rolling(20).mean().iloc[-1] else 'SELL')
-    indicators.append('BUY' if close.iloc[-1] > close.ewm(span=10).mean().iloc[-1] else 'SELL')
-    indicators.append('BUY' if close.iloc[-1] > close.ewm(span=20).mean().iloc[-1] else 'SELL')
+    votes.append("BUY" if close.iloc[-1] > close.rolling(10).mean().iloc[-1] else "SELL")
+    votes.append("BUY" if close.iloc[-1] > close.rolling(20).mean().iloc[-1] else "SELL")
+
+    votes.append("BUY" if close.iloc[-1] > close.ewm(span=10).mean().iloc[-1] else "SELL")
+    votes.append("BUY" if close.iloc[-1] > close.ewm(span=20).mean().iloc[-1] else "SELL")
 
     delta = close.diff()
-    gain = delta.where(delta>0,0).rolling(14).mean()
-    loss = -delta.where(delta<0,0).rolling(14).mean()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = -delta.clip(upper=0).rolling(14).mean()
     rs = gain / loss
-    rsi = 100 - (100/(1+rs))
-    indicators.append('BUY' if rsi.iloc[-1] > 50 else 'SELL')
+    rsi = 100 - (100 / (1 + rs))
+    votes.append("BUY" if rsi.iloc[-1] > 50 else "SELL")
 
     ema12 = close.ewm(span=12).mean()
     ema26 = close.ewm(span=26).mean()
     macd = ema12 - ema26
     signal = macd.ewm(span=9).mean()
-    indicators.append('BUY' if macd.iloc[-1] > signal.iloc[-1] else 'SELL')
+    votes.append("BUY" if macd.iloc[-1] > signal.iloc[-1] else "SELL")
 
-    sma20 = close.rolling(20).mean()
-    indicators.append('BUY' if close.iloc[-1] > sma20.iloc[-1] else 'SELL')
+    sma = close.rolling(20).mean()
+    votes.append("BUY" if close.iloc[-1] > sma.iloc[-1] else "SELL")
 
-    low14 = close.rolling(14).min()
-    high14 = close.rolling(14).max()
-    k = 100*(close - low14)/(high14 - low14)
-    indicators.append('BUY' if k.iloc[-1] > 50 else 'SELL')
+    low14 = low.rolling(14).min()
+    high14 = high.rolling(14).max()
+    stoch = 100 * (close - low14) / (high14 - low14)
+    votes.append("BUY" if stoch.iloc[-1] > 50 else "SELL")
 
-    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean()
-    indicators.append('BUY' if close.iloc[-1] > close.iloc[-2] else 'SELL')
+    votes.append("BUY" if close.iloc[-1] > close.iloc[-2] else "SELL")
 
-    tp = (high + low + close)/3
-    cci = (tp - tp.rolling(20).mean())/(0.015*tp.rolling(20).std())
-    indicators.append('BUY' if cci.iloc[-1] > 0 else 'SELL')
-
-    plus_dm = high.diff()
-    minus_dm = low.diff() * -1
-    tr14 = tr.rolling(14).sum()
-    plus_di = 100 * plus_dm.rolling(14).sum() / tr14
-    minus_di = 100 * minus_dm.rolling(14).sum() / tr14
-    adx = (abs(plus_di - minus_di)/(plus_di + minus_di))*100
-    indicators.append('BUY' if plus_di.iloc[-1] > minus_di.iloc[-1] else 'SELL')
-
-    indicators.append('BUY' if k.iloc[-1] < -50 else 'SELL')
+    tp = (high + low + close) / 3
+    cci = (tp - tp.rolling(20).mean()) / (0.015 * tp.rolling(20).std())
+    votes.append("BUY" if cci.iloc[-1] > 0 else "SELL")
 
     momentum = close.diff(4)
-    indicators.append('BUY' if momentum.iloc[-1] > 0 else 'SELL')
+    votes.append("BUY" if momentum.iloc[-1] > 0 else "SELL")
 
-    obv = (np.sign(close.diff())*volume).cumsum()
-    indicators.append('BUY' if obv.iloc[-1] > obv.iloc[-2] else 'SELL')
+    obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
+    votes.append("BUY" if obv.iloc[-1] > obv.iloc[-2] else "SELL")
 
-    tenkan = (high.rolling(9).max() + low.rolling(9).min())/2
-    kijun = (high.rolling(26).max() + low.rolling(26).min())/2
-    indicators.append('BUY' if tenkan.iloc[-1] > kijun.iloc[-1] else 'SELL')
+    tenkan = (high.rolling(9).max() + low.rolling(9).min()) / 2
+    kijun = (high.rolling(26).max() + low.rolling(26).min()) / 2
+    votes.append("BUY" if tenkan.iloc[-1] > kijun.iloc[-1] else "SELL")
 
-    return indicators
+    return votes
 
-# ================= SIGNALS =================
-async def get_signal(pair: str, interval="8h"):
-    try:
-        data = yf.download(pair, period="15d", interval=interval, progress=False)
-        if data.empty or len(data) < 15:
-            return "ПОКУПКА", 50.0
-        indicators = calculate_indicators(data)
-        buy_count = indicators.count('BUY')
-        sell_count = indicators.count('SELL')
-        if buy_count > sell_count:
-            direction = 'ПОКУПКА'
-            confidence = buy_count / len(indicators) * 100
-        else:
-            direction = 'ПРОДАЖА'
-            confidence = sell_count / len(indicators) * 100
-        return direction, confidence
-    except Exception as e:
-        print("Ошибка get_signal:", e)
-        return "НЕОПРЕДЕЛЕНО", 50.0
+# ================= SIGNAL =================
+async def get_signal(pair: str):
+    data = yf.download(pair, interval="15m", period="7d", progress=False)
+
+    if data.empty or len(data) < 30:
+        return None, 0.0
+
+    data = data.tail(30)
+    votes = calculate_indicators(data)
+
+    buy = votes.count("BUY")
+    sell = votes.count("SELL")
+
+    if buy == sell:
+        return None, 0.0
+
+    direction = "ПОКУПКА" if buy > sell else "ПРОДАЖА"
+    confidence = max(buy, sell) / len(votes) * 100
+
+    return direction, round(confidence, 2)
 
 # ================= HANDLERS =================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
-    user_id = msg.from_user.id
-    async with DB_POOL.acquire() as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+    await msg.answer(
+        "🤖 KURUT TRADE BOT\n\n"
+        "• Анализ рынка по 15 индикаторам\n"
+        "• Таймфрейм: 15 минут\n"
+        "• Без рандома и нейтрала\n\n"
+        "Для доступа:\n"
+        "1️⃣ Зарегистрируйтесь по ссылке\n"
+        "2️⃣ Пополните баланс от 20$\n"
+        "3️⃣ Доступ откроется автоматически\n\n"
+        f"🔗 {REF_LINK}\n\n"
+        "После доступа — получите сигналы 👇",
+        reply_markup=main_menu()
+    )
 
-    if user_id in AUTHORS:
-        await msg.answer("🏠 Главное меню (Авторский доступ)", reply_markup=main_menu())
+@dp.callback_query(lambda c: c.data.startswith("pairs"))
+async def pairs(cb: types.CallbackQuery):
+    if not await has_access(cb.from_user.id):
+        await cb.answer("❌ Нет доступа", show_alert=True)
         return
 
-    text = (
-        "👋 Привет! Добро пожаловать!\n\n"
-        "📌 Бот создан командой KURUT TRADE.\n"
-        "💡 Что умеет бот:\n"
-        "- Анализ рынка по 15 индикаторам\n"
-        "- Сигналы: ПОКУПКА / ПРОДАЖА\n"
-        "- Уверенность сигнала в процентах\n"
-        "- Время экспирации выбирает пользователь\n\n"
-        "📊 Как использовать:\n"
-        "1. Зарегистрируйтесь по нашей реферальной ссылке\n"
-        "2. Если есть аккаунт, удалите старый\n"
-        "3. Нажмите 'Проверить ID'\n"
-        "4. Пополните баланс на ≥20$\n"
-        "5. После пополнения получите доступ к сигналам"
-    )
-    await msg.answer(text, reply_markup=access_kb())
-
-# ================= HANDLERS ДЛЯ ВАЛЮТНЫХ ПАР И НОВОСТЕЙ =================
-
-@dp.callback_query(lambda c: c.data == "pairs")
-async def pairs(cb: types.CallbackQuery):
-    await cb.message.edit_text("📈 Выберите валютную пару", reply_markup=pairs_kb())
-    await cb.answer()
-
-@dp.callback_query(lambda c: c.data.startswith("pairs_page:"))
-async def pairs_page(cb: types.CallbackQuery):
     page = int(cb.data.split(":")[1])
     await cb.message.edit_text("📈 Выберите валютную пару", reply_markup=pairs_kb(page))
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data.startswith("pair:"))
+@dp.callback_query(lambda c: c.data.startswith("pair"))
 async def pair(cb: types.CallbackQuery):
     pair = cb.data.split(":")[1]
     await cb.message.edit_text(
-        f"⏱ Вы выбрали пару {pair.replace('=X','')}. Выберите время экспирации:",
+        f"⏱ Пара {pair.replace('=X','')}\nВыберите экспирацию",
         reply_markup=expiration_kb(pair)
     )
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data.startswith("exp:"))
+@dp.callback_query(lambda c: c.data.startswith("exp"))
 async def expiration(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
-    exp = int(exp)
-    direction, confidence = await get_signal(pair, interval="8h")
-    user_id = cb.from_user.id
+    direction, confidence = await get_signal(pair)
+
+    if not direction:
+        await cb.answer("❌ Нет сигнала", show_alert=True)
+        return
+
     async with DB_POOL.acquire() as conn:
         await conn.execute(
-            "INSERT INTO logs(user_id,pair,direction,confidence,exp_minutes) VALUES($1,$2,$3,$4,$5)",
-            user_id, pair, direction, confidence, exp
+            "INSERT INTO signals(user_id,pair,direction,confidence,expiration) VALUES($1,$2,$3,$4,$5)",
+            cb.from_user.id, pair, direction, confidence, int(exp)
         )
+
     await cb.message.edit_text(
-        f"📊 Сигнал\n"
+        f"📊 СИГНАЛ\n\n"
         f"Пара: {pair.replace('=X','')}\n"
-        f"Время экспирации: {exp} мин\n"
+        f"Экспирация: {exp} мин\n"
         f"Направление: {direction}\n"
-        f"Уверенность: {confidence:.2f}%",
+        f"Уверенность: {confidence}%",
         reply_markup=result_kb()
     )
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data == "menu")
-async def result_menu(cb: types.CallbackQuery):
+async def menu(cb: types.CallbackQuery):
     await cb.message.edit_text("🏠 Главное меню", reply_markup=main_menu())
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data == "news")
-async def news(cb: types.CallbackQuery):
-    pair = PAIRS[0]  # Берём первую пару, можно менять на логику
-    exp = EXPIRATIONS[0]
-    direction, confidence = await get_signal(pair, interval="8h")
-    await cb.message.edit_text(
-        f"📰 Новости / Сигнал выбранной пары\n"
-        f"Пара: {pair.replace('=X','')}\n"
-        f"Время экспирации: {exp} мин\n"
-        f"Направление: {direction}\n"
-        f"Уверенность: {confidence:.2f}%",
-        reply_markup=result_kb()
-    )
-    await cb.answer()
+# ================= POSTBACK =================
+async def postback(request: web.Request):
+    click_id = request.query.get("click_id")
+    amount = float(request.query.get("amount", 0))
+
+    if not click_id:
+        return web.Response(text="NO CLICK_ID")
+
+    async with DB_POOL.acquire() as conn:
+        await conn.execute("""
+        INSERT INTO users(user_id,balance,registered)
+        VALUES($1,$2,TRUE)
+        ON CONFLICT (user_id)
+        DO UPDATE SET balance = users.balance + $2
+        """, int(click_id), amount)
+
+    return web.Response(text="OK")
+
+# ================= WEBHOOK =================
+async def main():
+    await init_db()
+    await bot(DeleteWebhook(drop_pending_updates=True))
+    await bot(SetWebhook(url=WEBHOOK_URL))
+
+    app = web.Application()
+    SimpleRequestHandler(dp, bot).register(app, WEBHOOK_PATH)
+    app.router.add_get("/postback", postback)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, HOST, PORT).start()
+
+    logging.info("🚀 BOT STARTED")
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main())
