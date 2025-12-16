@@ -2,7 +2,6 @@ import os
 import sys
 import asyncio
 import logging
-from datetime import datetime
 
 import asyncpg
 import pandas as pd
@@ -12,6 +11,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.methods import DeleteWebhook, SetWebhook
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
@@ -143,7 +143,7 @@ def result_kb():
 
 def access_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="Получить доступ", url=REF_LINK)
+    kb.button(text="Перейти к боту", url=REF_LINK)
     kb.button(text="Проверить ID", callback_data="check_id")
     kb.adjust(1)
     return kb.as_markup()
@@ -188,7 +188,6 @@ def calculate_indicators(data: pd.DataFrame):
 
     # 7 Bollinger
     sma20 = close.rolling(20).mean()
-    std = close.rolling(20).std()
     indicators.append('BUY' if close.iloc[-1] > sma20.iloc[-1] else 'SELL')
 
     # 8 Stochastic
@@ -236,15 +235,11 @@ def calculate_indicators(data: pd.DataFrame):
 
 # ================= SIGNALS =================
 async def get_signal(pair: str, expiration: int = 1):
-    """
-    Сигнал на основе последних свечей для выбранной экспирации
-    """
     try:
-        # Скачиваем последние 100 свечей с интервалом в минуты, соответствующем экспирации
-        interval = f"{expiration}m"  # интервал в минутах
-        data = yf.download(pair, period="2d", interval=interval, progress=False)  # последние 2 дня достаточно
+        interval = f"{expiration}m"
+        data = yf.download(pair, period="1d", interval=interval, progress=False)
         if data.empty or len(data) < 20:
-            return "ПОКУПКА", 50.0  # минимальная уверенность если нет данных
+            return "ПОКУПКА", 50.0
 
         indicators = calculate_indicators(data)
         buy_count = indicators.count('BUY')
@@ -260,21 +255,12 @@ async def get_signal(pair: str, expiration: int = 1):
         return direction, confidence
 
     except Exception as e:
-        # логируем ошибку
         print("Ошибка get_signal:", e)
         return "НЕОПРЕДЕЛЕНО", 50.0
 
-# ================= HANDLERS =================
+# ================= START & REGISTRATION =================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
-    user_id = msg.from_user.id
-    async with DB_POOL.acquire() as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
-
-    if user_id in AUTHORS:
-        await msg.answer("🏠 Главное меню (Авторский доступ)", reply_markup=main_menu())
-        return
-
     text = (
         "👋 Привет! Добро пожаловать!\n\n"
         "📌 Бот создан командой KURUT TRADE.\n"
@@ -292,93 +278,42 @@ async def start(msg: types.Message):
     )
     await msg.answer(text, reply_markup=access_kb())
 
+# ================= FSM HANDLERS =================
 @dp.callback_query(lambda c: c.data == "check_id")
-async def check_id(cb: types.CallbackQuery):
+async def check_id_cb(cb: types.CallbackQuery, state: FSMContext):
     await cb.message.answer("✏️ Отправьте свой Pocket Option ID:")
-    await TradeState.waiting_id.set()
+    await state.set_state(TradeState.waiting_id)
     await cb.answer()
 
 @dp.message()
-async def receive_id(msg: types.Message):
-    state = dp.storage.get_state(chat=msg.chat.id, user=msg.from_user.id)
-    if state != TradeState.waiting_id:
+async def receive_id(msg: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state != TradeState.waiting_id:
         return
+
     user_id = msg.from_user.id
     pocket_id = msg.text.strip()
     await add_user(user_id, pocket_id)
-    await msg.answer("✅ ID зарегистрирован. Теперь пополните баланс ≥20$ и нажмите 'Я пополнил баланс'.", reply_markup=after_access_kb())
-    await dp.storage.set_state(chat=msg.chat.id, user=msg.from_user.id, state=None)
+
+    await msg.answer(
+        "✅ ID зарегистрирован. Теперь пополните баланс ≥20$ и нажмите 'Я пополнил баланс'.",
+        reply_markup=after_access_kb()
+    )
+    await state.clear()
 
 @dp.callback_query(lambda c: c.data == "check_balance")
 async def check_balance(cb: types.CallbackQuery):
     user_id = cb.from_user.id
-    access = await check_user_access(user_id)
-    if access:
+    balance = await get_balance(user_id)
+
+    if balance >= MIN_DEPOSIT:
         await cb.message.answer("🎉 Доступ к боту подтвержден!", reply_markup=main_menu())
     else:
-        await cb.message.answer(f"❌ Доступ не подтвержден. Минимальный депозит {MIN_DEPOSIT}$")
-    await cb.answer()
-
-@dp.callback_query(lambda c: c.data == "pairs")
-async def pairs(cb: types.CallbackQuery):
-    await cb.message.edit_text("📈 Выберите валютную пару", reply_markup=pairs_kb())
-    await cb.answer()
-
-@dp.callback_query(lambda c: c.data.startswith("pairs_page:"))
-async def pairs_page(cb: types.CallbackQuery):
-    page = int(cb.data.split(":")[1])
-    await cb.message.edit_text("📈 Выберите валютную пару", reply_markup=pairs_kb(page))
-    await cb.answer()
-
-@dp.callback_query(lambda c: c.data.startswith("pair:"))
-async def pair(cb: types.CallbackQuery):
-    pair = cb.data.split(":")[1]
-    await cb.message.edit_text(
-        f"⏱ Вы выбрали пару {pair.replace('=X','')}. Выберите время экспирации:",
-        reply_markup=expiration_kb(pair)
-    )
-    await cb.answer()
-
-@dp.callback_query(lambda c: c.data.startswith("exp:"))
-async def expiration(cb: types.CallbackQuery):
-    _, pair, exp = cb.data.split(":")
-    exp = int(exp)
-    direction, confidence = await get_signal(pair, exp)
-    user_id = cb.from_user.id
-    async with DB_POOL.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO logs(user_id,pair,direction,confidence,exp_minutes) VALUES($1,$2,$3,$4,$5)",
-            user_id, pair, direction, confidence, exp
+        await cb.message.answer(
+            f"❌ Доступ не подтвержден. Минимальный депозит {MIN_DEPOSIT}$.\n"
+            "Пополните баланс и нажмите снова 'Я пополнил баланс'.",
+            reply_markup=after_access_kb()
         )
-    await cb.message.edit_text(
-        f"📊 Сигнал\n"
-        f"Пара: {pair.replace('=X','')}\n"
-        f"Время экспирации: {exp} мин\n"
-        f"Направление: {direction}\n"
-        f"Уверенность: {confidence:.2f}%",
-        reply_markup=result_kb()
-    )
-    await cb.answer()
-
-@dp.callback_query(lambda c: c.data == "menu")
-async def result_menu(cb: types.CallbackQuery):
-    await cb.message.edit_text("🏠 Главное меню", reply_markup=main_menu())
-    await cb.answer()
-
-@dp.callback_query(lambda c: c.data == "news")
-async def news(cb: types.CallbackQuery):
-    # Выбираем случайную пару и экспирацию
-    pair = PAIRS[0]  # Можно улучшить по алгоритму
-    exp = EXPIRATIONS[0]
-    direction, confidence = await get_signal(pair, exp)
-    await cb.message.edit_text(
-        f"📊 Новости / Сигнал автоматически выбранной пары\n"
-        f"Пара: {pair.replace('=X','')}\n"
-        f"Время экспирации: {exp} мин\n"
-        f"Направление: {direction}\n"
-        f"Уверенность: {confidence:.2f}%",
-        reply_markup=result_kb()
-    )
     await cb.answer()
 
 # ================= POSTBACK =================
@@ -389,12 +324,16 @@ async def handle_postback(request: web.Request):
         amount = float(request.query.get("amount", 0))
     except:
         amount = 0
+
     if not click_id:
         return web.Response(text="No click_id", status=400)
+
     user_id = int(click_id)
     await add_user(user_id, pocket_id=str(click_id))
+
     if event in ["deposit", "reg"] and amount > 0:
         await update_balance(user_id, amount)
+
     return web.Response(text="OK")
 
 # ================= WEBHOOK =================
