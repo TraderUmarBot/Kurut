@@ -142,11 +142,10 @@ def calculate_indicators(df: pd.DataFrame):
     volume = df["Volume"]
     votes = []
 
-    # Проверяем, что хватает данных
     if len(close) < 30:
         return []
 
-    # Скользящие средние
+    # SMA и EMA
     sma10 = close.rolling(10).mean().iloc[-1]
     sma20 = close.rolling(20).mean().iloc[-1]
     ema10 = close.ewm(span=10).mean().iloc[-1]
@@ -169,23 +168,8 @@ def calculate_indicators(df: pd.DataFrame):
     ema26 = close.ewm(span=26).mean().iloc[-1]
     votes.append("BUY" if ema12 > ema26 else "SELL")
 
-    # SMA20
-    sma20 = close.rolling(20).mean().iloc[-1]
-    votes.append("BUY" if close.iloc[-1] > sma20 else "SELL")
-
-    # Stochastic
-    low14 = low.rolling(14).min().iloc[-1]
-    high14 = high.rolling(14).max().iloc[-1]
-    stoch = 100 * (close.iloc[-1] - low14) / (high14 - low14) if (high14 - low14) != 0 else 50
-    votes.append("BUY" if stoch > 50 else "SELL")
-
     # Momentum
     votes.append("BUY" if close.iloc[-1] > close.iloc[-2] else "SELL")
-
-    # CCI
-    tp = (high + low + close) / 3
-    cci = (tp.iloc[-1] - tp.rolling(20).mean().iloc[-1]) / (0.015 * tp.rolling(20).std().iloc[-1])
-    votes.append("BUY" if cci > 0 else "SELL")
 
     # OBV
     obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
@@ -195,6 +179,17 @@ def calculate_indicators(df: pd.DataFrame):
     tenkan = (high.rolling(9).max() + low.rolling(9).min()) / 2
     kijun = (high.rolling(26).max() + low.rolling(26).min()) / 2
     votes.append("BUY" if tenkan.iloc[-1] > kijun.iloc[-1] else "SELL")
+
+    # Stochastic
+    low14 = low.rolling(14).min().iloc[-1]
+    high14 = high.rolling(14).max().iloc[-1]
+    stoch = 100 * (close.iloc[-1] - low14) / (high14 - low14) if (high14 - low14) != 0 else 50
+    votes.append("BUY" if stoch > 50 else "SELL")
+
+    # CCI
+    tp = (high + low + close) / 3
+    cci = (tp.iloc[-1] - tp.rolling(20).mean().iloc[-1]) / (0.015 * tp.rolling(20).std().iloc[-1])
+    votes.append("BUY" if cci > 0 else "SELL")
 
     return votes
 
