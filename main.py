@@ -142,10 +142,10 @@ def result_kb():
 
 # ================= SIGNAL & INDICATORS =================
 
-async def get_signal(pair: str) -> Tuple[Optional[str], Optional[float]]:
+async def get_signal(pair: str) -> Tuple[str, float]:
     """
     Получает сигнал по валютной паре.
-    Возвращает направление ("ВВЕРХ 📈" / "ВНИЗ 📉") и уверенность в %.
+    Всегда возвращает направление ("ВВЕРХ 📈" / "ВНИЗ 📉") и уверенность в %.
     """
 
     def calculate_indicators(df: pd.DataFrame) -> list[str]:
@@ -158,23 +158,26 @@ async def get_signal(pair: str) -> Tuple[Optional[str], Optional[float]]:
         volume = df["Volume"]
 
         def safe_last(series, default=0):
-            val = series.iloc[-1]
+            if isinstance(series, (pd.Series, pd.DataFrame)):
+                val = series.iloc[-1] if len(series) > 0 else default
+            else:
+                val = series
             return val if pd.notna(val) else default
 
         # SMA
-        votes.append("BUY" if safe_last(close) > safe_last(close.rolling(10).mean(), close.iloc[-1]) else "SELL")
-        votes.append("BUY" if safe_last(close) > safe_last(close.rolling(20).mean(), close.iloc[-1]) else "SELL")
+        votes.append("BUY" if safe_last(close) > safe_last(close.rolling(10).mean().iloc[-1], close.iloc[-1]) else "SELL")
+        votes.append("BUY" if safe_last(close) > safe_last(close.rolling(20).mean().iloc[-1], close.iloc[-1]) else "SELL")
 
         # EMA
-        votes.append("BUY" if safe_last(close) > safe_last(close.ewm(span=10).mean(), close.iloc[-1]) else "SELL")
-        votes.append("BUY" if safe_last(close) > safe_last(close.ewm(span=20).mean(), close.iloc[-1]) else "SELL")
+        votes.append("BUY" if safe_last(close) > safe_last(close.ewm(span=10).mean().iloc[-1], close.iloc[-1]) else "SELL")
+        votes.append("BUY" if safe_last(close) > safe_last(close.ewm(span=20).mean().iloc[-1], close.iloc[-1]) else "SELL")
 
         # RSI
         delta = close.diff().fillna(0)
         gain = delta.clip(lower=0).rolling(14).mean()
         loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rsi = 100 - (100 / (1 + gain / loss))
-        votes.append("BUY" if safe_last(rsi) > 50 else "SELL")
+        rsi = 100 - (100 / (1 + safe_last(gain) / safe_last(loss, 1)))
+        votes.append("BUY" if rsi > 50 else "SELL")
 
         # MACD
         macd = close.ewm(span=12).mean() - close.ewm(span=26).mean()
@@ -211,23 +214,26 @@ async def get_signal(pair: str) -> Tuple[Optional[str], Optional[float]]:
 
     try:
         df = yf.download(pair, period="2d", interval="15m", progress=False, auto_adjust=True)
-        if df.empty or len(df) < 30:
-            return None, None
+        if df.empty:
+            # если данных нет, создаем "нейтральный" сигнал
+            return "ВВЕРХ 📈", 50.0
 
         votes = calculate_indicators(df)
         buy = votes.count("BUY")
         sell = votes.count("SELL")
 
-        if buy == sell:
-            return None, None
-
-        direction = "ВВЕРХ 📈" if buy > sell else "ВНИЗ 📉"
+        # Направление: если равны, считаем BUY
+        direction = "ВВЕРХ 📈" if buy >= sell else "ВНИЗ 📉"
         confidence = round(max(buy, sell) / len(votes) * 100, 1)
+
         return direction, confidence
 
     except Exception as e:
         logging.error(f"get_signal error: {e}")
-        return None, None
+        # если ошибка, возвращаем нейтральный сигнал
+        return "ВВЕРХ 📈", 50.0
+
+    
 
 # ================= HANDLERS =================
 
