@@ -1,6 +1,7 @@
 aiogram
 asyncpg
+pandas
+numpy
+tvdatafeed
 aiohttp
 yfinance
-numpy
-pandas
