@@ -134,6 +134,7 @@ def result_kb():
     return kb.as_markup()
 
 # ================= INDICATORS =================
+
 def calculate_indicators(df: pd.DataFrame):
     close = df["Close"]
     high = df["High"]
@@ -141,11 +142,20 @@ def calculate_indicators(df: pd.DataFrame):
     volume = df["Volume"]
     votes = []
 
+    # Проверяем, что хватает данных
+    if len(close) < 30:
+        return []
+
     # Скользящие средние
-    votes.append("BUY" if close.iloc[-1] > close.rolling(10).mean().iloc[-1] else "SELL")
-    votes.append("BUY" if close.iloc[-1] > close.rolling(20).mean().iloc[-1] else "SELL")
-    votes.append("BUY" if close.iloc[-1] > close.ewm(span=10).mean().iloc[-1] else "SELL")
-    votes.append("BUY" if close.iloc[-1] > close.ewm(span=20).mean().iloc[-1] else "SELL")
+    sma10 = close.rolling(10).mean().iloc[-1]
+    sma20 = close.rolling(20).mean().iloc[-1]
+    ema10 = close.ewm(span=10).mean().iloc[-1]
+    ema20 = close.ewm(span=20).mean().iloc[-1]
+
+    votes.append("BUY" if close.iloc[-1] > sma10 else "SELL")
+    votes.append("BUY" if close.iloc[-1] > sma20 else "SELL")
+    votes.append("BUY" if close.iloc[-1] > ema10 else "SELL")
+    votes.append("BUY" if close.iloc[-1] > ema20 else "SELL")
 
     # RSI
     delta = close.diff()
@@ -155,32 +165,37 @@ def calculate_indicators(df: pd.DataFrame):
     votes.append("BUY" if rsi.iloc[-1] > 50 else "SELL")
 
     # EMA12 / EMA26
-    ema12 = close.ewm(span=12).mean()
-    ema26 = close.ewm(span=26).mean()
-    votes.append("BUY" if ema12.iloc[-1] > ema26.iloc[-1] else "SELL")
+    ema12 = close.ewm(span=12).mean().iloc[-1]
+    ema26 = close.ewm(span=26).mean().iloc[-1]
+    votes.append("BUY" if ema12 > ema26 else "SELL")
 
     # SMA20
-    sma20 = close.rolling(20).mean()
-    votes.append("BUY" if close.iloc[-1] > sma20.iloc[-1] else "SELL")
+    sma20 = close.rolling(20).mean().iloc[-1]
+    votes.append("BUY" if close.iloc[-1] > sma20 else "SELL")
 
     # Stochastic
-    low14 = low.rolling(14).min()
-    high14 = high.rolling(14).max()
-    stoch = 100 * (close - low14) / (high14 - low14)
-    votes.append("BUY" if stoch.iloc[-1] > 50 else "SELL")
+    low14 = low.rolling(14).min().iloc[-1]
+    high14 = high.rolling(14).max().iloc[-1]
+    stoch = 100 * (close.iloc[-1] - low14) / (high14 - low14) if (high14 - low14) != 0 else 50
+    votes.append("BUY" if stoch > 50 else "SELL")
 
     # Momentum
     votes.append("BUY" if close.iloc[-1] > close.iloc[-2] else "SELL")
+
+    # CCI
     tp = (high + low + close) / 3
-    cci = (tp - tp.rolling(20).mean()) / (0.015 * tp.rolling(20).std())
-    votes.append("BUY" if cci.iloc[-1] > 0 else "SELL")
-    momentum = close.diff(4)
-    votes.append("BUY" if momentum.iloc[-1] > 0 else "SELL")
+    cci = (tp.iloc[-1] - tp.rolling(20).mean().iloc[-1]) / (0.015 * tp.rolling(20).std().iloc[-1])
+    votes.append("BUY" if cci > 0 else "SELL")
+
+    # OBV
     obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
     votes.append("BUY" if obv.iloc[-1] > obv.iloc[-2] else "SELL")
+
+    # Tenkan / Kijun
     tenkan = (high.rolling(9).max() + low.rolling(9).min()) / 2
     kijun = (high.rolling(26).max() + low.rolling(26).min()) / 2
     votes.append("BUY" if tenkan.iloc[-1] > kijun.iloc[-1] else "SELL")
+
     return votes
 
 # ================= SIGNAL =================
