@@ -215,7 +215,13 @@ async def get_signal_with_expiration(pair: str, requested_exp: int) -> Tuple[str
             votes = calculate_indicators(df)
             buy = votes.count("BUY")
             sell = votes.count("SELL")
-            direction = "ВВЕРХ 📈" if buy >= sell else "ВНИЗ 📉"
+            if buy > sell:
+    direction = "ВВЕРХ 📈"
+elif sell > buy:
+    direction = "ВНИЗ 📉"
+else:
+    # при равенстве считаем сигнал слабым
+    direction = "СИГНАЛ НЕЯСЕН"
             confidence = round(max(buy, sell) / len(votes) * 100, 1)
 
             if confidence > best_conf:
