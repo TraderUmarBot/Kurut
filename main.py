@@ -29,7 +29,9 @@ HOST = "0.0.0.0"
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut"
 
+# 👑 АВТОРЫ — ПОЛНЫЙ ДОСТУП БЕЗ УСЛОВИЙ
 AUTHORS = [6117198446, 7079260196]
+
 MIN_DEPOSIT = 20.0
 
 if not TG_TOKEN or not DATABASE_URL or not RENDER_EXTERNAL_HOSTNAME:
@@ -71,20 +73,12 @@ async def init_db():
             balance FLOAT DEFAULT 0
         );
         """)
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            pair TEXT,
-            direction TEXT,
-            expiration INT,
-            created TIMESTAMP DEFAULT now()
-        );
-        """)
 
 async def get_user(user_id: int):
     async with DB_POOL.acquire() as conn:
-        return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+        return await conn.fetchrow(
+            "SELECT * FROM users WHERE user_id=$1", user_id
+        )
 
 async def upsert_user(user_id: int):
     async with DB_POOL.acquire() as conn:
@@ -95,20 +89,18 @@ async def upsert_user(user_id: int):
 
 async def update_balance(user_id: int, amount: float):
     async with DB_POOL.acquire() as conn:
-        await conn.execute("UPDATE users SET balance=$1 WHERE user_id=$2", amount, user_id)
-
-async def log_signal(user_id: int, pair: str, direction: str, expiration: int):
-    async with DB_POOL.acquire() as conn:
         await conn.execute(
-            "INSERT INTO signals (user_id, pair, direction, expiration) VALUES ($1,$2,$3,$4)",
-            user_id, pair, direction, expiration
+            "UPDATE users SET balance=$1 WHERE user_id=$2",
+            amount, user_id
         )
 
 # ================= ACCESS =================
 
 async def has_access(user_id: int) -> bool:
+    # 👑 АВТОР — ВСЕГДА ДОСТУП
     if user_id in AUTHORS:
         return True
+
     user = await get_user(user_id)
     return bool(user and user["balance"] >= MIN_DEPOSIT)
 
@@ -145,11 +137,11 @@ def back_menu_kb():
     kb.button(text="⬅️ В меню", callback_data="menu")
     return kb.as_markup()
 
-# ================= STRATEGY (MULTI TF) =================
+# ================= STRATEGY =================
 
 async def get_signal(pair: str) -> str:
     intervals = ["1m", "5m", "15m"]
-    results = []
+    votes = []
 
     for interval in intervals:
         df = yf.download(pair, period="2d", interval=interval, progress=False)
@@ -157,7 +149,6 @@ async def get_signal(pair: str) -> str:
             continue
 
         close = df["Close"]
-
         ma = close.rolling(20).mean()
         ema = close.ewm(span=20).mean()
 
@@ -171,22 +162,29 @@ async def get_signal(pair: str) -> str:
         if close.iloc[-1] > ema.iloc[-1]: score += 1
         if rsi > 50: score += 1
 
-        results.append("BUY" if score >= 2 else "SELL")
+        votes.append("BUY" if score >= 2 else "SELL")
 
-    if results.count("BUY") > results.count("SELL"):
-        return "ВВЕРХ 📈"
-    return "ВНИЗ 📉"
+    return "ВВЕРХ 📈" if votes.count("BUY") > votes.count("SELL") else "ВНИЗ 📉"
 
 # ================= HANDLERS =================
 
 @dp.message(Command("start"))
 async def start(msg: types.Message):
+    # 👑 АВТОР
+    if msg.from_user.id in AUTHORS:
+        await msg.answer("👑 Авторский доступ", reply_markup=main_menu())
+        return
+
     kb = InlineKeyboardBuilder()
     kb.button(text="➡️ Далее", callback_data="instr_2")
-    await msg.answer("📘 ИНСТРУКЦИЯ KURUT TRADE\n\n"
-                     "Бот анализирует рынок по 15 индикаторам\n"
-                     "Подходит новичкам и профи\n\n"
-                     "Нажмите «Далее»", reply_markup=kb.as_markup())
+    await msg.answer(
+        "📘 ИНСТРУКЦИЯ ПО ИСПОЛЬЗОВАНИЮ ТРЕЙДИНГ-БОТА KURUT TRADE\n\n"
+        "Автоматический анализ рынка\n"
+        "15 индикаторов\n"
+        "Подходит новичкам и профи\n\n"
+        "Нажмите «Далее»",
+        reply_markup=kb.as_markup()
+    )
 
 @dp.callback_query(lambda c: c.data == "instr_2")
 async def instr_2(cb: types.CallbackQuery):
@@ -194,10 +192,10 @@ async def instr_2(cb: types.CallbackQuery):
     kb.button(text="🚀 Получить доступ", callback_data="get_access")
     await cb.message.edit_text(
         "🔥 ЧТО УМЕЕТ БОТ\n\n"
-        "✔ Анализ рынка\n"
-        "✔ Направление тренда\n"
+        "✔ Анализ тренда\n"
         "✔ Реальные сигналы\n"
-        "✔ 24/7\n\n"
+        "✔ Валютные пары\n"
+        "✔ Работа 24/7\n\n"
         "Нажмите «Получить доступ»",
         reply_markup=kb.as_markup()
     )
@@ -212,7 +210,7 @@ async def get_access(cb: types.CallbackQuery):
         "🔐 ДОСТУП К БОТУ\n\n"
         "1️⃣ Регистрация по ссылке\n"
         "2️⃣ Депозит от 20$\n"
-        "3️⃣ Проверить ID",
+        "3️⃣ Проверка ID",
         reply_markup=kb.as_markup()
     )
 
@@ -220,29 +218,18 @@ async def get_access(cb: types.CallbackQuery):
 async def check_id(cb: types.CallbackQuery):
     await upsert_user(cb.from_user.id)
     user = await get_user(cb.from_user.id)
-    if user and user["balance"] >= MIN_DEPOSIT:
-        await cb.message.edit_text("✅ Доступ открыт", reply_markup=main_menu())
-    else:
-        kb = InlineKeyboardBuilder()
-        kb.button(text="💰 Пополнить баланс", url=REF_LINK)
-        kb.button(text="🔄 Проверить баланс", callback_data="check_balance")
-        kb.adjust(1)
-        await cb.message.edit_text("⏳ Ожидаем депозит от 20$", reply_markup=kb.as_markup())
 
-@dp.callback_query(lambda c: c.data == "check_balance")
-async def check_balance(cb: types.CallbackQuery):
-    user = await get_user(cb.from_user.id)
     if user and user["balance"] >= MIN_DEPOSIT:
         await cb.message.edit_text("✅ Доступ открыт", reply_markup=main_menu())
     else:
-        await cb.answer("❌ Баланс меньше 20$", show_alert=True)
+        await cb.answer("❌ Нет депозита 20$", show_alert=True)
 
 @dp.callback_query(lambda c: c.data == "pairs")
 async def pairs(cb: types.CallbackQuery):
     if not await has_access(cb.from_user.id):
         await cb.answer("❌ Нет доступа", show_alert=True)
         return
-    await cb.message.edit_text("Выберите валютную пару", reply_markup=pairs_kb())
+    await cb.message.edit_text("Выберите пару", reply_markup=pairs_kb())
 
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
 async def pair(cb: types.CallbackQuery):
@@ -253,7 +240,6 @@ async def pair(cb: types.CallbackQuery):
 async def exp(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
     direction = await get_signal(pair)
-    await log_signal(cb.from_user.id, pair, direction, int(exp))
     await cb.message.edit_text(
         f"📊 СИГНАЛ\n\n"
         f"Пара: {pair}\n"
@@ -268,7 +254,8 @@ async def news(cb: types.CallbackQuery):
     pair = random.choice(PAIRS)
     direction = await get_signal(pair)
     await cb.message.edit_text(
-        f"🗞️ НОВОСТНОЙ СИГНАЛ\n\n{pair}\nНаправление: {direction}",
+        f"🗞️ НОВОСТИ РЫНКА\n\n"
+        f"{pair}\nНаправление: {direction}",
         reply_markup=back_menu_kb()
     )
 
@@ -281,9 +268,11 @@ async def menu(cb: types.CallbackQuery):
 async def postback(request: web.Request):
     click_id = request.query.get("click_id", "")
     amount = float(request.query.get("amount", "0"))
+
     if click_id.isdigit():
         await upsert_user(int(click_id))
         await update_balance(int(click_id), amount)
+
     return web.Response(text="OK")
 
 # ================= START =================
