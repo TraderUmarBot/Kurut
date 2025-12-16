@@ -143,17 +143,14 @@ def result_kb():
 # ================= SIGNAL & INDICATORS =================
 
 async def get_signal_with_expiration(pair: str, requested_exp: int) -> Tuple[str, float, int]:
-    """
-    Возвращает направление, уверенность и оптимальную экспирацию.
-    requested_exp — запрошенная пользователем экспирация в минутах.
-    """
-    expirations_to_try = [requested_exp, 3, 5, 10]
+    expirations_to_try = [requested_exp, 5, 15, 30]
+    interval_map = {1:"1m", 2:"2m", 3:"5m", 5:"15m", 10:"30m"}
     best_conf = 0
     best_direction = "ВВЕРХ 📈"
     best_exp = requested_exp
 
     for exp in expirations_to_try:
-        interval = f"{exp}m"
+        interval = interval_map.get(exp, "15m")
         try:
             df = yf.download(pair, period="2d", interval=interval, progress=False, auto_adjust=True)
             if df.empty:
@@ -216,12 +213,12 @@ async def get_signal_with_expiration(pair: str, requested_exp: int) -> Tuple[str
             buy = votes.count("BUY")
             sell = votes.count("SELL")
             if buy > sell:
-    direction = "ВВЕРХ 📈"
-elif sell > buy:
-    direction = "ВНИЗ 📉"
-else:
-    # при равенстве считаем сигнал слабым
-    direction = "СИГНАЛ НЕЯСЕН"
+                direction = "ВВЕРХ 📈"
+            elif sell > buy:
+                direction = "ВНИЗ 📉"
+            else:
+                direction = "СИГНАЛ НЕЯСЕН"
+
             confidence = round(max(buy, sell) / len(votes) * 100, 1)
 
             if confidence > best_conf:
@@ -243,11 +240,9 @@ else:
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     uid = msg.from_user.id
-
     if uid in AUTHORS:
         await msg.answer("👑 Авторский доступ\n\nГлавное меню:", reply_markup=main_menu())
         return
-
     await msg.answer(
         "📘 ИНСТРУКЦИЯ ПО ИСПОЛЬЗОВАНИЮ KURUT TRADE\n\n"
         "Бот анализирует рынок по 15 индикаторам и выдаёт готовые сигналы.\n\n"
@@ -263,12 +258,8 @@ async def continue_reg(cb: types.CallbackQuery):
     kb.button(text="🔗 Зарегистрироваться", url=REF_LINK)
     kb.button(text="✅ Проверить ID", callback_data="check_id")
     kb.adjust(1)
-
     await cb.message.edit_text(
-        "🔐 Чтобы получить доступ:\n"
-        "1️⃣ Зарегистрируйтесь по ссылке\n"
-        "2️⃣ Пополните баланс от 20$\n"
-        "3️⃣ Нажмите «Проверить ID»",
+        "🔐 Чтобы получить доступ:\n1️⃣ Зарегистрируйтесь по ссылке\n2️⃣ Пополните баланс от 20$\n3️⃣ Нажмите «Проверить ID»",
         reply_markup=kb.as_markup()
     )
     await cb.answer()
@@ -277,7 +268,6 @@ async def continue_reg(cb: types.CallbackQuery):
 async def check_id(cb: types.CallbackQuery):
     await upsert_user(cb.from_user.id)
     user = await get_user(cb.from_user.id)
-
     if user and user["balance"] >= MIN_DEPOSIT:
         await cb.message.edit_text("✅ Доступ открыт", reply_markup=main_menu())
     else:
@@ -316,26 +306,20 @@ async def pair(cb: types.CallbackQuery):
     await cb.message.edit_text("Выберите экспирацию", reply_markup=expiration_kb(pair))
     await cb.answer()
 
-# ====== ОБНОВЛЁННЫЙ ХЭНДЛЕР exp ======
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
 async def exp(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
-    requested_exp = int(exp)
+    direction, confidence, optimal_exp = await get_signal_with_expiration(pair, int(exp))
 
-    direction, confidence, optimal_exp = await get_signal_with_expiration(pair, requested_exp)
-
-    if confidence <= 20:  # порог слабого сигнала
-        await cb.message.edit_text(
-            "⚠️ Сигнал слишком слабый. Выберите другую валютную пару.",
-            reply_markup=pairs_kb()
-        )
+    if confidence <= 20:
+        await cb.message.edit_text("⚠️ Сигнал слишком слабый. Выберите другую валютную пару.", reply_markup=pairs_kb())
         await cb.answer()
         return
 
     await cb.message.edit_text(
         f"📊 СИГНАЛ\n\n"
         f"Пара: {pair}\n"
-        f"Запрошенная экспирация: {requested_exp} мин\n"
+        f"Экспирация: {exp} мин\n"
         f"Рекомендованная экспирация: {optimal_exp} мин\n"
         f"Направление: {direction}\n"
         f"Уверенность: {confidence}%",
@@ -348,30 +332,21 @@ async def menu(cb: types.CallbackQuery):
     await cb.message.edit_text("Главное меню", reply_markup=main_menu())
     await cb.answer()
 
-# ====== ОБНОВЛЁННЫЙ ХЭНДЛЕР news ======
 @dp.callback_query(lambda c: c.data == "news")
 async def news(cb: types.CallbackQuery):
     import random
     pair = random.choice(PAIRS)
     exp = random.choice(EXPIRATIONS)
-
     direction, confidence, optimal_exp = await get_signal_with_expiration(pair, exp)
 
     if confidence <= 20:
-        await cb.message.edit_text(
-            "⚠️ Сигнал слишком слабый. Выберите другую валютную пару.",
-            reply_markup=pairs_kb()
-        )
+        await cb.message.edit_text("⚠️ Сигнал слишком слабый. Выберите другую валютную пару.", reply_markup=pairs_kb())
         await cb.answer()
         return
 
     await cb.message.edit_text(
         f"📰 НОВОСТНОЙ СИГНАЛ\n\n"
-        f"{pair}\n"
-        f"{exp} мин\n"
-        f"Направление: {direction}\n"
-        f"Уверенность: {confidence}%\n"
-        f"Рекомендованная экспирация: {optimal_exp} мин",
+        f"{pair}\n{exp} мин\nРекомендованная экспирация: {optimal_exp} мин\n{direction}\n{confidence}%",
         reply_markup=result_kb()
     )
     await cb.answer()
