@@ -146,22 +146,19 @@ async def get_signal_with_expiration(pair: str, requested_exp: int) -> Tuple[str
     """
     Возвращает направление, уверенность и оптимальную экспирацию.
     requested_exp — запрошенная пользователем экспирация в минутах.
-    Бот проверяет разные таймфреймы и выбирает лучший сигнал.
     """
-    expirations_to_try = [requested_exp, 3, 5, 10]  # порядок проверки
+    expirations_to_try = [requested_exp, 3, 5, 10]
     best_conf = 0
     best_direction = "ВВЕРХ 📈"
     best_exp = requested_exp
 
     for exp in expirations_to_try:
-        # Получаем данные с Yahoo Finance с учётом экспирации
-        interval = f"{exp}m"  # пример: 1m, 3m, 5m, 10m
+        interval = f"{exp}m"
         try:
             df = yf.download(pair, period="2d", interval=interval, progress=False, auto_adjust=True)
             if df.empty:
                 continue
 
-            # Внутренняя функция анализа индикаторов (копируем calculate_indicators из get_signal)
             def calculate_indicators(df: pd.DataFrame) -> list[str]:
                 df = df.bfill().ffill()
                 votes = []
@@ -221,7 +218,6 @@ async def get_signal_with_expiration(pair: str, requested_exp: int) -> Tuple[str
             direction = "ВВЕРХ 📈" if buy >= sell else "ВНИЗ 📉"
             confidence = round(max(buy, sell) / len(votes) * 100, 1)
 
-            # выбираем лучший сигнал
             if confidence > best_conf:
                 best_conf = confidence
                 best_direction = direction
@@ -231,13 +227,10 @@ async def get_signal_with_expiration(pair: str, requested_exp: int) -> Tuple[str
             logging.error(f"get_signal_with_expiration error: {e}")
             continue
 
-    # если вообще нет данных, возвращаем дефолт
     if best_conf == 0:
         return "ВВЕРХ 📈", 50.0, requested_exp
 
     return best_direction, best_conf, best_exp
-
-    
 
 # ================= HANDLERS =================
 
@@ -317,45 +310,65 @@ async def pair(cb: types.CallbackQuery):
     await cb.message.edit_text("Выберите экспирацию", reply_markup=expiration_kb(pair))
     await cb.answer()
 
+# ====== ОБНОВЛЁННЫЙ ХЭНДЛЕР exp ======
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
 async def exp(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
-    direction, confidence = await get_signal(pair)
+    requested_exp = int(exp)
 
-    if not direction:
-        await cb.message.edit_text("⚠️ Сейчас нет сильного сигнала")
+    direction, confidence, optimal_exp = await get_signal_with_expiration(pair, requested_exp)
+
+    if confidence <= 20:  # порог слабого сигнала
+        await cb.message.edit_text(
+            "⚠️ Сигнал слишком слабый. Выберите другую валютную пару.",
+            reply_markup=pairs_kb()
+        )
+        await cb.answer()
         return
 
     await cb.message.edit_text(
         f"📊 СИГНАЛ\n\n"
         f"Пара: {pair}\n"
-        f"Экспирация: {exp} мин\n"
+        f"Запрошенная экспирация: {requested_exp} мин\n"
+        f"Рекомендованная экспирация: {optimal_exp} мин\n"
         f"Направление: {direction}\n"
         f"Уверенность: {confidence}%",
         reply_markup=result_kb()
     )
+    await cb.answer()
 
 @dp.callback_query(lambda c: c.data == "menu")
 async def menu(cb: types.CallbackQuery):
     await cb.message.edit_text("Главное меню", reply_markup=main_menu())
     await cb.answer()
 
+# ====== ОБНОВЛЁННЫЙ ХЭНДЛЕР news ======
 @dp.callback_query(lambda c: c.data == "news")
 async def news(cb: types.CallbackQuery):
     import random
     pair = random.choice(PAIRS)
     exp = random.choice(EXPIRATIONS)
-    direction, confidence = await get_signal(pair)
 
-    if not direction:
-        await cb.message.edit_text("⚠️ Нет сигнала сейчас")
+    direction, confidence, optimal_exp = await get_signal_with_expiration(pair, exp)
+
+    if confidence <= 20:
+        await cb.message.edit_text(
+            "⚠️ Сигнал слишком слабый. Выберите другую валютную пару.",
+            reply_markup=pairs_kb()
+        )
+        await cb.answer()
         return
 
     await cb.message.edit_text(
         f"📰 НОВОСТНОЙ СИГНАЛ\n\n"
-        f"{pair}\n{exp} мин\n{direction}\n{confidence}%",
+        f"{pair}\n"
+        f"{exp} мин\n"
+        f"Направление: {direction}\n"
+        f"Уверенность: {confidence}%\n"
+        f"Рекомендованная экспирация: {optimal_exp} мин",
         reply_markup=result_kb()
     )
+    await cb.answer()
 
 # ================= POSTBACK =================
 
