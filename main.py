@@ -2,27 +2,22 @@ import os
 import sys
 import asyncio
 import logging
-import io
-import random
-from typing import Tuple
-
 import asyncpg
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import matplotlib.pyplot as plt
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InputFile
 
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiogram.methods import DeleteWebhook, SetWebhook
 
 # ================= CONFIG =================
+
 TG_TOKEN = os.getenv("TG_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
@@ -42,27 +37,30 @@ if not TG_TOKEN or not DATABASE_URL or not RENDER_EXTERNAL_HOSTNAME:
     sys.exit(1)
 
 # ================= BOT =================
+
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 DB_POOL: asyncpg.Pool | None = None
 
 # ================= CONSTANTS =================
+
 PAIRS = [
     "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X",
     "EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X",
     "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
 
-EXPIRATIONS = [1, 5, 15]
+EXPIRATIONS = [1, 5, 10]
 PAIRS_PER_PAGE = 6
 
 INTERVAL_MAP = {
     1: "1m",
     5: "5m",
-    15: "15m"
+    10: "15m"
 }
 
 # ================= DATABASE =================
+
 async def init_db():
     global DB_POOL
     DB_POOL = await asyncpg.create_pool(DATABASE_URL)
@@ -95,170 +93,64 @@ async def has_access(user_id: int) -> bool:
     user = await get_user(user_id)
     return bool(user and user["balance"] >= MIN_DEPOSIT)
 
-# ================= UTILS =================
-def last(v: pd.Series):
+# ================= SIGNAL CORE =================
+
+def last(v):
     return float(v.iloc[-1])
 
-# ================= SIGNAL CORE =================
-
-# ================= SIGNAL CORE =================
-async def get_signal(pair: str, exp: int) -> Tuple[str, io.BytesIO]:
+async def get_signal(pair: str, exp: int) -> tuple[str, str]:
     try:
         interval = INTERVAL_MAP[exp]
-        period = "1d" if interval in ["1m", "5m"] else "2d"
-        df = yf.download(pair, period=period, interval=interval, progress=False, threads=True, auto_adjust=True)
+        df = yf.download(pair, period="2d", interval=interval, progress=False)
 
         if df.empty or len(df) < 50:
-            return "NO_DATA", None
+            return "ВНИЗ 📉", "Слабый рынок"
 
         close = df["Close"]
-        high = df["High"]
-        low = df["Low"]
-        volume = df["Volume"]
 
-        # ========== INDICATORS ==========
         ema20 = close.ewm(span=20).mean()
         ema50 = close.ewm(span=50).mean()
-        ema100 = close.ewm(span=100).mean()
-        ema200 = close.ewm(span=200).mean()
-
-        sma20 = close.rolling(20).mean()
-        sma50 = close.rolling(50).mean()
-        sma100 = close.rolling(100).mean()
-        sma200 = close.rolling(200).mean()
 
         delta = close.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        rsi = 100 - (100 / (1 + gain.rolling(14).mean() / loss.rolling(14).mean()))
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rsi = 100 - (100 / (1 + gain / loss))
 
-        macd = close.ewm(span=12).mean() - close.ewm(span=26).mean()
-        signal_line = macd.ewm(span=9).mean()
+        buy = 0
+        sell = 0
 
-        obv = (np.sign(delta) * volume).fillna(0).cumsum()
+        if last(ema20) > last(ema50):
+            buy += 2
+        else:
+            sell += 2
 
-        atr = (high - low).rolling(14).mean()
-        volatility = close.pct_change().rolling(14).std() * np.sqrt(14)
-        momentum = close - close.shift(10)
-        cci = (close - close.rolling(20).mean()) / (0.015 * close.rolling(20).std())
-        williams_r = (high.rolling(14).max() - close) / (high.rolling(14).max() - low.rolling(14).min()) * -100
-
-        # ========== SAFE LAST VALUES ==========
-        def last(v: pd.Series):
-            return float(v.iloc[-1]) if not v.empty and not pd.isna(v.iloc[-1]) else np.nan
-
-        # Проверка, есть ли данные для всех индикаторов
-        indicators = [ema20, ema50, ema100, ema200, sma20, sma50, sma100, sma200, rsi, macd, signal_line, obv, atr, volatility, momentum, cci, williams_r]
-        if any(pd.isna(last(ind)) for ind in indicators):
-            return "NO_DATA", None
-
-        # ========== SIGNAL SCORING ==========
-        buy_score = 0
-        sell_score = 0
-
-        # EMA/SMA trend
-        if last(ema20) > last(ema50) > last(ema200):
-            buy_score += 3
-        if last(ema20) < last(ema50) < last(ema200):
-            sell_score += 3
-        if last(sma20) > last(sma50) > last(sma200):
-            buy_score += 2
-        if last(sma20) < last(sma50) < last(sma200):
-            sell_score += 2
-
-        # RSI
         if last(rsi) > 55:
-            buy_score += 2
-        if last(rsi) < 45:
-            sell_score += 2
+            buy += 2
+        elif last(rsi) < 45:
+            sell += 2
 
-        # MACD
-        if last(macd) > last(signal_line):
-            buy_score += 2
-        else:
-            sell_score += 2
-
-        # OBV
-        if last(obv) > last(obv.shift(1) or 0):
-            buy_score += 1
-        else:
-            sell_score += 1
-
-        # Momentum
-        if last(momentum) > 0:
-            buy_score += 1
-        else:
-            sell_score += 1
-
-        # CCI
-        if last(cci) > 100:
-            buy_score += 1
-        if last(cci) < -100:
-            sell_score += 1
-
-        # Williams %R
-        if last(williams_r) < -20:
-            buy_score += 1
-        if last(williams_r) > -80:
-            sell_score += 1
-
-        # ATR/Volatility filter
-        if last(volatility) > 0.005:
-            buy_score += 1
-            sell_score += 1
-
-        # ========== DECISION ==========
-        if buy_score >= sell_score + 2:
+        if buy > sell:
             direction = "ВВЕРХ 📈"
-        elif sell_score >= buy_score + 2:
-            direction = "ВНИЗ 📉"
         else:
-            direction = "NO_SIGNAL"
+            direction = "ВНИЗ 📉"
 
-        # ========== GRAPH ==========
-        graph_buf = io.BytesIO()
-        plt.figure(figsize=(12,6))
-        plt.plot(close, label="Close", color="black")
-        plt.plot(ema20, label="EMA20", linestyle="--")
-        plt.plot(ema50, label="EMA50", linestyle="--")
-        plt.plot(ema200, label="EMA200", linestyle="--")
-        plt.title(f"{pair.replace('=X','')} Signal: {direction}")
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(graph_buf, format="png")
-        plt.close()
-        graph_buf.seek(0)
+        strength = abs(buy - sell)
 
-        return direction, graph_buf
+        if strength >= 3:
+            level = "🔥 СИЛЬНЫЙ сигнал"
+        elif strength == 2:
+            level = "⚡ СРЕДНИЙ сигнал"
+        else:
+            level = "⚠️ СЛАБЫЙ рынок (риск)"
+
+        return direction, level
 
     except Exception as e:
         logging.error(f"get_signal error: {e}")
-        return "ERROR", None
-
-        # ===================== Graph =====================
-        buf = io.BytesIO()
-        plt.figure(figsize=(12,6))
-        plt.plot(close, label="Close", color="black")
-        plt.plot(ema20, label="EMA20", color="blue")
-        plt.plot(ema50, label="EMA50", color="orange")
-        plt.plot(ema200, label="EMA200", color="red")
-        plt.plot(sma50, label="SMA50", color="green")
-        plt.plot(sma200, label="SMA200", color="purple")
-        plt.title(f"{pair.replace('=X','')} Signal: {direction}")
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(buf, format="png")
-        plt.close()
-        buf.seek(0)
-
-        return direction, buf
-    except Exception as e:
-        logging.error(f"get_signal error: {e}")
-        return "ERROR", None
+        return "ВНИЗ 📉", "⚠️ Ошибка данных"
 
 # ================= KEYBOARDS =================
+
 def main_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="📈 Валютные пары", callback_data="pairs")
@@ -266,9 +158,9 @@ def main_menu():
     kb.adjust(1)
     return kb.as_markup()
 
-def back_to_menu_kb():
+def back_menu_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="🏠 Главное меню", callback_data="main_menu")
+    kb.button(text="⬅️ Главное меню", callback_data="main_menu")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -292,21 +184,20 @@ def exp_kb(pair):
     return kb.as_markup()
 
 # ================= HANDLERS =================
+
 @dp.message(Command("start"))
 async def start(msg: types.Message):
-    user_id = msg.from_user.id
-    if user_id in AUTHORS:
-        await msg.answer("👑 Авторский доступ — полный доступ к боту", reply_markup=main_menu())
+    if msg.from_user.id in AUTHORS:
+        await msg.answer("👑 Авторский доступ", reply_markup=main_menu())
         return
 
     kb = InlineKeyboardBuilder()
     kb.button(text="➡️ Далее", callback_data="instr2")
     await msg.answer(
         "📘 ИНСТРУКЦИЯ KURUT TRADE\n\n"
-        "Бот анализирует рынок по 15 индикаторам\n"
-        "Использует 3 стратегии\n"
-        "Работает 24/7\n\n"
-        "Для получения доступа:",
+        "Бот анализирует рынок\n"
+        "Использует профессиональные индикаторы\n"
+        "Подходит для новичков и профи",
         reply_markup=kb.as_markup()
     )
 
@@ -315,7 +206,7 @@ async def instr2(cb: types.CallbackQuery):
     kb = InlineKeyboardBuilder()
     kb.button(text="🔗 Получить доступ", callback_data="get_access")
     await cb.message.edit_text(
-        "Чтобы получить доступ:\n"
+        "Как получить доступ:\n"
         "1️⃣ Регистрация по ссылке\n"
         "2️⃣ Пополнение от 20$\n"
         "3️⃣ Проверка ID",
@@ -334,6 +225,11 @@ async def get_access(cb: types.CallbackQuery):
 async def check_id(cb: types.CallbackQuery):
     await upsert_user(cb.from_user.id)
     user = await get_user(cb.from_user.id)
+
+    if cb.from_user.id in AUTHORS:
+        await cb.message.edit_text("👑 Авторский доступ открыт", reply_markup=main_menu())
+        return
+
     if user and user["balance"] >= MIN_DEPOSIT:
         await cb.message.edit_text("✅ Доступ открыт", reply_markup=main_menu())
     else:
@@ -346,62 +242,62 @@ async def check_id(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data=="check_balance")
 async def check_balance(cb: types.CallbackQuery):
     user = await get_user(cb.from_user.id)
-    if user and user["balance"] >= MIN_DEPOSIT:
+    if cb.from_user.id in AUTHORS or (user and user["balance"] >= MIN_DEPOSIT):
         await cb.message.edit_text("✅ Доступ открыт", reply_markup=main_menu())
     else:
-        await cb.answer("Баланс меньше 20$", show_alert=True)
+        await cb.answer("❌ Баланс меньше 20$", show_alert=True)
 
-# ================= Пары и сигналы =================
+@dp.callback_query(lambda c: c.data=="main_menu")
+async def main_menu_cb(cb: types.CallbackQuery):
+    await cb.message.edit_text("Главное меню:", reply_markup=main_menu())
+
 @dp.callback_query(lambda c: c.data=="pairs")
-async def pairs_cb(cb: types.CallbackQuery):
+async def pairs(cb: types.CallbackQuery):
     if not await has_access(cb.from_user.id):
         await cb.answer("Нет доступа", show_alert=True)
         return
     await cb.message.edit_text("Выберите пару", reply_markup=pairs_kb())
 
 @dp.callback_query(lambda c: c.data.startswith("page:"))
-async def page_cb(cb: types.CallbackQuery):
+async def page(cb: types.CallbackQuery):
     page = int(cb.data.split(":")[1])
     await cb.message.edit_text("Выберите пару", reply_markup=pairs_kb(page))
 
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
-async def pair_cb(cb: types.CallbackQuery):
+async def pair(cb: types.CallbackQuery):
     pair = cb.data.split(":")[1]
     await cb.message.edit_text("Выберите экспирацию", reply_markup=exp_kb(pair))
 
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
-async def exp_cb(cb: types.CallbackQuery):
+async def exp(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
-    exp = int(exp)
-    direction, buf = await get_signal(pair, exp)
-    kb = back_to_menu_kb()
-    if direction in ["NO_SIGNAL","NO_DATA","ERROR"]:
-        await cb.message.edit_text("⚠️ Сейчас нет сильного сигнала", reply_markup=kb)
-        return
-    buf.seek(0)
-    await cb.message.answer_photo(
-        photo=InputFile(buf, filename="signal.png"),
-        caption=f"📊 СИГНАЛ KURUT TRADE\n\nПара: {pair.replace('=X','')}\nЭкспирация: {exp} мин\nНаправление: {direction}",
-        reply_markup=kb
+    direction, level = await get_signal(pair, int(exp))
+
+    await cb.message.edit_text(
+        f"📊 СИГНАЛ KURUT TRADE\n\n"
+        f"Пара: {pair.replace('=X','')}\n"
+        f"Экспирация: {exp} мин\n"
+        f"Направление: {direction}\n"
+        f"Качество: {level}",
+        reply_markup=back_menu_kb()
     )
 
 @dp.callback_query(lambda c: c.data=="news")
-async def news_cb(cb: types.CallbackQuery):
+async def news(cb: types.CallbackQuery):
+    import random
     pair = random.choice(PAIRS)
     exp = random.choice(EXPIRATIONS)
-    direction, buf = await get_signal(pair, exp)
-    kb = back_to_menu_kb()
-    if direction in ["NO_SIGNAL","NO_DATA","ERROR"]:
-        await cb.message.edit_text("⚠️ Сейчас нет новостного сигнала", reply_markup=kb)
-        return
-    buf.seek(0)
-    await cb.message.answer_photo(
-        photo=InputFile(buf, filename="signal.png"),
-        caption=f"📰 НОВОСТНОЙ СИГНАЛ\n\n{pair.replace('=X','')} — {exp} мин\n{direction}",
-        reply_markup=kb
+    direction, level = await get_signal(pair, exp)
+
+    await cb.message.edit_text(
+        f"📰 НОВОСТНОЙ СИГНАЛ\n\n"
+        f"{pair.replace('=X','')} — {exp} мин\n"
+        f"{direction}\n{level}",
+        reply_markup=back_menu_kb()
     )
 
 # ================= POSTBACK =================
+
 async def postback(request: web.Request):
     click_id = request.query.get("click_id","").strip()
     amount = request.query.get("amount","0")
@@ -412,6 +308,7 @@ async def postback(request: web.Request):
     return web.Response(text="OK")
 
 # ================= START =================
+
 async def main():
     await init_db()
     await bot(DeleteWebhook(drop_pending_updates=True))
