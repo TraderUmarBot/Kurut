@@ -6,6 +6,8 @@ import asyncpg
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import matplotlib.pyplot as plt
+from io import BytesIO
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -14,7 +16,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
-from aiogram.methods import DeleteWebhook, SetWebhook
+from aiogram.methods import DeleteWebhook, SetWebhook, SendPhoto
 
 # ================= CONFIG =================
 
@@ -93,20 +95,26 @@ async def has_access(user_id: int) -> bool:
     user = await get_user(user_id)
     return bool(user and user["balance"] >= MIN_DEPOSIT)
 
-# ================= SIGNAL CORE =================
+# ================= SIGNAL & PLOT =================
 
 def last(v):
     return float(v.iloc[-1])
 
-async def get_signal(pair: str, exp: int) -> tuple[str, str]:
+async def get_signal(pair: str, exp: int) -> tuple[str, str, BytesIO]:
+    """
+    Возвращает (направление, сила, график BytesIO)
+    """
     try:
         interval = INTERVAL_MAP[exp]
-        df = yf.download(pair, period="2d", interval=interval, progress=False)
+        df = yf.download(pair, period="2d", interval=interval, progress=False, auto_adjust=True)
 
         if df.empty or len(df) < 50:
-            return "ВНИЗ 📉", "Слабый рынок"
+            return "ВНИЗ 📉", "Слабый рынок", None
 
         close = df["Close"]
+        high = df["High"]
+        low = df["Low"]
+        volume = df["Volume"]
 
         ema20 = close.ewm(span=20).mean()
         ema50 = close.ewm(span=50).mean()
@@ -116,38 +124,79 @@ async def get_signal(pair: str, exp: int) -> tuple[str, str]:
         loss = (-delta.clip(upper=0)).rolling(14).mean()
         rsi = 100 - (100 / (1 + gain / loss))
 
+        macd = close.ewm(span=12).mean() - close.ewm(span=26).mean()
+        macd_signal = macd.ewm(span=9).mean()
+
+        # Сигнал BUY / SELL
         buy = 0
         sell = 0
-
         if last(ema20) > last(ema50):
             buy += 2
         else:
             sell += 2
-
         if last(rsi) > 55:
             buy += 2
         elif last(rsi) < 45:
             sell += 2
+        if last(macd) > last(macd_signal):
+            buy += 1
+        else:
+            sell += 1
 
         if buy > sell:
-            direction = "ВВЕРХ 📈"
+            direction = "BUY 📈"
+            entry_idx = -1
         else:
-            direction = "ВНИЗ 📉"
+            direction = "SELL 📉"
+            entry_idx = -1
 
         strength = abs(buy - sell)
-
         if strength >= 3:
             level = "🔥 СИЛЬНЫЙ сигнал"
         elif strength == 2:
             level = "⚡ СРЕДНИЙ сигнал"
         else:
-            level = "⚠️ СЛАБЫЙ рынок (риск)"
+            level = "⚠️ СЛАБЫЙ рынок"
 
-        return direction, level
+        # ================== ГРАФИК ==================
+        plt.style.use('dark_background')
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 6), gridspec_kw={'height_ratios':[3,1]})
+
+        # Price + EMA
+        ax1.plot(df.index, close, label="Close", color="white")
+        ax1.plot(df.index, ema20, label="EMA20", color="cyan")
+        ax1.plot(df.index, ema50, label="EMA50", color="magenta")
+        # Стрелка входа
+        if entry_idx < 0:
+            ax1.annotate(direction, xy=(df.index[entry_idx], close.iloc[entry_idx]), 
+                         xytext=(0,30), textcoords="offset points",
+                         arrowprops=dict(facecolor='yellow', arrowstyle='->'),
+                         color='yellow', fontsize=14)
+        ax1.set_title(f"{pair.replace('=X','')} | {direction} | {level}")
+        ax1.legend()
+        ax1.grid(True)
+
+        # RSI / MACD
+        ax2.plot(rsi, label="RSI", color="lime")
+        ax2.plot(macd, label="MACD", color="orange")
+        ax2.plot(macd_signal, label="Signal", color="red")
+        ax2.legend()
+        ax2.grid(True)
+
+        # Watermark
+        fig.text(0.9, 0.02, 'KURUT', fontsize=18, color='white', alpha=0.3, ha='right')
+
+        buf = BytesIO()
+        plt.tight_layout()
+        plt.savefig(buf, format="png")
+        plt.close(fig)
+        buf.seek(0)
+
+        return direction, level, buf
 
     except Exception as e:
         logging.error(f"get_signal error: {e}")
-        return "ВНИЗ 📉", "⚠️ Ошибка данных"
+        return "ВНИЗ 📉", "⚠️ Ошибка данных", None
 
 # ================= KEYBOARDS =================
 
@@ -195,9 +244,12 @@ async def start(msg: types.Message):
     kb.button(text="➡️ Далее", callback_data="instr2")
     await msg.answer(
         "📘 ИНСТРУКЦИЯ KURUT TRADE\n\n"
-        "Бот анализирует рынок\n"
-        "Использует профессиональные индикаторы\n"
-        "Подходит для новичков и профи",
+        "Бот анализирует рынок🤩\n"
+        "Использует профессиональные индикаторы🔥\n"
+        "Подходит для новичков и профи😎",
+        "Самая лучшая TRADER команда во всем СНГ это KURUT TRADE🏆",
+        "Самые лучшие стратегии добавлены в этого бота❤️",
+   
         reply_markup=kb.as_markup()
     )
 
@@ -210,6 +262,7 @@ async def instr2(cb: types.CallbackQuery):
         "1️⃣ Регистрация по ссылке\n"
         "2️⃣ Пополнение от 20$\n"
         "3️⃣ Проверка ID",
+        "4️⃣Если у вас есть аккаунт удалите его обязательно!",
         reply_markup=kb.as_markup()
     )
 
@@ -271,30 +324,34 @@ async def pair(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
 async def exp(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
-    direction, level = await get_signal(pair, int(exp))
+    direction, level, chart_buf = await get_signal(pair, int(exp))
 
-    await cb.message.edit_text(
-        f"📊 СИГНАЛ KURUT TRADE\n\n"
-        f"Пара: {pair.replace('=X','')}\n"
-        f"Экспирация: {exp} мин\n"
-        f"Направление: {direction}\n"
-        f"Качество: {level}",
-        reply_markup=back_menu_kb()
-    )
+    if chart_buf:
+        await bot.send_photo(chat_id=cb.from_user.id, photo=chart_buf,
+                             caption=f"📊 СИГНАЛ KURUT TRADE\n\nПара: {pair.replace('=X','')}\nЭкспирация: {exp} мин\nНаправление: {direction}\nКачество: {level}",
+                             reply_markup=back_menu_kb())
+    else:
+        await cb.message.edit_text(
+            f"📊 СИГНАЛ KURUT TRADE\n\nПара: {pair.replace('=X','')}\nЭкспирация: {exp} мин\nНаправление: {direction}\nКачество: {level}",
+            reply_markup=back_menu_kb()
+        )
 
 @dp.callback_query(lambda c: c.data=="news")
 async def news(cb: types.CallbackQuery):
     import random
     pair = random.choice(PAIRS)
     exp = random.choice(EXPIRATIONS)
-    direction, level = await get_signal(pair, exp)
+    direction, level, chart_buf = await get_signal(pair, exp)
 
-    await cb.message.edit_text(
-        f"📰 НОВОСТНОЙ СИГНАЛ\n\n"
-        f"{pair.replace('=X','')} — {exp} мин\n"
-        f"{direction}\n{level}",
-        reply_markup=back_menu_kb()
-    )
+    if chart_buf:
+        await bot.send_photo(chat_id=cb.from_user.id, photo=chart_buf,
+                             caption=f"📰 НОВОСТНОЙ СИГНАЛ\n\n{pair.replace('=X','')} — {exp} мин\n{direction}\n{level}",
+                             reply_markup=back_menu_kb())
+    else:
+        await cb.message.edit_text(
+            f"📰 НОВОСТНОЙ СИГНАЛ\n\n{pair.replace('=X','')} — {exp} мин\n{direction}\n{level}",
+            reply_markup=back_menu_kb()
+        )
 
 # ================= POSTBACK =================
 
