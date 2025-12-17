@@ -100,11 +100,14 @@ def last(v: pd.Series):
     return float(v.iloc[-1])
 
 # ================= SIGNAL CORE =================
+
+# ================= SIGNAL CORE =================
 async def get_signal(pair: str, exp: int) -> Tuple[str, io.BytesIO]:
     try:
         interval = INTERVAL_MAP[exp]
-        period = "1d" if interval in ["1m","5m"] else "2d"
+        period = "1d" if interval in ["1m", "5m"] else "2d"
         df = yf.download(pair, period=period, interval=interval, progress=False, threads=True, auto_adjust=True)
+
         if df.empty or len(df) < 50:
             return "NO_DATA", None
 
@@ -113,64 +116,125 @@ async def get_signal(pair: str, exp: int) -> Tuple[str, io.BytesIO]:
         low = df["Low"]
         volume = df["Volume"]
 
-        # ===================== 15 индикаторов =====================
+        # ========== INDICATORS ==========
         ema20 = close.ewm(span=20).mean()
         ema50 = close.ewm(span=50).mean()
+        ema100 = close.ewm(span=100).mean()
         ema200 = close.ewm(span=200).mean()
+
+        sma20 = close.rolling(20).mean()
         sma50 = close.rolling(50).mean()
+        sma100 = close.rolling(100).mean()
         sma200 = close.rolling(200).mean()
+
         delta = close.diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rsi = 100 - (100 / (1 + gain / loss))
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        rsi = 100 - (100 / (1 + gain.rolling(14).mean() / loss.rolling(14).mean()))
+
         macd = close.ewm(span=12).mean() - close.ewm(span=26).mean()
         signal_line = macd.ewm(span=9).mean()
+
         obv = (np.sign(delta) * volume).fillna(0).cumsum()
-        low14 = low.rolling(14).min()
-        high14 = high.rolling(14).max()
-        stoch = 100*(close - low14)/(high14 - low14)
-        willr = (high14 - close)/(high14 - low14) * -100
-        tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
-        plus_dm = high.diff().clip(lower=0)
-        minus_dm = (-low.diff()).clip(lower=0)
-        atr = tr.rolling(14).mean()
-        plus_di = 100*(plus_dm.ewm(alpha=1/14).mean()/atr)
-        minus_di = 100*(minus_dm.ewm(alpha=1/14).mean()/atr)
-        dx = (abs(plus_di - minus_di)/(plus_di + minus_di))*100
-        adx = dx.rolling(14).mean()
 
-        # ===================== Signal Calculation =====================
-        buy_score = sell_score = 0
-        # EMA/SMA
-        if last(ema20) > last(ema50) > last(ema200): buy_score += 2
-        if last(ema20) < last(ema50) < last(ema200): sell_score += 2
-        if last(sma50) > last(sma200): buy_score += 1
-        if last(sma50) < last(sma200): sell_score += 1
+        atr = (high - low).rolling(14).mean()
+        volatility = close.pct_change().rolling(14).std() * np.sqrt(14)
+        momentum = close - close.shift(10)
+        cci = (close - close.rolling(20).mean()) / (0.015 * close.rolling(20).std())
+        williams_r = (high.rolling(14).max() - close) / (high.rolling(14).max() - low.rolling(14).min()) * -100
+
+        # ========== SAFE LAST VALUES ==========
+        def last(v: pd.Series):
+            return float(v.iloc[-1]) if not v.empty and not pd.isna(v.iloc[-1]) else np.nan
+
+        # Проверка, есть ли данные для всех индикаторов
+        indicators = [ema20, ema50, ema100, ema200, sma20, sma50, sma100, sma200, rsi, macd, signal_line, obv, atr, volatility, momentum, cci, williams_r]
+        if any(pd.isna(last(ind)) for ind in indicators):
+            return "NO_DATA", None
+
+        # ========== SIGNAL SCORING ==========
+        buy_score = 0
+        sell_score = 0
+
+        # EMA/SMA trend
+        if last(ema20) > last(ema50) > last(ema200):
+            buy_score += 3
+        if last(ema20) < last(ema50) < last(ema200):
+            sell_score += 3
+        if last(sma20) > last(sma50) > last(sma200):
+            buy_score += 2
+        if last(sma20) < last(sma50) < last(sma200):
+            sell_score += 2
+
         # RSI
-        if last(rsi) > 55: buy_score += 2
-        if last(rsi) < 45: sell_score += 2
-        # MACD
-        if last(macd) > last(signal_line): buy_score += 2
-        else: sell_score += 2
-        # OBV
-        if last(obv) > obv.iloc[-2]: buy_score += 1
-        else: sell_score += 1
-        # Stochastic & Williams
-        if last(stoch) < 20: buy_score +=1
-        if last(stoch) > 80: sell_score +=1
-        if last(willr) < -80: buy_score +=1
-        if last(willr) > -20: sell_score +=1
-        # ADX
-        if last(adx) > 25:
-            if last(plus_di) > last(minus_di): buy_score +=1
-            else: sell_score +=1
+        if last(rsi) > 55:
+            buy_score += 2
+        if last(rsi) < 45:
+            sell_score += 2
 
+        # MACD
+        if last(macd) > last(signal_line):
+            buy_score += 2
+        else:
+            sell_score += 2
+
+        # OBV
+        if last(obv) > last(obv.shift(1) or 0):
+            buy_score += 1
+        else:
+            sell_score += 1
+
+        # Momentum
+        if last(momentum) > 0:
+            buy_score += 1
+        else:
+            sell_score += 1
+
+        # CCI
+        if last(cci) > 100:
+            buy_score += 1
+        if last(cci) < -100:
+            sell_score += 1
+
+        # Williams %R
+        if last(williams_r) < -20:
+            buy_score += 1
+        if last(williams_r) > -80:
+            sell_score += 1
+
+        # ATR/Volatility filter
+        if last(volatility) > 0.005:
+            buy_score += 1
+            sell_score += 1
+
+        # ========== DECISION ==========
         if buy_score >= sell_score + 2:
-            direction = "BUY 📈"
+            direction = "ВВЕРХ 📈"
         elif sell_score >= buy_score + 2:
-            direction = "SELL 📉"
+            direction = "ВНИЗ 📉"
         else:
             direction = "NO_SIGNAL"
+
+        # ========== GRAPH ==========
+        graph_buf = io.BytesIO()
+        plt.figure(figsize=(12,6))
+        plt.plot(close, label="Close", color="black")
+        plt.plot(ema20, label="EMA20", linestyle="--")
+        plt.plot(ema50, label="EMA50", linestyle="--")
+        plt.plot(ema200, label="EMA200", linestyle="--")
+        plt.title(f"{pair.replace('=X','')} Signal: {direction}")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(graph_buf, format="png")
+        plt.close()
+        graph_buf.seek(0)
+
+        return direction, graph_buf
+
+    except Exception as e:
+        logging.error(f"get_signal error: {e}")
+        return "ERROR", None
 
         # ===================== Graph =====================
         buf = io.BytesIO()
