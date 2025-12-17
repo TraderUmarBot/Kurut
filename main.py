@@ -3,7 +3,9 @@ import sys
 import asyncio
 import logging
 import io
+import random
 from typing import Tuple
+
 import asyncpg
 import pandas as pd
 import numpy as np
@@ -101,7 +103,7 @@ def last(v: pd.Series):
 async def get_signal(pair: str, exp: int) -> Tuple[str, io.BytesIO]:
     try:
         interval = INTERVAL_MAP[exp]
-        period = "1d" if interval in ["1m", "5m"] else "2d"
+        period = "1d" if interval in ["1m","5m"] else "2d"
         df = yf.download(pair, period=period, interval=interval, progress=False, threads=True, auto_adjust=True)
         if df.empty or len(df) < 50:
             return "NO_DATA", None
@@ -111,59 +113,83 @@ async def get_signal(pair: str, exp: int) -> Tuple[str, io.BytesIO]:
         low = df["Low"]
         volume = df["Volume"]
 
-        # EMA
+        # ===================== 15 индикаторов =====================
         ema20 = close.ewm(span=20).mean()
         ema50 = close.ewm(span=50).mean()
         ema200 = close.ewm(span=200).mean()
-
-        # RSI
+        sma50 = close.rolling(50).mean()
+        sma200 = close.rolling(200).mean()
         delta = close.diff()
         gain = delta.clip(lower=0).rolling(14).mean()
         loss = (-delta.clip(upper=0)).rolling(14).mean()
         rsi = 100 - (100 / (1 + gain / loss))
-
-        # MACD
         macd = close.ewm(span=12).mean() - close.ewm(span=26).mean()
         signal_line = macd.ewm(span=9).mean()
-
-        # OBV
         obv = (np.sign(delta) * volume).fillna(0).cumsum()
+        low14 = low.rolling(14).min()
+        high14 = high.rolling(14).max()
+        stoch = 100*(close - low14)/(high14 - low14)
+        willr = (high14 - close)/(high14 - low14) * -100
+        tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+        plus_dm = high.diff().clip(lower=0)
+        minus_dm = (-low.diff()).clip(lower=0)
+        atr = tr.rolling(14).mean()
+        plus_di = 100*(plus_dm.ewm(alpha=1/14).mean()/atr)
+        minus_di = 100*(minus_dm.ewm(alpha=1/14).mean()/atr)
+        dx = (abs(plus_di - minus_di)/(plus_di + minus_di))*100
+        adx = dx.rolling(14).mean()
 
-        # Scores
+        # ===================== Signal Calculation =====================
         buy_score = sell_score = 0
-        if ema20.iloc[-1] > ema50.iloc[-1] > ema200.iloc[-1]: buy_score += 3
-        if ema20.iloc[-1] < ema50.iloc[-1] < ema200.iloc[-1]: sell_score += 3
-        if rsi.iloc[-1] > 55: buy_score += 2
-        if rsi.iloc[-1] < 45: sell_score += 2
-        if macd.iloc[-1] > signal_line.iloc[-1]: buy_score += 2
+        # EMA/SMA
+        if last(ema20) > last(ema50) > last(ema200): buy_score += 2
+        if last(ema20) < last(ema50) < last(ema200): sell_score += 2
+        if last(sma50) > last(sma200): buy_score += 1
+        if last(sma50) < last(sma200): sell_score += 1
+        # RSI
+        if last(rsi) > 55: buy_score += 2
+        if last(rsi) < 45: sell_score += 2
+        # MACD
+        if last(macd) > last(signal_line): buy_score += 2
         else: sell_score += 2
-        if obv.iloc[-1] > obv.iloc[-2]: buy_score += 1
+        # OBV
+        if last(obv) > obv.iloc[-2]: buy_score += 1
         else: sell_score += 1
+        # Stochastic & Williams
+        if last(stoch) < 20: buy_score +=1
+        if last(stoch) > 80: sell_score +=1
+        if last(willr) < -80: buy_score +=1
+        if last(willr) > -20: sell_score +=1
+        # ADX
+        if last(adx) > 25:
+            if last(plus_di) > last(minus_di): buy_score +=1
+            else: sell_score +=1
 
         if buy_score >= sell_score + 2:
-            direction = "ВВЕРХ 📈"
+            direction = "BUY 📈"
         elif sell_score >= buy_score + 2:
-            direction = "ВНИЗ 📉"
+            direction = "SELL 📉"
         else:
             direction = "NO_SIGNAL"
 
-        # Graph
-        graph_buf = io.BytesIO()
-        plt.figure(figsize=(10,5))
-        plt.plot(close, label="Close")
-        plt.plot(ema20, label="EMA20")
-        plt.plot(ema50, label="EMA50")
-        plt.plot(ema200, label="EMA200")
+        # ===================== Graph =====================
+        buf = io.BytesIO()
+        plt.figure(figsize=(12,6))
+        plt.plot(close, label="Close", color="black")
+        plt.plot(ema20, label="EMA20", color="blue")
+        plt.plot(ema50, label="EMA50", color="orange")
+        plt.plot(ema200, label="EMA200", color="red")
+        plt.plot(sma50, label="SMA50", color="green")
+        plt.plot(sma200, label="SMA200", color="purple")
         plt.title(f"{pair.replace('=X','')} Signal: {direction}")
         plt.legend()
         plt.grid(True)
         plt.tight_layout()
-        plt.savefig(graph_buf, format="png")
+        plt.savefig(buf, format="png")
         plt.close()
-        graph_buf.seek(0)
+        buf.seek(0)
 
-        return direction, graph_buf
-
+        return direction, buf
     except Exception as e:
         logging.error(f"get_signal error: {e}")
         return "ERROR", None
@@ -204,16 +230,19 @@ def exp_kb(pair):
 # ================= HANDLERS =================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
-    if msg.from_user.id in AUTHORS:
-        await msg.answer("👑 Авторский доступ", reply_markup=main_menu())
+    user_id = msg.from_user.id
+    if user_id in AUTHORS:
+        await msg.answer("👑 Авторский доступ — полный доступ к боту", reply_markup=main_menu())
         return
+
     kb = InlineKeyboardBuilder()
     kb.button(text="➡️ Далее", callback_data="instr2")
     await msg.answer(
         "📘 ИНСТРУКЦИЯ KURUT TRADE\n\n"
         "Бот анализирует рынок по 15 индикаторам\n"
         "Использует 3 стратегии\n"
-        "Работает 24/7",
+        "Работает 24/7\n\n"
+        "Для получения доступа:",
         reply_markup=kb.as_markup()
     )
 
@@ -258,59 +287,52 @@ async def check_balance(cb: types.CallbackQuery):
     else:
         await cb.answer("Баланс меньше 20$", show_alert=True)
 
-@dp.callback_query(lambda c: c.data=="main_menu")
-async def main_menu_cb(cb: types.CallbackQuery):
-    await cb.message.edit_text("Главное меню", reply_markup=main_menu())
-
+# ================= Пары и сигналы =================
 @dp.callback_query(lambda c: c.data=="pairs")
-async def pairs(cb: types.CallbackQuery):
+async def pairs_cb(cb: types.CallbackQuery):
     if not await has_access(cb.from_user.id):
         await cb.answer("Нет доступа", show_alert=True)
         return
     await cb.message.edit_text("Выберите пару", reply_markup=pairs_kb())
 
 @dp.callback_query(lambda c: c.data.startswith("page:"))
-async def page(cb: types.CallbackQuery):
+async def page_cb(cb: types.CallbackQuery):
     page = int(cb.data.split(":")[1])
     await cb.message.edit_text("Выберите пару", reply_markup=pairs_kb(page))
 
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
-async def pair(cb: types.CallbackQuery):
+async def pair_cb(cb: types.CallbackQuery):
     pair = cb.data.split(":")[1]
     await cb.message.edit_text("Выберите экспирацию", reply_markup=exp_kb(pair))
 
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
-async def exp(cb: types.CallbackQuery):
+async def exp_cb(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
     exp = int(exp)
-    direction, graph_buf = await get_signal(pair, exp)
+    direction, buf = await get_signal(pair, exp)
     kb = back_to_menu_kb()
     if direction in ["NO_SIGNAL","NO_DATA","ERROR"]:
         await cb.message.edit_text("⚠️ Сейчас нет сильного сигнала", reply_markup=kb)
         return
-    graph_buf.seek(0)
-    # Исправлено: используем InputFile с BytesIO напрямую
-    photo_file = InputFile(file=graph_buf, filename="signal.png")
+    buf.seek(0)
     await cb.message.answer_photo(
-        photo=photo_file,
+        photo=InputFile(buf, filename="signal.png"),
         caption=f"📊 СИГНАЛ KURUT TRADE\n\nПара: {pair.replace('=X','')}\nЭкспирация: {exp} мин\nНаправление: {direction}",
         reply_markup=kb
     )
 
 @dp.callback_query(lambda c: c.data=="news")
-async def news(cb: types.CallbackQuery):
-    import random
+async def news_cb(cb: types.CallbackQuery):
     pair = random.choice(PAIRS)
     exp = random.choice(EXPIRATIONS)
-    direction, graph_buf = await get_signal(pair, exp)
+    direction, buf = await get_signal(pair, exp)
     kb = back_to_menu_kb()
     if direction in ["NO_SIGNAL","NO_DATA","ERROR"]:
         await cb.message.edit_text("⚠️ Сейчас нет новостного сигнала", reply_markup=kb)
         return
-    graph_buf.seek(0)
-    photo_file = InputFile(file=graph_buf, filename="signal.png")
+    buf.seek(0)
     await cb.message.answer_photo(
-        photo=photo_file,
+        photo=InputFile(buf, filename="signal.png"),
         caption=f"📰 НОВОСТНОЙ СИГНАЛ\n\n{pair.replace('=X','')} — {exp} мин\n{direction}",
         reply_markup=kb
     )
