@@ -5,3 +5,5 @@ numpy
 aiohttp
 yfinance
 matplotlib
+mplfinance
+Pillow
