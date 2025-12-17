@@ -94,17 +94,15 @@ async def has_access(user_id: int) -> bool:
     return bool(user and user["balance"] >= MIN_DEPOSIT)
 
 # ================= UTILS =================
-def last(v):
+def last(v: pd.Series):
     return float(v.iloc[-1])
 
-# ================= SIGNALS =================
+# ================= SIGNAL CORE =================
 async def get_signal(pair: str, exp: int) -> Tuple[str, io.BytesIO]:
-    """
-    Возвращает сигнал и график в BytesIO
-    """
     try:
         interval = INTERVAL_MAP[exp]
-        df = yf.download(pair, period="2d", interval=interval, progress=False, auto_adjust=True)
+        period = "1d" if interval in ["1m", "5m"] else "2d"
+        df = yf.download(pair, period=period, interval=interval, progress=False, threads=True, auto_adjust=True)
         if df.empty or len(df) < 50:
             return "NO_DATA", None
 
@@ -113,46 +111,34 @@ async def get_signal(pair: str, exp: int) -> Tuple[str, io.BytesIO]:
         low = df["Low"]
         volume = df["Volume"]
 
-        # ===== INDICATORS =====
+        # EMA
         ema20 = close.ewm(span=20).mean()
         ema50 = close.ewm(span=50).mean()
         ema200 = close.ewm(span=200).mean()
 
+        # RSI
         delta = close.diff()
         gain = delta.clip(lower=0).rolling(14).mean()
         loss = (-delta.clip(upper=0)).rolling(14).mean()
         rsi = 100 - (100 / (1 + gain / loss))
 
+        # MACD
         macd = close.ewm(span=12).mean() - close.ewm(span=26).mean()
         signal_line = macd.ewm(span=9).mean()
 
+        # OBV
         obv = (np.sign(delta) * volume).fillna(0).cumsum()
 
-        buy_score = 0
-        sell_score = 0
-
-        # === TREND ===
-        if last(ema20) > last(ema50) > last(ema200):
-            buy_score += 3
-        if last(ema20) < last(ema50) < last(ema200):
-            sell_score += 3
-
-        # === MOMENTUM ===
-        if last(rsi) > 55:
-            buy_score += 2
-        if last(rsi) < 45:
-            sell_score += 2
-
-        if last(macd) > last(signal_line):
-            buy_score += 2
-        else:
-            sell_score += 2
-
-        # === VOLUME ===
-        if last(obv) > last(obv.shift(1)):
-            buy_score += 1
-        else:
-            sell_score += 1
+        # Scores
+        buy_score = sell_score = 0
+        if ema20.iloc[-1] > ema50.iloc[-1] > ema200.iloc[-1]: buy_score += 3
+        if ema20.iloc[-1] < ema50.iloc[-1] < ema200.iloc[-1]: sell_score += 3
+        if rsi.iloc[-1] > 55: buy_score += 2
+        if rsi.iloc[-1] < 45: sell_score += 2
+        if macd.iloc[-1] > signal_line.iloc[-1]: buy_score += 2
+        else: sell_score += 2
+        if obv.iloc[-1] > obv.iloc[-2]: buy_score += 1
+        else: sell_score += 1
 
         if buy_score >= sell_score + 2:
             direction = "ВВЕРХ 📈"
@@ -161,7 +147,7 @@ async def get_signal(pair: str, exp: int) -> Tuple[str, io.BytesIO]:
         else:
             direction = "NO_SIGNAL"
 
-        # ===== GRAPH =====
+        # Graph
         graph_buf = io.BytesIO()
         plt.figure(figsize=(10,5))
         plt.plot(close, label="Close")
@@ -190,6 +176,12 @@ def main_menu():
     kb.adjust(1)
     return kb.as_markup()
 
+def back_to_menu_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🏠 Главное меню", callback_data="main_menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
 def pairs_kb(page=0):
     kb = InlineKeyboardBuilder()
     start = page * PAIRS_PER_PAGE
@@ -209,19 +201,12 @@ def exp_kb(pair):
     kb.adjust(2)
     return kb.as_markup()
 
-def back_to_menu_kb():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🏠 Главное меню", callback_data="menu")
-    kb.adjust(1)
-    return kb.as_markup()
-
 # ================= HANDLERS =================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     if msg.from_user.id in AUTHORS:
         await msg.answer("👑 Авторский доступ", reply_markup=main_menu())
         return
-
     kb = InlineKeyboardBuilder()
     kb.button(text="➡️ Далее", callback_data="instr2")
     await msg.answer(
@@ -273,6 +258,10 @@ async def check_balance(cb: types.CallbackQuery):
     else:
         await cb.answer("Баланс меньше 20$", show_alert=True)
 
+@dp.callback_query(lambda c: c.data=="main_menu")
+async def main_menu_cb(cb: types.CallbackQuery):
+    await cb.message.edit_text("Главное меню", reply_markup=main_menu())
+
 @dp.callback_query(lambda c: c.data=="pairs")
 async def pairs(cb: types.CallbackQuery):
     if not await has_access(cb.from_user.id):
@@ -295,36 +284,33 @@ async def exp(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
     exp = int(exp)
     direction, graph_buf = await get_signal(pair, exp)
-
-    if direction in ["NO_SIGNAL", "NO_DATA", "ERROR"]:
-        await cb.message.edit_text("⚠️ Сейчас нет сильного сигнала", reply_markup=back_to_menu_kb())
-        return
-
-    photo_file = InputFile.from_buffer(graph_buf, filename="signal.png")
     kb = back_to_menu_kb()
+    if direction in ["NO_SIGNAL","NO_DATA","ERROR"]:
+        await cb.message.edit_text("⚠️ Сейчас нет сильного сигнала", reply_markup=kb)
+        return
+    graph_buf.seek(0)
     await cb.message.answer_photo(
-        photo=photo_file,
+        photo=InputFile(graph_buf, filename="signal.png"),
         caption=f"📊 СИГНАЛ KURUT TRADE\n\nПара: {pair.replace('=X','')}\nЭкспирация: {exp} мин\nНаправление: {direction}",
         reply_markup=kb
     )
-
-@dp.callback_query(lambda c: c.data=="menu")
-async def menu(cb: types.CallbackQuery):
-    await cb.message.edit_text("🏠 Главное меню", reply_markup=main_menu())
 
 @dp.callback_query(lambda c: c.data=="news")
 async def news(cb: types.CallbackQuery):
     import random
     pair = random.choice(PAIRS)
     exp = random.choice(EXPIRATIONS)
-    direction, _ = await get_signal(pair, exp)
-
-    if direction in ["NO_SIGNAL", "NO_DATA", "ERROR"]:
-        await cb.message.edit_text("⚠️ Сейчас нет новостного сигнала", reply_markup=back_to_menu_kb())
+    direction, graph_buf = await get_signal(pair, exp)
+    kb = back_to_menu_kb()
+    if direction in ["NO_SIGNAL","NO_DATA","ERROR"]:
+        await cb.message.edit_text("⚠️ Сейчас нет новостного сигнала", reply_markup=kb)
         return
-
-    await cb.message.edit_text(f"📰 НОВОСТНОЙ СИГНАЛ\n\n{pair.replace('=X','')} — {exp} мин\n{direction}",
-                               reply_markup=back_to_menu_kb())
+    graph_buf.seek(0)
+    await cb.message.answer_photo(
+        photo=InputFile(graph_buf, filename="signal.png"),
+        caption=f"📰 НОВОСТНОЙ СИГНАЛ\n\n{pair.replace('=X','')} — {exp} мин\n{direction}",
+        reply_markup=kb
+    )
 
 # ================= POSTBACK =================
 async def postback(request: web.Request):
