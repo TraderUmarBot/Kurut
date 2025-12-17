@@ -289,8 +289,10 @@ async def exp(cb: types.CallbackQuery):
         await cb.message.edit_text("⚠️ Сейчас нет сильного сигнала", reply_markup=kb)
         return
     graph_buf.seek(0)
+    # Исправлено: используем InputFile с BytesIO напрямую
+    photo_file = InputFile(file=graph_buf, filename="signal.png")
     await cb.message.answer_photo(
-        photo=InputFile(graph_buf, filename="signal.png"),
+        photo=photo_file,
         caption=f"📊 СИГНАЛ KURUT TRADE\n\nПара: {pair.replace('=X','')}\nЭкспирация: {exp} мин\nНаправление: {direction}",
         reply_markup=kb
     )
@@ -306,8 +308,9 @@ async def news(cb: types.CallbackQuery):
         await cb.message.edit_text("⚠️ Сейчас нет новостного сигнала", reply_markup=kb)
         return
     graph_buf.seek(0)
+    photo_file = InputFile(file=graph_buf, filename="signal.png")
     await cb.message.answer_photo(
-        photo=InputFile(graph_buf, filename="signal.png"),
+        photo=photo_file,
         caption=f"📰 НОВОСТНОЙ СИГНАЛ\n\n{pair.replace('=X','')} — {exp} мин\n{direction}",
         reply_markup=kb
     )
