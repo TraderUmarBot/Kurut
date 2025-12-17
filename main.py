@@ -7,6 +7,8 @@ import asyncpg
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import matplotlib.pyplot as plt
+import io
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -51,14 +53,13 @@ PAIRS = [
     "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
 
-EXPIRATIONS = [1, 3, 5, 10]
+EXPIRATIONS = [1, 5, 10]
 PAIRS_PER_PAGE = 6
 
 INTERVAL_MAP = {
     1: "1m",
-    3: "5m",
     5: "5m",
-    10: "15m"
+    10: "10m"
 }
 
 # ================= DATABASE =================
@@ -102,22 +103,25 @@ def last(v):
 
 # ================= SIGNAL CORE =================
 
-async def get_signal(pair: str, exp: int) -> str:
+async def get_signal(pair: str, exp: int) -> Tuple[str, bytes]:
     try:
         interval = INTERVAL_MAP[exp]
         df = yf.download(pair, period="2d", interval=interval, progress=False)
-
         if df.empty or len(df) < 50:
-            return "NO_DATA"
+            return "NO_DATA", b""
 
         close = df["Close"]
         high = df["High"]
         low = df["Low"]
         volume = df["Volume"]
 
+        # === INDICATORS ===
         ema20 = close.ewm(span=20).mean()
         ema50 = close.ewm(span=50).mean()
         ema200 = close.ewm(span=200).mean()
+        sma20 = close.rolling(20).mean()
+        sma50 = close.rolling(50).mean()
+        sma200 = close.rolling(200).mean()
 
         delta = close.diff()
         gain = delta.clip(lower=0).rolling(14).mean()
@@ -128,7 +132,12 @@ async def get_signal(pair: str, exp: int) -> str:
         signal = macd.ewm(span=9).mean()
 
         obv = (np.sign(delta) * volume).fillna(0).cumsum()
+        atr = (high - low).rolling(14).mean()
+        up = high.rolling(14).max()
+        down = low.rolling(14).min()
+        stochastic = (close - down) / (up - down) * 100
 
+        # SIMPLE STRATEGY SCORES
         buy_score = 0
         sell_score = 0
 
@@ -137,6 +146,11 @@ async def get_signal(pair: str, exp: int) -> str:
             buy_score += 3
         if last(ema20) < last(ema50) < last(ema200):
             sell_score += 3
+
+        if last(sma20) > last(sma50) > last(sma200):
+            buy_score += 1
+        if last(sma20) < last(sma50) < last(sma200):
+            sell_score += 1
 
         # === MOMENTUM ===
         if last(rsi) > 55:
@@ -149,22 +163,51 @@ async def get_signal(pair: str, exp: int) -> str:
         else:
             sell_score += 2
 
+        if last(stochastic) > 80:
+            sell_score += 1
+        if last(stochastic) < 20:
+            buy_score += 1
+
         # === VOLUME ===
         if last(obv) > last(obv.shift(1)):
             buy_score += 1
         else:
             sell_score += 1
 
-        if buy_score >= sell_score + 2:
-            return "ВВЕРХ 📈"
-        if sell_score >= buy_score + 2:
-            return "ВНИЗ 📉"
+        # === ATR FILTER ===
+        if last(atr) < atr.mean():
+            buy_score -= 1
+            sell_score -= 1
 
-        return "NO_SIGNAL"
+        # AI-FILTER placeholder (you can add ML model here for stronger signals)
+
+        # === FINAL DECISION ===
+        if buy_score >= sell_score + 2:
+            direction = "ВВЕРХ 📈"
+        elif sell_score >= buy_score + 2:
+            direction = "ВНИЗ 📉"
+        else:
+            direction = "NO_SIGNAL"
+
+        # === CREATE GRAPH ===
+        plt.figure(figsize=(10,5))
+        plt.plot(close.index, close, label='Close')
+        plt.plot(ema20, label='EMA20')
+        plt.plot(ema50, label='EMA50')
+        plt.plot(ema200, label='EMA200')
+        plt.title(f"{pair.replace('=X','')} Signal: {direction}")
+        plt.legend()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        plt.close()
+        buf.seek(0)
+        img_bytes = buf.read()
+
+        return direction, img_bytes
 
     except Exception as e:
         logging.error(f"get_signal error: {e}")
-        return "ERROR"
+        return "ERROR", b""
 
 # ================= KEYBOARDS =================
 
@@ -237,19 +280,19 @@ async def check_id(cb: types.CallbackQuery):
     await upsert_user(cb.from_user.id)
     user = await get_user(cb.from_user.id)
 
-    if user and user["balance"] >= MIN_DEPOSIT:
+    if cb.from_user.id in AUTHORS or (user and user["balance"] >= MIN_DEPOSIT):
         await cb.message.edit_text("✅ Доступ открыт", reply_markup=main_menu())
-    else:
-        kb = InlineKeyboardBuilder()
-        kb.button(text="💰 Пополнить баланс", url=REF_LINK)
-        kb.button(text="🔄 Проверить пополнение", callback_data="check_balance")
-        kb.adjust(1)
-        await cb.message.edit_text("⏳ Ожидаем пополнение от 20$", reply_markup=kb.as_markup())
+        return
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💰 Пополнить баланс", url=REF_LINK)
+    kb.button(text="🔄 Проверить пополнение", callback_data="check_balance")
+    kb.adjust(1)
+    await cb.message.edit_text("⏳ Ожидаем пополнение от 20$", reply_markup=kb.as_markup())
 
 @dp.callback_query(lambda c: c.data=="check_balance")
 async def check_balance(cb: types.CallbackQuery):
     user = await get_user(cb.from_user.id)
-    if user and user["balance"] >= MIN_DEPOSIT:
+    if cb.from_user.id in AUTHORS or (user and user["balance"] >= MIN_DEPOSIT):
         await cb.message.edit_text("✅ Доступ открыт", reply_markup=main_menu())
     else:
         await cb.answer("Баланс меньше 20$", show_alert=True)
@@ -274,17 +317,20 @@ async def pair(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
 async def exp(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
-    direction = await get_signal(pair, int(exp))
+    direction, img_bytes = await get_signal(pair, int(exp))
 
     if direction in ["NO_SIGNAL", "NO_DATA", "ERROR"]:
         await cb.message.edit_text("⚠️ Сейчас нет сильного сигнала")
         return
 
-    await cb.message.edit_text(
-        f"📊 СИГНАЛ KURUT TRADE\n\n"
-        f"Пара: {pair.replace('=X','')}\n"
-        f"Экспирация: {exp} мин\n"
-        f"Направление: {direction}"
+    await cb.message.answer_photo(
+        photo=img_bytes,
+        caption=(
+            f"📊 СИГНАЛ KURUT TRADE\n\n"
+            f"Пара: {pair.replace('=X','')}\n"
+            f"Экспирация: {exp} мин\n"
+            f"Направление: {direction}"
+        )
     )
 
 @dp.callback_query(lambda c: c.data=="news")
@@ -292,15 +338,18 @@ async def news(cb: types.CallbackQuery):
     import random
     pair = random.choice(PAIRS)
     exp = random.choice(EXPIRATIONS)
-    direction = await get_signal(pair, exp)
+    direction, img_bytes = await get_signal(pair, exp)
 
     if direction in ["NO_SIGNAL", "NO_DATA", "ERROR"]:
         await cb.message.edit_text("⚠️ Сейчас нет новостного сигнала")
         return
 
-    await cb.message.edit_text(
-        f"📰 НОВОСТНОЙ СИГНАЛ\n\n"
-        f"{pair.replace('=X','')} — {exp} мин\n{direction}"
+    await cb.message.answer_photo(
+        photo=img_bytes,
+        caption=(
+            f"📰 НОВОСТНОЙ СИГНАЛ\n\n"
+            f"{pair.replace('=X','')} — {exp} мин\n{direction}"
+        )
     )
 
 # ================= POSTBACK =================
