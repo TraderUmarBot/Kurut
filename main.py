@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import matplotlib.pyplot as plt
-import io
+from io import BytesIO
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -53,13 +53,13 @@ PAIRS = [
     "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
 
-EXPIRATIONS = [1, 5, 10]
+EXPIRATIONS = [1, 5, 15]
 PAIRS_PER_PAGE = 6
 
 INTERVAL_MAP = {
     1: "1m",
     5: "5m",
-    10: "10m"
+    15: "15m"
 }
 
 # ================= DATABASE =================
@@ -98,17 +98,20 @@ async def has_access(user_id: int) -> bool:
 
 # ================= UTILS =================
 
-def last(v):
-    return float(v.iloc[-1])
+def last(v: pd.Series) -> float:
+    if isinstance(v, pd.Series) and len(v) > 0:
+        return float(v.iloc[-1])
+    return 0.0
 
 # ================= SIGNAL CORE =================
 
-async def get_signal(pair: str, exp: int) -> Tuple[str, bytes]:
+async def get_signal(pair: str, exp: int) -> Tuple[str, BytesIO]:
     try:
-        interval = INTERVAL_MAP[exp]
+        interval = INTERVAL_MAP.get(exp, "1m")
         df = yf.download(pair, period="2d", interval=interval, progress=False)
+
         if df.empty or len(df) < 50:
-            return "NO_DATA", b""
+            return "NO_DATA", None
 
         close = df["Close"]
         high = df["High"]
@@ -119,9 +122,6 @@ async def get_signal(pair: str, exp: int) -> Tuple[str, bytes]:
         ema20 = close.ewm(span=20).mean()
         ema50 = close.ewm(span=50).mean()
         ema200 = close.ewm(span=200).mean()
-        sma20 = close.rolling(20).mean()
-        sma50 = close.rolling(50).mean()
-        sma200 = close.rolling(200).mean()
 
         delta = close.diff()
         gain = delta.clip(lower=0).rolling(14).mean()
@@ -129,44 +129,29 @@ async def get_signal(pair: str, exp: int) -> Tuple[str, bytes]:
         rsi = 100 - (100 / (1 + gain / loss))
 
         macd = close.ewm(span=12).mean() - close.ewm(span=26).mean()
-        signal = macd.ewm(span=9).mean()
+        macd_signal = macd.ewm(span=9).mean()
 
-        obv = (np.sign(delta) * volume).fillna(0).cumsum()
-        atr = (high - low).rolling(14).mean()
-        up = high.rolling(14).max()
-        down = low.rolling(14).min()
-        stochastic = (close - down) / (up - down) * 100
+        obv = (np.sign(delta.fillna(0)) * volume).cumsum()
 
-        # SIMPLE STRATEGY SCORES
         buy_score = 0
         sell_score = 0
 
         # === TREND ===
         if last(ema20) > last(ema50) > last(ema200):
             buy_score += 3
-        if last(ema20) < last(ema50) < last(ema200):
+        elif last(ema20) < last(ema50) < last(ema200):
             sell_score += 3
-
-        if last(sma20) > last(sma50) > last(sma200):
-            buy_score += 1
-        if last(sma20) < last(sma50) < last(sma200):
-            sell_score += 1
 
         # === MOMENTUM ===
         if last(rsi) > 55:
             buy_score += 2
-        if last(rsi) < 45:
+        elif last(rsi) < 45:
             sell_score += 2
 
-        if last(macd) > last(signal):
+        if last(macd) > last(macd_signal):
             buy_score += 2
         else:
             sell_score += 2
-
-        if last(stochastic) > 80:
-            sell_score += 1
-        if last(stochastic) < 20:
-            buy_score += 1
 
         # === VOLUME ===
         if last(obv) > last(obv.shift(1)):
@@ -174,14 +159,7 @@ async def get_signal(pair: str, exp: int) -> Tuple[str, bytes]:
         else:
             sell_score += 1
 
-        # === ATR FILTER ===
-        if last(atr) < atr.mean():
-            buy_score -= 1
-            sell_score -= 1
-
-        # AI-FILTER placeholder (you can add ML model here for stronger signals)
-
-        # === FINAL DECISION ===
+        # === SIGNAL DECISION ===
         if buy_score >= sell_score + 2:
             direction = "ВВЕРХ 📈"
         elif sell_score >= buy_score + 2:
@@ -189,25 +167,26 @@ async def get_signal(pair: str, exp: int) -> Tuple[str, bytes]:
         else:
             direction = "NO_SIGNAL"
 
-        # === CREATE GRAPH ===
-        plt.figure(figsize=(10,5))
-        plt.plot(close.index, close, label='Close')
-        plt.plot(ema20, label='EMA20')
-        plt.plot(ema50, label='EMA50')
-        plt.plot(ema200, label='EMA200')
-        plt.title(f"{pair.replace('=X','')} Signal: {direction}")
+        # === PLOT GRAPH ===
+        plt.figure(figsize=(10,6))
+        plt.plot(df.index, close, label='Close', color='black')
+        plt.plot(df.index, ema20, label='EMA20', color='blue')
+        plt.plot(df.index, ema50, label='EMA50', color='orange')
+        plt.plot(df.index, ema200, label='EMA200', color='green')
+        plt.title(f'{pair.replace("=X","")} - {exp} мин')
         plt.legend()
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png')
-        plt.close()
-        buf.seek(0)
-        img_bytes = buf.read()
+        plt.grid(True)
 
-        return direction, img_bytes
+        buf = BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        plt.close()
+
+        return direction, buf
 
     except Exception as e:
         logging.error(f"get_signal error: {e}")
-        return "ERROR", b""
+        return "ERROR", None
 
 # ================= KEYBOARDS =================
 
@@ -280,19 +259,19 @@ async def check_id(cb: types.CallbackQuery):
     await upsert_user(cb.from_user.id)
     user = await get_user(cb.from_user.id)
 
-    if cb.from_user.id in AUTHORS or (user and user["balance"] >= MIN_DEPOSIT):
+    if user and user["balance"] >= MIN_DEPOSIT:
         await cb.message.edit_text("✅ Доступ открыт", reply_markup=main_menu())
-        return
-    kb = InlineKeyboardBuilder()
-    kb.button(text="💰 Пополнить баланс", url=REF_LINK)
-    kb.button(text="🔄 Проверить пополнение", callback_data="check_balance")
-    kb.adjust(1)
-    await cb.message.edit_text("⏳ Ожидаем пополнение от 20$", reply_markup=kb.as_markup())
+    else:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="💰 Пополнить баланс", url=REF_LINK)
+        kb.button(text="🔄 Проверить пополнение", callback_data="check_balance")
+        kb.adjust(1)
+        await cb.message.edit_text("⏳ Ожидаем пополнение от 20$", reply_markup=kb.as_markup())
 
 @dp.callback_query(lambda c: c.data=="check_balance")
 async def check_balance(cb: types.CallbackQuery):
     user = await get_user(cb.from_user.id)
-    if cb.from_user.id in AUTHORS or (user and user["balance"] >= MIN_DEPOSIT):
+    if user and user["balance"] >= MIN_DEPOSIT:
         await cb.message.edit_text("✅ Доступ открыт", reply_markup=main_menu())
     else:
         await cb.answer("Баланс меньше 20$", show_alert=True)
@@ -317,40 +296,53 @@ async def pair(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
 async def exp(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
-    direction, img_bytes = await get_signal(pair, int(exp))
+    exp = int(exp)
+    direction, graph_buf = await get_signal(pair, exp)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🏠 Главное меню", callback_data="main_menu")
+    kb.adjust(1)
 
     if direction in ["NO_SIGNAL", "NO_DATA", "ERROR"]:
-        await cb.message.edit_text("⚠️ Сейчас нет сильного сигнала")
+        await cb.message.edit_text("⚠️ Сейчас нет сильного сигнала", reply_markup=kb.as_markup())
         return
 
-    await cb.message.answer_photo(
-        photo=img_bytes,
-        caption=(
-            f"📊 СИГНАЛ KURUT TRADE\n\n"
-            f"Пара: {pair.replace('=X','')}\n"
-            f"Экспирация: {exp} мин\n"
-            f"Направление: {direction}"
+    if graph_buf:
+        await cb.message.answer_photo(photo=graph_buf,
+                                      caption=f"📊 СИГНАЛ KURUT TRADE\n\nПара: {pair.replace('=X','')}\nЭкспирация: {exp} мин\nНаправление: {direction}",
+                                      reply_markup=kb.as_markup())
+    else:
+        await cb.message.edit_text(
+            f"📊 СИГНАЛ KURUT TRADE\n\nПара: {pair.replace('=X','')}\nЭкспирация: {exp} мин\nНаправление: {direction}",
+            reply_markup=kb.as_markup()
         )
-    )
+
+@dp.callback_query(lambda c: c.data=="main_menu")
+async def go_main(cb: types.CallbackQuery):
+    await cb.message.edit_text("Главное меню:", reply_markup=main_menu())
 
 @dp.callback_query(lambda c: c.data=="news")
 async def news(cb: types.CallbackQuery):
     import random
     pair = random.choice(PAIRS)
     exp = random.choice(EXPIRATIONS)
-    direction, img_bytes = await get_signal(pair, exp)
+    direction, graph_buf = await get_signal(pair, exp)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🏠 Главное меню", callback_data="main_menu")
+    kb.adjust(1)
 
     if direction in ["NO_SIGNAL", "NO_DATA", "ERROR"]:
-        await cb.message.edit_text("⚠️ Сейчас нет новостного сигнала")
+        await cb.message.edit_text("⚠️ Сейчас нет новостного сигнала", reply_markup=kb.as_markup())
         return
 
-    await cb.message.answer_photo(
-        photo=img_bytes,
-        caption=(
-            f"📰 НОВОСТНОЙ СИГНАЛ\n\n"
-            f"{pair.replace('=X','')} — {exp} мин\n{direction}"
-        )
-    )
+    if graph_buf:
+        await cb.message.answer_photo(photo=graph_buf,
+                                      caption=f"📰 НОВОСТНОЙ СИГНАЛ\n\n{pair.replace('=X','')} — {exp} мин\n{direction}",
+                                      reply_markup=kb.as_markup())
+    else:
+        await cb.message.edit_text(f"📰 НОВОСТНОЙ СИГНАЛ\n\n{pair.replace('=X','')} — {exp} мин\n{direction}",
+                                   reply_markup=kb.as_markup())
 
 # ================= POSTBACK =================
 
