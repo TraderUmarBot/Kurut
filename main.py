@@ -6,15 +6,11 @@ import asyncpg
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import io
-import matplotlib.pyplot as plt
-import mplfinance as mpf
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InputFile
 
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
@@ -272,76 +268,17 @@ async def pair(cb: types.CallbackQuery):
     pair = cb.data.split(":")[1]
     await cb.message.edit_text("Выберите экспирацию", reply_markup=exp_kb(pair))
 
-# ==================== ИСПРАВЛЕННЫЙ EXP ====================
-
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
 async def exp(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
-    exp = int(exp)
-    direction, level = await get_signal(pair, exp)
+    direction, level = await get_signal(pair, int(exp))
 
-    # ===== Загрузка данных =====
-    interval = INTERVAL_MAP[exp]
-    df = yf.download(pair, period="2d", interval=interval, progress=False)
-    if df.empty or len(df) < 50:
-        await cb.message.edit_text("⚠️ Нет данных для построения графика", reply_markup=back_menu_kb())
-        return
-
-    # ===== Построение графика с RSI/MACD =====
-    df.index.name = 'Date'
-    df_mpf = df[['Open','High','Low','Close','Volume']]
-
-    # Рассчёт индикаторов
-    df['EMA20'] = df['Close'].ewm(span=20).mean()
-    df['EMA50'] = df['Close'].ewm(span=50).mean()
-    df['RSI'] = 100 - (100 / (1 + (df['Close'].diff().clip(lower=0).rolling(14).mean() /
-                                  (-df['Close'].diff().clip(upper=0).rolling(14).mean()))))
-    df['MACD'] = df['Close'].ewm(span=12).mean() - df['Close'].ewm(span=26).mean()
-    df['Signal'] = df['MACD'].ewm(span=9).mean()
-
-    # ===== Рисуем график =====
-    mc = mpf.make_marketcolors(up='g', down='r', inherit=True)
-    s  = mpf.make_mpf_style(marketcolors=mc, mavcolors=['#1f77b4','#ff7f0e'], rc={'font.size':10})
-    addplots = [
-        mpf.make_addplot(df['EMA20'], color='blue'),
-        mpf.make_addplot(df['EMA50'], color='orange'),
-        mpf.make_addplot(df['RSI'], panel=1, color='purple', ylabel='RSI'),
-        mpf.make_addplot(df['MACD'], panel=2, color='green', ylabel='MACD'),
-        mpf.make_addplot(df['Signal'], panel=2, color='red')
-    ]
-
-    fig, axlist = mpf.plot(
-        df_mpf,
-        type='candle',
-        style=s,
-        addplot=addplots,
-        volume=True,
-        returnfig=True,
-        figsize=(10,6),
-        title=f"{pair.replace('=X','')} - KURUT"
-    )
-
-    # Добавим стрелку точки входа
-    if direction == "ВВЕРХ 📈":
-        axlist[0].annotate('BUY', xy=(len(df)-1, df['Low'].iloc[-1]*0.995),
-                           xytext=(len(df)-10, df['Low'].iloc[-1]*0.98),
-                           arrowprops=dict(facecolor='green', shrink=0.05))
-    else:
-        axlist[0].annotate('SELL', xy=(len(df)-1, df['High'].iloc[-1]*1.005),
-                           xytext=(len(df)-10, df['High'].iloc[-1]*1.02),
-                           arrowprops=dict(facecolor='red', shrink=0.05))
-
-    # Сохраняем в BytesIO
-    chart_buf = io.BytesIO()
-    fig.savefig(chart_buf, format='png', bbox_inches='tight')
-    plt.close(fig)
-    chart_buf.seek(0)
-    photo = InputFile(chart_buf, filename="chart.png")
-
-    await bot.send_photo(
-        chat_id=cb.from_user.id,
-        photo=photo,
-        caption=f"📊 СИГНАЛ KURUT TRADE\n\nПара: {pair.replace('=X','')}\nЭкспирация: {exp} мин\nНаправление: {direction}\nКачество: {level}",
+    await cb.message.edit_text(
+        f"📊 СИГНАЛ KURUT TRADE\n\n"
+        f"Пара: {pair.replace('=X','')}\n"
+        f"Экспирация: {exp} мин\n"
+        f"Направление: {direction}\n"
+        f"Качество: {level}",
         reply_markup=back_menu_kb()
     )
 
