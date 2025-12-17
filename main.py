@@ -2,8 +2,8 @@ import os
 import sys
 import asyncio
 import logging
-from io import BytesIO
-from typing import List
+import io
+from typing import Tuple
 import asyncpg
 import pandas as pd
 import numpy as np
@@ -15,6 +15,7 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InputFile
+
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiogram.methods import DeleteWebhook, SetWebhook
@@ -50,7 +51,7 @@ PAIRS = [
     "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
 
-EXPIRATIONS = [1, 5, 15]  # таймфреймы в минутах
+EXPIRATIONS = [1, 5, 15]
 PAIRS_PER_PAGE = 6
 
 INTERVAL_MAP = {
@@ -96,27 +97,26 @@ async def has_access(user_id: int) -> bool:
 def last(v):
     return float(v.iloc[-1])
 
-# ================= SIGNAL CORE =================
-async def get_signal(pair: str, exp: int) -> str:
+# ================= SIGNALS =================
+async def get_signal(pair: str, exp: int) -> Tuple[str, io.BytesIO]:
+    """
+    Возвращает сигнал и график в BytesIO
+    """
     try:
-        interval = INTERVAL_MAP.get(exp, "1m")
+        interval = INTERVAL_MAP[exp]
         df = yf.download(pair, period="2d", interval=interval, progress=False, auto_adjust=True)
-
         if df.empty or len(df) < 50:
-            return "NO_DATA"
+            return "NO_DATA", None
 
         close = df["Close"]
         high = df["High"]
         low = df["Low"]
         volume = df["Volume"]
 
-        # 15 индикаторов
+        # ===== INDICATORS =====
         ema20 = close.ewm(span=20).mean()
         ema50 = close.ewm(span=50).mean()
-        ema100 = close.ewm(span=100).mean()
         ema200 = close.ewm(span=200).mean()
-        sma14 = close.rolling(14).mean()
-        sma50 = close.rolling(50).mean()
 
         delta = close.diff()
         gain = delta.clip(lower=0).rolling(14).mean()
@@ -124,18 +124,9 @@ async def get_signal(pair: str, exp: int) -> str:
         rsi = 100 - (100 / (1 + gain / loss))
 
         macd = close.ewm(span=12).mean() - close.ewm(span=26).mean()
-        macd_signal = macd.ewm(span=9).mean()
-        obv = (np.sign(delta) * volume).fillna(0).cumsum()
-        bollinger_upper = sma14 + 2*close.rolling(14).std()
-        bollinger_lower = sma14 - 2*close.rolling(14).std()
+        signal_line = macd.ewm(span=9).mean()
 
-        # Индикаторы продолжать до 15-ти...
-        atr = (high - low).rolling(14).mean()
-        stochastic_k = ((close - low.rolling(14).min()) / (high.rolling(14).max() - low.rolling(14).min())) * 100
-        stochastic_d = stochastic_k.rolling(3).mean()
-        williams_r = (high.rolling(14).max() - close) / (high.rolling(14).max() - low.rolling(14).min()) * -100
-        cci = (close - sma14) / (0.015 * close.rolling(14).std())
-        momentum = close - close.shift(10)
+        obv = (np.sign(delta) * volume).fillna(0).cumsum()
 
         buy_score = 0
         sell_score = 0
@@ -147,46 +138,49 @@ async def get_signal(pair: str, exp: int) -> str:
             sell_score += 3
 
         # === MOMENTUM ===
-        if last(rsi) > 55: buy_score += 2
-        if last(rsi) < 45: sell_score += 2
-        if last(macd) > last(macd_signal): buy_score += 2
-        else: sell_score += 2
-        if last(momentum) > 0: buy_score += 1
-        else: sell_score += 1
+        if last(rsi) > 55:
+            buy_score += 2
+        if last(rsi) < 45:
+            sell_score += 2
+
+        if last(macd) > last(signal_line):
+            buy_score += 2
+        else:
+            sell_score += 2
 
         # === VOLUME ===
-        if last(obv) > last(obv.shift(1)): buy_score += 1
-        else: sell_score += 1
+        if last(obv) > last(obv.shift(1)):
+            buy_score += 1
+        else:
+            sell_score += 1
 
-        # === FINAL SIGNAL ===
         if buy_score >= sell_score + 2:
-            return "ВВЕРХ 📈"
-        if sell_score >= buy_score + 2:
-            return "ВНИЗ 📉"
-        return "NO_SIGNAL"
+            direction = "ВВЕРХ 📈"
+        elif sell_score >= buy_score + 2:
+            direction = "ВНИЗ 📉"
+        else:
+            direction = "NO_SIGNAL"
+
+        # ===== GRAPH =====
+        graph_buf = io.BytesIO()
+        plt.figure(figsize=(10,5))
+        plt.plot(close, label="Close")
+        plt.plot(ema20, label="EMA20")
+        plt.plot(ema50, label="EMA50")
+        plt.plot(ema200, label="EMA200")
+        plt.title(f"{pair.replace('=X','')} Signal: {direction}")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(graph_buf, format="png")
+        plt.close()
+        graph_buf.seek(0)
+
+        return direction, graph_buf
 
     except Exception as e:
         logging.error(f"get_signal error: {e}")
-        return "ERROR"
-
-# ================= GRAPH =================
-def generate_graph(pair: str, exp: int) -> BytesIO:
-    interval = INTERVAL_MAP.get(exp, "1m")
-    df = yf.download(pair, period="2d", interval=interval, progress=False, auto_adjust=True)
-    if df.empty:
-        return None
-
-    plt.figure(figsize=(10,5))
-    plt.plot(df['Close'], label='Close')
-    plt.plot(df['Close'].ewm(span=20).mean(), label='EMA20')
-    plt.plot(df['Close'].ewm(span=50).mean(), label='EMA50')
-    plt.title(f'{pair} Signal Graph')
-    plt.legend()
-    buf = BytesIO()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
-    plt.close()
-    return buf
+        return "ERROR", None
 
 # ================= KEYBOARDS =================
 def main_menu():
@@ -201,8 +195,10 @@ def pairs_kb(page=0):
     start = page * PAIRS_PER_PAGE
     for p in PAIRS[start:start + PAIRS_PER_PAGE]:
         kb.button(text=p.replace("=X",""), callback_data=f"pair:{p}")
-    if page > 0: kb.button(text="⬅️ Назад", callback_data=f"page:{page-1}")
-    if start + PAIRS_PER_PAGE < len(PAIRS): kb.button(text="➡️ Вперёд", callback_data=f"page:{page+1}")
+    if page > 0:
+        kb.button(text="⬅️ Назад", callback_data=f"page:{page-1}")
+    if start + PAIRS_PER_PAGE < len(PAIRS):
+        kb.button(text="➡️ Вперёд", callback_data=f"page:{page+1}")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -213,9 +209,9 @@ def exp_kb(pair):
     kb.adjust(2)
     return kb.as_markup()
 
-def back_to_main_kb():
+def back_to_menu_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="🏠 Главное меню", callback_data="main_menu")
+    kb.button(text="🏠 Главное меню", callback_data="menu")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -225,6 +221,7 @@ async def start(msg: types.Message):
     if msg.from_user.id in AUTHORS:
         await msg.answer("👑 Авторский доступ", reply_markup=main_menu())
         return
+
     kb = InlineKeyboardBuilder()
     kb.button(text="➡️ Далее", callback_data="instr2")
     await msg.answer(
@@ -297,45 +294,37 @@ async def pair(cb: types.CallbackQuery):
 async def exp(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
     exp = int(exp)
-    direction = await get_signal(pair, exp)
-    graph_buf = generate_graph(pair, exp)
-
-    kb = back_to_main_kb()
+    direction, graph_buf = await get_signal(pair, exp)
 
     if direction in ["NO_SIGNAL", "NO_DATA", "ERROR"]:
-        await cb.message.edit_text("⚠️ Сейчас нет сильного сигнала", reply_markup=kb)
+        await cb.message.edit_text("⚠️ Сейчас нет сильного сигнала", reply_markup=back_to_menu_kb())
         return
 
-    if graph_buf:
-        photo_file = InputFile(graph_buf, filename="signal.png")
-        await cb.message.answer_photo(
-            photo=photo_file,
-            caption=f"📊 СИГНАЛ KURUT TRADE\n\nПара: {pair.replace('=X','')}\nЭкспирация: {exp} мин\nНаправление: {direction}",
-            reply_markup=kb
-        )
+    photo_file = InputFile.from_buffer(graph_buf, filename="signal.png")
+    kb = back_to_menu_kb()
+    await cb.message.answer_photo(
+        photo=photo_file,
+        caption=f"📊 СИГНАЛ KURUT TRADE\n\nПара: {pair.replace('=X','')}\nЭкспирация: {exp} мин\nНаправление: {direction}",
+        reply_markup=kb
+    )
+
+@dp.callback_query(lambda c: c.data=="menu")
+async def menu(cb: types.CallbackQuery):
+    await cb.message.edit_text("🏠 Главное меню", reply_markup=main_menu())
 
 @dp.callback_query(lambda c: c.data=="news")
 async def news(cb: types.CallbackQuery):
     import random
     pair = random.choice(PAIRS)
     exp = random.choice(EXPIRATIONS)
-    direction = await get_signal(pair, exp)
-    graph_buf = generate_graph(pair, exp)
-    kb = back_to_main_kb()
-    if direction in ["NO_SIGNAL", "NO_DATA", "ERROR"]:
-        await cb.message.edit_text("⚠️ Сейчас нет новостного сигнала", reply_markup=kb)
-        return
-    if graph_buf:
-        photo_file = InputFile(graph_buf, filename="signal.png")
-        await cb.message.answer_photo(
-            photo=photo_file,
-            caption=f"📰 НОВОСТНОЙ СИГНАЛ\n\n{pair.replace('=X','')} — {exp} мин\n{direction}",
-            reply_markup=kb
-        )
+    direction, _ = await get_signal(pair, exp)
 
-@dp.callback_query(lambda c: c.data=="main_menu")
-async def main_menu_cb(cb: types.CallbackQuery):
-    await cb.message.edit_text("Главное меню:", reply_markup=main_menu())
+    if direction in ["NO_SIGNAL", "NO_DATA", "ERROR"]:
+        await cb.message.edit_text("⚠️ Сейчас нет новостного сигнала", reply_markup=back_to_menu_kb())
+        return
+
+    await cb.message.edit_text(f"📰 НОВОСТНОЙ СИГНАЛ\n\n{pair.replace('=X','')} — {exp} мин\n{direction}",
+                               reply_markup=back_to_menu_kb())
 
 # ================= POSTBACK =================
 async def postback(request: web.Request):
