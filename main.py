@@ -51,7 +51,6 @@ PAIRS = [
 ]
 
 EXPIRATIONS = [1, 5, 10]
-PAIRS_PER_PAGE = 6
 
 INTERVAL_MAP = {
     1: "1m",
@@ -59,61 +58,14 @@ INTERVAL_MAP = {
     10: "15m"
 }
 
-# ================= TEXT / LANG =================
-
-TEXT = {
-    "choose_lang": {
-        "ru": "🌍 Выберите язык",
-        "en": "🌍 Choose language",
-        "uz": "🌍 Tilni tanlang",
-        "tj": "🌍 Забонро интихоб кунед",
-        "kz": "🌍 Тілді таңдаңыз",
-        "kg": "🌍 Тилди тандаңыз"
-    },
-    "start": {
-        "ru": "📘 ИНСТРУКЦИЯ KURUT TRADE\n\nБот анализирует рынок\nИспользует профессиональные индикаторы\nПодходит для новичков и профи",
-        "en": "📘 KURUT TRADE GUIDE\n\nBot analyzes the market\nUses professional indicators\nSuitable for beginners and pros",
-        "uz": "📘 KURUT TRADE\n\nBot bozorni tahlil qiladi\nProfessional indikatorlar ishlatadi",
-        "tj": "📘 KURUT TRADE\n\nБот бозорро таҳлил мекунад",
-        "kz": "📘 KURUT TRADE\n\nБот нарықты талдайды",
-        "kg": "📘 KURUT TRADE\n\nБот рынокту талдайт"
-    },
-    "choose_pair": {
-        "ru": "Выберите пару",
-        "en": "Choose a pair",
-        "uz": "Juftlikni tanlang",
-        "tj": "Ҷуфтро интихоб кунед",
-        "kz": "Жұпты таңдаңыз",
-        "kg": "Жупту тандаңыз"
-    },
-    "choose_exp": {
-        "ru": "Выберите экспирацию",
-        "en": "Choose expiration",
-        "uz": "Ekspiratsiyani tanlang",
-        "tj": "Мӯҳлатро интихоб кунед",
-        "kz": "Экспирацияны таңдаңыз",
-        "kg": "Экспирацияны тандаңыз"
-    },
-    "signal": {
-        "ru": "📊 СИГНАЛ KURUT TRADE",
-        "en": "📊 KURUT TRADE SIGNAL",
-        "uz": "📊 KURUT TRADE SIGNAL",
-        "tj": "📊 СИГНАЛИ KURUT",
-        "kz": "📊 KURUT СИГНАЛЫ",
-        "kg": "📊 KURUT СИГНАЛЫ"
-    },
-    "menu": {
-        "ru": "Главное меню:",
-        "en": "Main menu:",
-        "uz": "Asosiy menyu:",
-        "tj": "Менюи асосӣ:",
-        "kz": "Басты мәзір:",
-        "kg": "Башкы меню:"
-    }
+LANGS = {
+    "ru": "🇷🇺 Русский",
+    "en": "🇬🇧 English",
+    "uz": "🇺🇿 O‘zbek",
+    "tj": "🇹🇯 Тоҷикӣ",
+    "kz": "🇰🇿 Қазақ",
+    "kg": "🇰🇬 Кыргыз"
 }
-
-def t(key: str, lang: str) -> str:
-    return TEXT.get(key, {}).get(lang, TEXT[key]["ru"])
 
 # ================= DATABASE =================
 
@@ -128,12 +80,20 @@ async def init_db():
             lang TEXT DEFAULT 'ru'
         );
         """)
+        await conn.execute("""
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS lang TEXT DEFAULT 'ru';
+        """)
 
-async def upsert_user(user_id: int):
+async def upsert_user(user_id: int, lang: str = "ru"):
     async with DB_POOL.acquire() as conn:
         await conn.execute(
-            "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING",
-            user_id
+            """
+            INSERT INTO users (user_id, lang)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) DO NOTHING
+            """,
+            user_id, lang
         )
 
 async def get_user(user_id: int):
@@ -148,8 +108,12 @@ async def set_lang(user_id: int, lang: str):
         )
 
 async def get_lang(user_id: int) -> str:
-    user = await get_user(user_id)
-    return user["lang"] if user else "ru"
+    async with DB_POOL.acquire() as conn:
+        user = await conn.fetchrow(
+            "SELECT lang FROM users WHERE user_id=$1",
+            user_id
+        )
+        return user["lang"] if user and user["lang"] else "ru"
 
 async def update_balance(user_id: int, amount: float):
     async with DB_POOL.acquire() as conn:
@@ -164,20 +128,21 @@ async def has_access(user_id: int) -> bool:
     user = await get_user(user_id)
     return bool(user and user["balance"] >= MIN_DEPOSIT)
 
-# ================= SIGNAL CORE (НЕ ТРОГАЛ) =================
+# ================= SIGNAL CORE (УЛУЧШЕННЫЙ) =================
 
 def last(v):
     return float(v.iloc[-1])
 
-async def get_signal(pair: str, exp: int) -> tuple[str, str]:
+async def get_signal(pair: str, exp: int):
     try:
         interval = INTERVAL_MAP[exp]
         df = yf.download(pair, period="2d", interval=interval, progress=False)
 
-        if df.empty or len(df) < 50:
-            return "ВНИЗ 📉", "⚠️ Слабый рынок"
+        if df.empty or len(df) < 60:
+            return None
 
         close = df["Close"]
+
         ema20 = close.ewm(span=20).mean()
         ema50 = close.ewm(span=50).mean()
 
@@ -186,69 +151,50 @@ async def get_signal(pair: str, exp: int) -> tuple[str, str]:
         loss = (-delta.clip(upper=0)).rolling(14).mean()
         rsi = 100 - (100 / (1 + gain / loss))
 
-        buy = 0
-        sell = 0
+        buy, sell = 0, 0
 
         if last(ema20) > last(ema50):
             buy += 2
         else:
             sell += 2
 
-        if last(rsi) > 55:
+        if last(rsi) > 60:
             buy += 2
-        elif last(rsi) < 45:
+        elif last(rsi) < 40:
             sell += 2
 
-        direction = "ВВЕРХ 📈" if buy > sell else "ВНИЗ 📉"
-        strength = abs(buy - sell)
+        if abs(buy - sell) < 2:
+            return None
 
-        if strength >= 3:
-            level = "🔥 СИЛЬНЫЙ сигнал"
-        elif strength == 2:
-            level = "⚡ СРЕДНИЙ сигнал"
-        else:
-            level = "⚠️ СЛАБЫЙ рынок (риск)"
+        direction = "📈 BUY" if buy > sell else "📉 SELL"
+        strength = "🔥 СИЛЬНЫЙ СИГНАЛ" if abs(buy - sell) >= 3 else "⚡ СРЕДНИЙ СИГНАЛ"
 
-        return direction, level
+        return direction, strength
 
     except Exception as e:
         logging.error(e)
-        return "ВНИЗ 📉", "⚠️ Ошибка данных"
+        return None
 
 # ================= KEYBOARDS =================
 
 def lang_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="🇷🇺 Русский", callback_data="lang:ru")
-    kb.button(text="🇺🇿 O‘zbek", callback_data="lang:uz")
-    kb.button(text="🇹🇯 Тоҷикӣ", callback_data="lang:tj")
-    kb.button(text="🇰🇿 Қазақша", callback_data="lang:kz")
-    kb.button(text="🇰🇬 Кыргызча", callback_data="lang:kg")
-    kb.button(text="🇬🇧 English", callback_data="lang:en")
+    for k, v in LANGS.items():
+        kb.button(text=v, callback_data=f"lang:{k}")
     kb.adjust(2)
     return kb.as_markup()
 
-def main_menu():
+def main_menu(lang):
     kb = InlineKeyboardBuilder()
-    kb.button(text="📈 Валютные пары", callback_data="pairs")
-    kb.button(text="📰 Новости", callback_data="news")
+    kb.button(text="📊 Сигналы", callback_data="pairs")
+    kb.button(text="🌍 Сменить язык", callback_data="change_lang")
     kb.adjust(1)
     return kb.as_markup()
 
-def back_menu_kb():
+def pairs_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="⬅️ Главное меню", callback_data="main_menu")
-    return kb.as_markup()
-
-def pairs_kb(page=0):
-    kb = InlineKeyboardBuilder()
-    start = page * PAIRS_PER_PAGE
-    for p in PAIRS[start:start + PAIRS_PER_PAGE]:
+    for p in PAIRS:
         kb.button(text=p.replace("=X",""), callback_data=f"pair:{p}")
-    if page > 0:
-        kb.button(text="⬅️", callback_data=f"page:{page-1}")
-    if start + PAIRS_PER_PAGE < len(PAIRS):
-        kb.button(text="➡️", callback_data=f"page:{page+1}")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -256,7 +202,12 @@ def exp_kb(pair):
     kb = InlineKeyboardBuilder()
     for e in EXPIRATIONS:
         kb.button(text=f"{e} мин", callback_data=f"exp:{pair}:{e}")
-    kb.adjust(2)
+    kb.adjust(3)
+    return kb.as_markup()
+
+def back_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ Главное меню", callback_data="main_menu")
     return kb.as_markup()
 
 # ================= HANDLERS =================
@@ -264,63 +215,132 @@ def exp_kb(pair):
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     await upsert_user(msg.from_user.id)
-    await msg.answer(TEXT["choose_lang"]["ru"], reply_markup=lang_kb())
+    await msg.answer(
+        "🌍 Выберите язык / Choose language",
+        reply_markup=lang_kb()
+    )
 
 @dp.callback_query(lambda c: c.data.startswith("lang:"))
-async def choose_lang(cb: types.CallbackQuery):
+async def set_language(cb: types.CallbackQuery):
     lang = cb.data.split(":")[1]
     await set_lang(cb.from_user.id, lang)
-    await cb.message.edit_text(t("start", lang), reply_markup=main_menu())
+
+    await cb.message.edit_text(
+        "📘 ИНСТРУКЦИЯ KURUT TRADE\n\n"
+        "1️⃣ Выбираете валютную пару\n"
+        "2️⃣ Выбираете время экспирации\n"
+        "3️⃣ Получаете готовый сигнал\n\n"
+        "Бот анализирует рынок автоматически\n"
+        "Используются EMA + RSI\n\n"
+        "⬇️ Нажмите Далее",
+        reply_markup=InlineKeyboardBuilder()
+        .button(text="➡️ Далее", callback_data="instr2")
+        .as_markup()
+    )
+
+@dp.callback_query(lambda c: c.data=="instr2")
+async def instr2(cb: types.CallbackQuery):
+    await cb.message.edit_text(
+        "🔐 ДОСТУП К БОТУ\n\n"
+        "Для работы сигналов нужно:\n"
+        "1️⃣ Зарегистрироваться\n"
+        "2️⃣ Пополнить от 20$\n"
+        "3️⃣ Проверить доступ\n\n"
+        "⬇️ Продолжить",
+        reply_markup=InlineKeyboardBuilder()
+        .button(text="➡️ Продолжить", callback_data="get_access")
+        .as_markup()
+    )
+
+@dp.callback_query(lambda c: c.data=="get_access")
+async def get_access(cb: types.CallbackQuery):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔗 Регистрация", url=REF_LINK)
+    kb.button(text="✅ Проверить доступ", callback_data="check_id")
+    kb.adjust(1)
+
+    await cb.message.edit_text(
+        "💼 ПОЛУЧЕНИЕ ДОСТУПА\n\n"
+        "Регистрация по кнопке ниже\n"
+        "После пополнения нажмите Проверить",
+        reply_markup=kb.as_markup()
+    )
+
+@dp.callback_query(lambda c: c.data=="check_id")
+async def check_id(cb: types.CallbackQuery):
+    if await has_access(cb.from_user.id):
+        lang = await get_lang(cb.from_user.id)
+        await cb.message.edit_text(
+            "✅ Доступ открыт\n\nВыберите действие:",
+            reply_markup=main_menu(lang)
+        )
+    else:
+        await cb.answer("⏳ Пополнение не найдено", show_alert=True)
 
 @dp.callback_query(lambda c: c.data=="main_menu")
-async def main_menu_cb(cb: types.CallbackQuery):
+async def mm(cb: types.CallbackQuery):
     lang = await get_lang(cb.from_user.id)
-    await cb.message.edit_text(t("menu", lang), reply_markup=main_menu())
+    await cb.message.edit_text(
+        "🏠 Главное меню",
+        reply_markup=main_menu(lang)
+    )
 
 @dp.callback_query(lambda c: c.data=="pairs")
 async def pairs(cb: types.CallbackQuery):
     if not await has_access(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
+        await cb.answer("❌ Нет доступа", show_alert=True)
         return
-    lang = await get_lang(cb.from_user.id)
-    await cb.message.edit_text(t("choose_pair", lang), reply_markup=pairs_kb())
-
-@dp.callback_query(lambda c: c.data.startswith("page:"))
-async def page(cb: types.CallbackQuery):
-    lang = await get_lang(cb.from_user.id)
-    page = int(cb.data.split(":")[1])
-    await cb.message.edit_text(t("choose_pair", lang), reply_markup=pairs_kb(page))
+    await cb.message.edit_text(
+        "📊 Выберите валютную пару",
+        reply_markup=pairs_kb()
+    )
 
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
 async def pair(cb: types.CallbackQuery):
-    lang = await get_lang(cb.from_user.id)
     pair = cb.data.split(":")[1]
-    await cb.message.edit_text(t("choose_exp", lang), reply_markup=exp_kb(pair))
+    await cb.message.edit_text(
+        f"⏱ Выберите экспирацию\n{pair.replace('=X','')}",
+        reply_markup=exp_kb(pair)
+    )
 
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
 async def exp(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
-    lang = await get_lang(cb.from_user.id)
+    signal = await get_signal(pair, int(exp))
 
-    direction, level = await get_signal(pair, int(exp))
+    if not signal:
+        await cb.message.edit_text(
+            "⚠️ Сейчас нет сильного сигнала\n\nПопробуйте позже",
+            reply_markup=back_menu()
+        )
+        return
+
+    direction, strength = signal
 
     await cb.message.edit_text(
-        f"{t('signal', lang)}\n\n"
-        f"{pair.replace('=X','')}\n"
-        f"{exp} min\n"
-        f"{direction}\n{level}",
-        reply_markup=back_menu_kb()
+        f"━━━━━━━━━━━━━━\n"
+        f"📊 KURUT TRADE SIGNAL\n"
+        f"━━━━━━━━━━━━━━\n\n"
+        f"💱 Пара: {pair.replace('=X','')}\n"
+        f"⏱ Экспирация: {exp} мин\n\n"
+        f"{direction}\n"
+        f"{strength}\n\n"
+        f"⚠️ Соблюдайте риск-менеджмент",
+        reply_markup=back_menu()
     )
 
 # ================= POSTBACK =================
 
 async def postback(request: web.Request):
-    click_id = request.query.get("click_id","").strip()
-    amount = request.query.get("amount","0")
+    click_id = request.query.get("click_id", "")
+    amount = request.query.get("amount", "0")
+
     if not click_id.isdigit():
         return web.Response(text="NO CLICK_ID")
+
     await upsert_user(int(click_id))
     await update_balance(int(click_id), float(amount))
+
     return web.Response(text="OK")
 
 # ================= START =================
