@@ -79,7 +79,11 @@ bot = Bot(token=TG_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 DB_POOL: asyncpg.Pool | None = None
 
-PAIRS = ["EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X","EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X"]
+PAIRS = [
+    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X", "USDCHF=X",
+    "EURJPY=X", "GBPJPY=X", "AUDJPY=X", "EURGBP=X", "EURAUD=X", "GBPAUD=X",
+    "CADJPY=X", "CHFJPY=X", "EURCAD=X", "GBPCAD=X", "AUDCAD=X", "AUDCHF=X", "CADCHF=X"
+]
 INTERVAL_MAP = {1: "1m", 5: "5m", 15: "15m"}
 
 async def init_db():
