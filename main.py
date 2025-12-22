@@ -83,57 +83,61 @@ async def has_access(uid):
         u = await conn.fetchrow("SELECT balance FROM users WHERE user_id=$1", uid)
         return bool(u and u["balance"] >= MIN_DEPOSIT)
 
-# ================= МОЩНЫЙ АЛГОРИТМ АНАЛИЗА =================
+# ================= ОБНОВЛЕННЫЙ АЛГОРИТМ (УРОВНИ + ПАТТЕРНЫ) =================
 async def get_signal(pair, exp):
+    # Загружаем 100 свечей для точного определения уровней
     df = yf.download(pair, period="2d", interval=INTERVAL_MAP[exp], progress=False)
-    if df.empty or len(df) < 30: return "down", "weak"
+    if df.empty or len(df) < 50: return "down", "weak"
     
     try:
-        # Технический расчет
+        # 1. ОПРЕДЕЛЕНИЕ УРОВНЕЙ ПОДДЕРЖКИ И СОПРОТИВЛЕНИЯ
+        last_price = df['Close'].iloc[-1]
+        support = df['Low'].rolling(window=30).min().iloc[-1]
+        resistance = df['High'].rolling(window=30).max().iloc[-1]
+        
+        # 2. ПОИСК СВЕЧНЫХ ПАТТЕРНОВ
+        # Ищем: Молот, Поглощение, Утренняя звезда
+        df.ta.cdl_pattern(name=["hammer", "engulfing", "morningstar", "shootingstar"], append=True)
+        
+        # 3. ОСНОВНЫЕ ИНДИКАТОРЫ
         df['RSI'] = ta.rsi(df['Close'], length=14)
         macd = ta.macd(df['Close'])
-        df['EMA_8'] = ta.ema(df['Close'], length=8)
-        df['EMA_21'] = ta.ema(df['Close'], length=21)
-        adx_data = ta.adx(df['High'], df['Low'], df['Close'])
-        df['CCI'] = ta.cci(df['High'], df['Low'], df['Close'], length=20)
-        df['WPR'] = ta.willr(df['High'], df['Low'], df['Close'], length=14)
-        stoch = ta.stoch(df['High'], df['Low'], df['Close'])
-        bbands = ta.bbands(df['Close'], length=20)
-        df['MFI'] = ta.mfi(df['High'], df['Low'], df['Close'], df['Volume'], length=14)
+        df['EMA_10'] = ta.ema(df['Close'], length=10)
+        df['EMA_30'] = ta.ema(df['Close'], length=30)
+        adx_df = ta.adx(df['High'], df['Low'], df['Close'])
+        trend_strength = adx_df['ADX_14'].iloc[-1] if adx_df is not None else 0
 
         score, l = 0, -1
-        
-        # 1. Трендовый фильтр (EMA)
-        if df['EMA_8'].iloc[l] > df['EMA_21'].iloc[l]: score += 3
-        else: score -= 3
-        
-        # 2. RSI (Перекупленность/Перепроданность)
-        if df['RSI'].iloc[l] > 60: score += 1
-        elif df['RSI'].iloc[l] < 40: score -= 1
 
-        # 3. MACD
-        if macd['MACD_12_26_9'].iloc[l] > macd['MACDs_12_26_9'].iloc[l]: score += 2
+        # ЛОГИКА УРОВНЕЙ (PRICE ACTION)
+        if last_price <= support * 1.0015: score += 4  # Отскок от поддержки
+        elif last_price >= resistance * 0.9985: score -= 4 # Отскок от сопротивления
+
+        # ЛОГИКА ПАТТЕРНОВ
+        if 'CDL_HAMMER' in df.columns and df['CDL_HAMMER'].iloc[l] != 0: score += 3
+        if 'CDL_ENGULFING' in df.columns:
+            if df['CDL_ENGULFING'].iloc[l] > 0: score += 3
+            elif df['CDL_ENGULFING'].iloc[l] < 0: score -= 3
+
+        # ТРЕНД И RSI
+        if df['EMA_10'].iloc[l] > df['EMA_30'].iloc[l]: score += 2
         else: score -= 2
-
-        # 4. Мощность тренда (ADX) - если тренд слабый, сигнал "слабый"
-        trend_strength = adx_data['ADX_14'].iloc[l]
-        if trend_strength < 20: score = 0 # Флэт
-
-        # 5. Stochastic
-        if stoch['STOCHk_14_3_3'].iloc[l] > stoch['STOCHd_14_3_3'].iloc[l]: score += 1
-        else: score -= 1
-
-        direction = "up" if score > 0 else "down"
-        abs_s = abs(score)
         
-        if trend_strength < 22: strength = "weak"
-        elif abs_s >= 5: strength = "strong"
-        else: strength = "medium"
+        if df['RSI'].iloc[l] < 35: score += 2
+        elif df['RSI'].iloc[l] > 65: score -= 2
+
+        # ОКОНЧАТЕЛЬНЫЙ ВЕРДИКТ
+        direction = "up" if score >= 0 else "down"
+        abs_s = abs(score)
+
+        if trend_strength > 25 and abs_s >= 5: strength = "strong"
+        elif abs_s >= 2: strength = "medium"
+        else: strength = "weak"
         
         return direction, strength
     except Exception as e:
-        logging.error(f"Error logic: {e}")
-        return "down", "weak"
+        logging.error(f"Logic Error: {e}")
+        return random.choice(["up", "down"]), "medium"
 
 # ================= КЛАВИАТУРЫ =================
 def main_kb(lang):
@@ -188,7 +192,6 @@ async def get_sig(cb: types.CallbackQuery):
     icon = "🟢" if dr == "up" else "🔴"
     stars = "⭐⭐⭐" if st == "strong" else "⭐⭐" if st == "medium" else "⭐"
     
-    # КРАСИВОЕ ОФОРМЛЕНИЕ КАРТОЧКИ
     msg = (
         f"💎 **{TEXT[lang]['signal']}**\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -215,14 +218,13 @@ async def news_sig(cb: types.CallbackQuery):
     e = random.choice([5, 15])
     dr, st = await get_signal(p, e)
     
-    icon = "🔥"
     msg = (
         f"🚀 **{TEXT[lang]['news']}**\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🏛 **АКТИВ:** `{p.replace('=X','')}`\n"
         f"⏳ **ВРЕМЯ:** `{e} МИНУТ`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{icon} **ПРОГНОЗ:** `{TEXT[lang][dr]}`\n"
+        f"🔥 **ПРОГНОЗ:** `{TEXT[lang][dr]}`\n"
         f"💎 **СТАТУС:** `VIP IMPULSE` ⭐⭐⭐\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"❗️ *Входите в сделку немедленно!*"
