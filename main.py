@@ -134,80 +134,97 @@ async def has_access(user_id:int) -> bool:
     return bool(user and user["balance"]>=MIN_DEPOSIT)
 
 # ================= SIGNAL CORE (10 indicators + свечные паттерны) =================
-def last(v): return float(v.iloc[-1])
+# ================= SAFE LAST FUNCTION =================
+def last(v: pd.Series) -> float:
+    """Возвращает последнее значение Series безопасно"""
+    if v.empty:
+        return 0.0
+    return float(v.iloc[-1])
 
-async def get_signal(pair:str, exp:int) -> tuple[str,str]:
+# ================= GET SIGNAL =================
+async def get_signal(pair: str, exp: int) -> tuple[str, str]:
     try:
         interval = INTERVAL_MAP[exp]
-        df = yf.download(pair, period="5d", interval=interval, progress=False)
-        if df.empty or len(df)<50: return "ВНИЗ 📉","Слабый рынок"
+        df = yf.download(pair, period="2d", interval=interval, progress=False)
+
+        if df.empty or len(df) < 50:
+            logging.error(f"get_signal warning: not enough data for {pair}")
+            return "ВНИЗ 📉", "Слабый рынок"
 
         close = df["Close"]
-        high = df["High"]
-        low = df["Low"]
 
-        # EMA, SMA
-        ema10 = close.ewm(span=10).mean()
+        ema20 = close.ewm(span=20).mean()
         ema50 = close.ewm(span=50).mean()
-        sma20 = close.rolling(20).mean()
 
-        # RSI
         delta = close.diff()
         gain = delta.clip(lower=0).rolling(14).mean()
         loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rsi = 100-(100/(1+gain/loss))
+        rsi = 100 - (100 / (1 + gain / loss))
 
-        # MACD
-        ema12 = close.ewm(span=12).mean()
-        ema26 = close.ewm(span=26).mean()
-        macd = ema12-ema26
-        signal = macd.ewm(span=9).mean()
+        buy = 0
+        sell = 0
 
-        # Bollinger Bands
-        sma20_bb = close.rolling(20).mean()
-        std = close.rolling(20).std()
-        upper = sma20_bb+2*std
-        lower = sma20_bb-2*std
+        if last(ema20) > last(ema50):
+            buy += 2
+        else:
+            sell += 2
 
-        # ATR
-        tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
-        atr = tr.rolling(14).mean()
+        if last(rsi) > 55:
+            buy += 2
+        elif last(rsi) < 45:
+            sell += 2
 
-        # ADX
-        plus_dm = high.diff()
-        minus_dm = low.diff()
-        plus_dm[plus_dm<0]=0
-        minus_dm[minus_dm<0]=0
-        tr_adx = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
-        plus_di = 100*(plus_dm.rolling(14).sum()/tr_adx.rolling(14).sum())
-        minus_di = 100*(minus_dm.rolling(14).sum()/tr_adx.rolling(14).sum())
-        adx = abs(plus_di-minus_di)
+        direction = "ВВЕРХ 📈" if buy > sell else "ВНИЗ 📉"
+        strength = abs(buy - sell)
 
-        # Считаем "силу" покупки и продажи
-        buy=sell=0
-        if last(close)>last(ema50): buy+=2
-        else: sell+=2
-        if last(rsi)>55: buy+=2
-        elif last(rsi)<45: sell+=2
-        if last(macd)>last(signal): buy+=2
-        else: sell+=2
-        if last(close)>last(upper): buy+=1
-        elif last(close)<last(lower): sell+=1
-        if last(plus_di)>last(minus_di): buy+=1
-        else: sell+=1
-
-        # Определяем направление и силу
-        direction = "ВВЕРХ 📈" if buy>sell else "ВНИЗ 📉"
-        strength_diff = abs(buy-sell)
-        if strength_diff>=6: level="🔥 СИЛЬНЫЙ сигнал"
-        elif strength_diff>=3: level="⚡ СРЕДНИЙ сигнал"
-        else: level="⚠️ СЛАБЫЙ рынок (риск)"
+        if strength >= 3:
+            level = "🔥 СИЛЬНЫЙ сигнал"
+        elif strength == 2:
+            level = "⚡ СРЕДНИЙ сигнал"
+        else:
+            level = "⚠️ СЛАБЫЙ рынок (риск)"
 
         return direction, level
 
     except Exception as e:
         logging.error(f"get_signal error: {e}")
-        return "ВНИЗ 📉","⚠️ Ошибка данных"
+        return "ВНИЗ 📉", "⚠️ Ошибка данных"
+
+# ================= START HANDLER =================
+@dp.message(Command("start"))
+async def start(msg: types.Message):
+    await upsert_user(msg.from_user.id)
+    lang = await get_language(msg.from_user.id)
+    # для авторов всегда русский
+    if msg.from_user.id in AUTHORS:
+        lang = "ru"
+        await msg.answer(MESSAGES["main_menu"][lang], reply_markup=main_menu_kb(lang))
+        return
+
+    # для остальных пользователей
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➡️ Далее", callback_data="instr2")
+    kb.adjust(1)
+    await msg.answer(MESSAGES["start"][lang], reply_markup=kb.as_markup())
+
+# ================= INSTRUCTION STEP 2 =================
+@dp.callback_query(lambda c: c.data=="instr2")
+async def instr2(cb: types.CallbackQuery):
+    lang = await get_language(cb.from_user.id)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔗 Получить доступ", callback_data="get_access")
+    kb.adjust(1)
+    await cb.message.edit_text(MESSAGES["instruction"][lang], reply_markup=kb.as_markup())
+
+# ================= GET ACCESS =================
+@dp.callback_query(lambda c: c.data=="get_access")
+async def get_access(cb: types.CallbackQuery):
+    lang = await get_language(cb.from_user.id)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔗 Регистрация", url=REF_LINK)
+    kb.button(text="✅ Проверить ID", callback_data="check_id")
+    kb.adjust(1)
+    await cb.message.edit_text(MESSAGES["get_access"][lang], reply_markup=kb.as_markup())
 
 # ================= KEYBOARDS =================
 def main_menu_kb(lang:str):
