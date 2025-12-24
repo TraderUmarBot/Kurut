@@ -92,12 +92,12 @@ MESSAGES = {
         "kz": "Ботқа қолжетімділік:"
     },
     "check_balance": {
-        "ru": "⏳ Ожидаем пополнение от 20$",
-        "en": "⏳ Waiting for deposit of 20$",
-        "tj": "⏳ Муттозири пардохт аз 20$",
-        "uz": "⏳ 20$ depozitni kutmoqda",
-        "kg": "⏳ 20$ толомоону күтүп жатабыз",
-        "kz": "⏳ 20$ депозитін күтеміз"
+        "ru": f"⏳ Ожидаем пополнение от {MIN_DEPOSIT}$",
+        "en": f"⏳ Waiting for deposit of {MIN_DEPOSIT}$",
+        "tj": f"⏳ Муттозири пардохт аз {MIN_DEPOSIT}$",
+        "uz": f"⏳ {MIN_DEPOSIT}$ depozitni kutmoqda",
+        "kg": f"⏳ {MIN_DEPOSIT}$ толомоону күтүп жатабыз",
+        "kz": f"⏳ {MIN_DEPOSIT}$ депозитін күтеміз"
     },
     "access_open": {
         "ru": "✅ Доступ открыт",
@@ -155,7 +155,7 @@ async def has_access(user_id: int) -> bool:
 # ================= SIGNAL CORE =================
 
 def last(v):
-    return float(v.iloc[-1])
+    return float(v.iloc[-1]) if not v.empty else 0.0
 
 async def get_signal(pair: str, exp: int, lang: str) -> tuple[str, str]:
     try:
@@ -211,6 +211,15 @@ async def get_signal(pair: str, exp: int, lang: str) -> tuple[str, str]:
         logging.error(f"get_signal error: {e}")
         return "ВНИЗ 📉", "⚠️ Ошибка данных"
 
+# ================= SAFE EDIT =================
+
+async def safe_edit(cb: types.CallbackQuery, text: str, reply_markup=None):
+    try:
+        if cb.message.text != text:
+            await cb.message.edit_text(text, reply_markup=reply_markup)
+    except Exception as e:
+        logging.warning(f"Cannot edit message: {e}")
+
 # ================= KEYBOARDS =================
 
 def main_menu(lang: str):
@@ -252,8 +261,7 @@ def language_kb():
         kb.button(text=name, callback_data=f"set_lang:{code}")
     kb.adjust(2)
     return kb.as_markup()
-
-# ================= HANDLERS =================
+    # ================= HANDLERS =================
 
 @dp.message(Command("start"))
 async def start(msg: types.Message):
@@ -262,17 +270,18 @@ async def start(msg: types.Message):
     if msg.from_user.id in AUTHORS:
         await msg.answer(MESSAGES["author_access"][lang], reply_markup=main_menu(lang))
         return
-    await msg.answer(MESSAGES["start"][lang], reply_markup=InlineKeyboardBuilder().button(text="➡️ Далее", callback_data="instr2").as_markup())
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➡️ Далее", callback_data="instr2")
+    kb.adjust(1)
+    await msg.answer(MESSAGES["start"][lang], reply_markup=kb.as_markup())
 
 @dp.callback_query(lambda c: c.data=="instr2")
 async def instr2(cb: types.CallbackQuery):
     lang = await get_language(cb.from_user.id)
     kb = InlineKeyboardBuilder()
     kb.button(text="🔗 Получить доступ", callback_data="get_access")
-    await cb.message.edit_text(
-        f"Как получить доступ:\n1️⃣ Регистрация по ссылке\n2️⃣ Пополнение от {MIN_DEPOSIT}$\n3️⃣ Проверка ID",
-        reply_markup=kb.as_markup()
-    )
+    kb.adjust(1)
+    await safe_edit(cb, f"Как получить доступ:\n1️⃣ Регистрация по ссылке\n2️⃣ Пополнение от {MIN_DEPOSIT}$\n3️⃣ Проверка ID", reply_markup=kb.as_markup())
 
 @dp.callback_query(lambda c: c.data=="get_access")
 async def get_access(cb: types.CallbackQuery):
@@ -281,7 +290,7 @@ async def get_access(cb: types.CallbackQuery):
     kb.button(text="🔗 Регистрация", url=REF_LINK)
     kb.button(text="✅ Проверить ID", callback_data="check_id")
     kb.adjust(1)
-    await cb.message.edit_text(MESSAGES["get_access"][lang], reply_markup=kb.as_markup())
+    await safe_edit(cb, MESSAGES["get_access"][lang], reply_markup=kb.as_markup())
 
 @dp.callback_query(lambda c: c.data=="check_id")
 async def check_id(cb: types.CallbackQuery):
@@ -290,31 +299,31 @@ async def check_id(cb: types.CallbackQuery):
     lang = await get_language(cb.from_user.id)
 
     if cb.from_user.id in AUTHORS:
-        await cb.message.edit_text(MESSAGES["author_access"][lang], reply_markup=main_menu(lang))
+        await safe_edit(cb, MESSAGES["author_access"][lang], reply_markup=main_menu(lang))
         return
 
     if user and user["balance"] >= MIN_DEPOSIT:
-        await cb.message.edit_text(MESSAGES["access_open"][lang], reply_markup=main_menu(lang))
+        await safe_edit(cb, MESSAGES["access_open"][lang], reply_markup=main_menu(lang))
     else:
         kb = InlineKeyboardBuilder()
         kb.button(text="💰 Пополнить баланс", url=REF_LINK)
         kb.button(text="🔄 Проверить пополнение", callback_data="check_balance")
         kb.adjust(1)
-        await cb.message.edit_text(MESSAGES["check_balance"][lang], reply_markup=kb.as_markup())
+        await safe_edit(cb, MESSAGES["check_balance"][lang], reply_markup=kb.as_markup())
 
 @dp.callback_query(lambda c: c.data=="check_balance")
 async def check_balance(cb: types.CallbackQuery):
     user = await get_user(cb.from_user.id)
     lang = await get_language(cb.from_user.id)
     if cb.from_user.id in AUTHORS or (user and user["balance"] >= MIN_DEPOSIT):
-        await cb.message.edit_text(MESSAGES["access_open"][lang], reply_markup=main_menu(lang))
+        await safe_edit(cb, MESSAGES["access_open"][lang], reply_markup=main_menu(lang))
     else:
         await cb.answer(f"❌ Баланс меньше {MIN_DEPOSIT}$", show_alert=True)
 
 @dp.callback_query(lambda c: c.data=="main_menu")
 async def main_menu_cb(cb: types.CallbackQuery):
     lang = await get_language(cb.from_user.id)
-    await cb.message.edit_text("Главное меню:" if lang=="ru" else "Main menu:", reply_markup=main_menu(lang))
+    await safe_edit(cb, "Главное меню:" if lang=="ru" else "Main menu:", reply_markup=main_menu(lang))
 
 @dp.callback_query(lambda c: c.data=="pairs")
 async def pairs(cb: types.CallbackQuery):
@@ -322,24 +331,24 @@ async def pairs(cb: types.CallbackQuery):
         lang = await get_language(cb.from_user.id)
         await cb.answer("Нет доступа" if lang=="ru" else "No access", show_alert=True)
         return
-    await cb.message.edit_text("Выберите пару", reply_markup=pairs_kb())
+    await safe_edit(cb, "Выберите пару", reply_markup=pairs_kb())
 
 @dp.callback_query(lambda c: c.data.startswith("page:"))
 async def page(cb: types.CallbackQuery):
     page = int(cb.data.split(":")[1])
-    await cb.message.edit_text("Выберите пару", reply_markup=pairs_kb(page))
+    await safe_edit(cb, "Выберите пару", reply_markup=pairs_kb(page))
 
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
 async def pair(cb: types.CallbackQuery):
     pair = cb.data.split(":")[1]
-    await cb.message.edit_text("Выберите экспирацию", reply_markup=exp_kb(pair))
+    await safe_edit(cb, "Выберите экспирацию", reply_markup=exp_kb(pair))
 
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
 async def exp(cb: types.CallbackQuery):
     _, pair, exp_time = cb.data.split(":")
     lang = await get_language(cb.from_user.id)
     direction, level = await get_signal(pair, int(exp_time), lang)
-    await cb.message.edit_text(
+    await safe_edit(cb,
         f"📊 СИГНАЛ KURUT TRADE\n\nПара: {pair.replace('=X','')}\nЭкспирация: {exp_time} мин\nНаправление: {direction}\nКачество: {level}",
         reply_markup=back_menu_kb(lang)
     )
@@ -351,20 +360,21 @@ async def news(cb: types.CallbackQuery):
     pair = random.choice(PAIRS)
     exp_time = random.choice(EXPIRATIONS)
     direction, level = await get_signal(pair, exp_time, lang)
-    await cb.message.edit_text(
+    await safe_edit(cb,
         f"📰 НОВОСТНОЙ СИГНАЛ\n\n{pair.replace('=X','')} — {exp_time} мин\n{direction}\n{level}",
         reply_markup=back_menu_kb(lang)
     )
 
 @dp.callback_query(lambda c: c.data=="change_lang")
 async def change_lang(cb: types.CallbackQuery):
-    await cb.message.edit_text("Выберите язык:" if await get_language(cb.from_user.id)=="ru" else "Choose language:", reply_markup=language_kb())
+    lang = await get_language(cb.from_user.id)
+    await safe_edit(cb, "Выберите язык:" if lang=="ru" else "Choose language:", reply_markup=language_kb())
 
 @dp.callback_query(lambda c: c.data.startswith("set_lang:"))
 async def set_lang(cb: types.CallbackQuery):
     lang_code = cb.data.split(":")[1]
     await set_language(cb.from_user.id, lang_code)
-    await cb.message.edit_text(f"Язык установлен: {LANGUAGES.get(lang_code, 'Русский')}", reply_markup=main_menu(lang_code))
+    await safe_edit(cb, f"Язык установлен: {LANGUAGES.get(lang_code, 'Русский')}", reply_markup=main_menu(lang_code))
 
 # ================= POSTBACK =================
 
@@ -390,7 +400,7 @@ async def main():
     await bot(DeleteWebhook(drop_pending_updates=True))
     await bot(SetWebhook(url=WEBHOOK_URL))
 
-        app = web.Application()
+    app = web.Application()
     SimpleRequestHandler(dp, bot).register(app, WEBHOOK_PATH)
     app.router.add_get("/postback", postback)
 
