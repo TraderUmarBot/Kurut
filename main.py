@@ -12,14 +12,14 @@ from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiogram.methods import DeleteWebhook, SetWebhook
 
-# ================= CONFIG (Берется из переменных Render) =================
+# 1. КОНФИГ
 TG_TOKEN = os.getenv("TG_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 PORT = int(os.getenv("PORT", 10000))
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut"
-AUTHORS = [6117198446, 7079260196] # Твой ID и ID партнера
+AUTHORS = [6117198446, 7079260196]
 MIN_DEPOSIT = 20.0
 
 WEBHOOK_PATH = "/webhook"
@@ -27,14 +27,18 @@ WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 
 logging.basicConfig(level=logging.INFO)
 
-# ================= ДАННЫЕ =================
+# 2. ИНИЦИАЛИЗАЦИЯ (Важно: сначала создаем bot и dp!)
+bot = Bot(token=TG_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+DB_POOL = None
+
+# 3. ДАННЫЕ И СЛОВАРЬ
 PAIRS = [
     "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X",
     "EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X",
     "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
 
-# ================= МУЛЬТИЯЗЫЧНЫЙ СЛОВАРЬ (ИНТЕРФЕЙС И СИГНАЛЫ) =================
 LEXICON = {
     "ru": {
         "instr": "📘 **ИНСТРУКЦИЯ**\n\n1️⃣ Нажмите **Регистрация**.\n2️⃣ Создайте новый аккаунт.\n3️⃣ Пополните баланс от **$20**.\n4️⃣ Доступ откроется автоматически!",
@@ -68,7 +72,7 @@ LEXICON = {
     }
 }
 
-# ================= DB HELPERS =================
+# 4. ФУНКЦИИ ЛОГИКИ
 async def get_lang(uid: int):
     if uid in AUTHORS: return "ru"
     async with DB_POOL.acquire() as conn:
@@ -81,7 +85,6 @@ async def check_access(uid: int):
         bal = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", uid)
         return (bal or 0) >= MIN_DEPOSIT
 
-# ================= SIGNAL ENGINE =================
 async def get_signal(pair: str, exp: int, lang: str):
     try:
         data = yf.download(pair, period="1d", interval="1m", progress=False)
@@ -90,21 +93,14 @@ async def get_signal(pair: str, exp: int, lang: str):
         rsi = ta.rsi(close, length=14).iloc[-1]
         sup = data['Low'].rolling(20).min().iloc[-1]
         res_p = data['High'].rolling(20).max().iloc[-1]
-        
         l = LEXICON[lang]
         direction = l["up"] if rsi < 50 else l["down"]
-        
-        return (f"📊 **{l['sig_title']}: {pair.replace('=X','')}**\n"
-                f"━━━━━━━━━━━━━━\n"
-                f"⏰ Time: **{exp} MIN**\n"
-                f"🚀 {l['dir']}: **{direction}**\n"
-                f"💪 {l['str']}: {l['strong']}\n"
-                f"📍 {l['target']}: `{sup:.5f}-{res_p:.5f}`\n"
-                f"📈 RSI: `{rsi:.1f}`\n"
-                f"━━━━━━━━━━━━━━")
+        return (f"📊 **{l['sig_title']}: {pair.replace('=X','')}**\n━━━━━━━━━━━━━━\n"
+                f"⏰ Time: **{exp} MIN**\n🚀 {l['dir']}: **{direction}**\n💪 {l['str']}: {l['strong']}\n"
+                f"📍 {l['target']}: `{sup:.5f}-{res_p:.5f}`\n📈 RSI: `{rsi:.1f}`\n━━━━━━━━━━━━━━")
     except: return "❌ Analysis Error"
 
-# ================= HANDLERS =================
+# 5. ХЕНДЛЕРЫ (Теперь dp уже создан выше)
 @dp.message(Command("start"))
 async def cmd_start(msg: types.Message):
     async with DB_POOL.acquire() as conn:
@@ -134,7 +130,7 @@ async def verify(cb: types.CallbackQuery):
         kb.button(text=LEXICON[l]["pairs_btn"], callback_data="plist:0")
         kb.button(text=LEXICON[l]["news_btn"], callback_data="vip_news")
         kb.adjust(1)
-        await cb.message.edit_text("✅ Access Granted!", reply_markup=kb.as_markup())
+        await cb.message.edit_text("🏠 Главное меню / Main Menu", reply_markup=kb.as_markup())
     else:
         await cb.answer("❌ Deposit $20 first!", show_alert=True)
 
@@ -176,7 +172,7 @@ async def vip_news(cb: types.CallbackQuery):
     kb = InlineKeyboardBuilder().button(text="⬅️ Back", callback_data="verify")
     await cb.message.edit_text(f"🔥 **VIP NEWS**\n\n{res}", reply_markup=kb.as_markup(), parse_mode="Markdown")
 
-# ================= SERVER & POSTBACK =================
+# 6. ВЕБ-СЕРВЕР И ЗАПУСК
 async def postback(request):
     uid = request.query.get("click_id")
     amt = request.query.get("amount", "0")
@@ -192,13 +188,21 @@ async def main():
     DB_POOL = await asyncpg.create_pool(DATABASE_URL)
     async with DB_POOL.acquire() as conn:
         await conn.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, balance FLOAT DEFAULT 0, language TEXT DEFAULT 'ru')")
+    
     await bot(DeleteWebhook(drop_pending_updates=True))
     await bot(SetWebhook(url=WEBHOOK_URL))
+    
     app = web.Application()
     SimpleRequestHandler(dp, bot).register(app, WEBHOOK_PATH)
     app.router.add_get("/postback", postback)
-    runner = web.AppRunner(app); await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    
+    # Исправленный запуск для Render
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    
+    logging.info(f"Bot started on port {PORT}")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
