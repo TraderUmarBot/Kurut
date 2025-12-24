@@ -50,7 +50,6 @@ PAIRS = [
 
 EXPIRATIONS = [1, 5, 10]
 PAIRS_PER_PAGE = 6
-
 INTERVAL_MAP = {1:"1m",5:"5m",10:"15m"}
 
 LANGUAGES = {
@@ -65,11 +64,7 @@ LANGUAGES = {
 MESSAGES = {
     "start": {
         "ru": "📘 ИНСТРУКЦИЯ KURUT TRADE\n\nБот анализирует рынок\nИспользует профессиональные индикаторы\nПодходит для новичков и профи",
-        "en": "📘 KURUT TRADE INSTRUCTION\n\nBot analyzes the market\nUses professional indicators\nSuitable for beginners and pros",
-        "tj": "📘 ДАСТУРИ KURUT TRADE\n\nБот бозорро таҳлил мекунад\nИндикаторҳои касбиро истифода мебарад\nБарои наврасон ва мутахассисон",
-        "uz": "📘 KURUT TRADE KO'RSATMALARI\n\nBot bozorni tahlil qiladi\nProfessional indikatorlardan foydalanadi\nYangi boshlovchilar va mutaxassislar uchun",
-        "kg": "📘 KURUT TRADE КООРДИНАТОР\n\nБот базарды талдайт\nКесиптик индикаторлорду колдонуп,\nЖаңы баштагандар жана адистер үчүн",
-        "kz": "📘 KURUT TRADE НҰСҚАУЛЫҚ\n\nБот нарықты талдайды\nКәсіби индикаторларды қолданады\nЖаңадан бастаушылар мен мамандарға"
+        "en": "📘 KURUT TRADE INSTRUCTION\n\nBot analyzes the market\nUses professional indicators\nSuitable for beginners and pros"
     },
     "author_access": {
         "ru": "👑 Авторский доступ",
@@ -95,12 +90,16 @@ async def init_db():
     global DB_POOL
     DB_POOL = await asyncpg.create_pool(DATABASE_URL)
     async with DB_POOL.acquire() as conn:
+        # Создаём таблицу, если нет
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
-            balance FLOAT DEFAULT 0,
-            language TEXT DEFAULT 'ru'
+            balance FLOAT DEFAULT 0
         );
+        """)
+        # Добавляем колонку language, если её нет
+        await conn.execute("""
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'ru';
         """)
 
 async def upsert_user(user_id: int):
@@ -124,7 +123,7 @@ async def set_language(user_id: int, lang: str):
 
 async def get_language(user_id: int) -> str:
     if user_id in AUTHORS:
-        return "ru"  # авторам всегда русский
+        return "ru"
     user = await get_user(user_id)
     if user and "language" in user:
         return user["language"]
@@ -146,8 +145,8 @@ async def get_signal(pair: str, exp: int, lang: str) -> tuple[str,str]:
         interval = INTERVAL_MAP[exp]
         df = yf.download(pair, period="2d", interval=interval, progress=False)
         if df.empty or len(df)<50:
-            messages = {"ru":"Слабый рынок","en":"Weak market"}
-            return "ВНИЗ 📉", messages.get(lang,"Слабый рынок")
+            msg = {"ru":"Слабый рынок","en":"Weak market"}
+            return "ВНИЗ 📉", msg.get(lang,"Слабый рынок")
         close = df["Close"]
         ema20 = close.ewm(span=20).mean()
         ema50 = close.ewm(span=50).mean()
@@ -161,8 +160,8 @@ async def get_signal(pair: str, exp: int, lang: str) -> tuple[str,str]:
         if last(rsi)>55: buy+=2
         elif last(rsi)<45: sell+=2
         direction = "ВВЕРХ 📈" if buy>sell else "ВНИЗ 📉"
-        level_map = {3: "🔥 СИЛЬНЫЙ сигнал", 2:"⚡ СРЕДНИЙ сигнал",1:"⚠️ СЛАБЫЙ рынок (риск)",0:"⚠️ СЛАБЫЙ рынок (риск)"}
-        level = level_map.get(abs(buy-sell), "⚠️ СЛАБЫЙ рынок (риск)")
+        level_map = {3:"🔥 СИЛЬНЫЙ сигнал",2:"⚡ СРЕДНИЙ сигнал",1:"⚠️ СЛАБЫЙ рынок (риск)",0:"⚠️ СЛАБЫЙ рынок (риск)"}
+        level = level_map.get(abs(buy-sell),"⚠️ СЛАБЫЙ рынок (риск)")
         return direction, level
     except Exception as e:
         logging.error(f"get_signal error: {e}")
@@ -195,11 +194,11 @@ def back_menu_kb(lang:str):
 
 def pairs_kb(page=0):
     kb = InlineKeyboardBuilder()
-    start = page*PAIRS_PER_PAGE
-    for p in PAIRS[start:start+PAIRS_PER_PAGE]:
+    start = page*6
+    for p in PAIRS[start:start+6]:
         kb.button(text=p.replace("=X",""), callback_data=f"pair:{p}")
     if page>0: kb.button(text="⬅️ Назад",callback_data=f"page:{page-1}")
-    if start+PAIRS_PER_PAGE<len(PAIRS): kb.button(text="➡️ Вперёд",callback_data=f"page:{page+1}")
+    if start+6<len(PAIRS): kb.button(text="➡️ Вперёд",callback_data=f"page:{page+1}")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -216,7 +215,8 @@ def language_kb():
         kb.button(text=name,callback_data=f"set_lang:{code}")
     kb.adjust(2)
     return kb.as_markup()
-    # ================= HANDLERS =================
+
+# ================= HANDLERS =================
 
 @dp.message(Command("start"))
 async def start(msg: types.Message):
@@ -228,7 +228,7 @@ async def start(msg: types.Message):
     kb = InlineKeyboardBuilder()
     kb.button(text="➡️ Далее", callback_data="instr2")
     kb.adjust(1)
-    await msg.answer(MESSAGES["start"][lang], reply_markup=kb.as_markup())
+    await msg.answer(MESSAGES["start"].get(lang,MESSAGES["start"]["ru"]), reply_markup=kb.as_markup())
 
 @dp.callback_query(lambda c: c.data=="instr2")
 async def instr2(cb: types.CallbackQuery):
@@ -245,33 +245,31 @@ async def get_access(cb: types.CallbackQuery):
     kb.button(text="🔗 Регистрация", url=REF_LINK)
     kb.button(text="✅ Проверить ID", callback_data="check_id")
     kb.adjust(1)
-    await safe_edit(cb, MESSAGES["get_access"][lang], reply_markup=kb.as_markup())
+    await safe_edit(cb, MESSAGES["get_access"].get(lang,MESSAGES["get_access"]["ru"]), reply_markup=kb.as_markup())
 
 @dp.callback_query(lambda c: c.data=="check_id")
 async def check_id(cb: types.CallbackQuery):
     await upsert_user(cb.from_user.id)
     user = await get_user(cb.from_user.id)
     lang = await get_language(cb.from_user.id)
-
     if cb.from_user.id in AUTHORS:
         await safe_edit(cb, MESSAGES["author_access"]["ru"], reply_markup=main_menu("ru"))
         return
-
-    if user and user["balance"] >= MIN_DEPOSIT:
-        await safe_edit(cb, MESSAGES["access_open"][lang], reply_markup=main_menu(lang))
+    if user and user["balance"]>=MIN_DEPOSIT:
+        await safe_edit(cb, MESSAGES["access_open"].get(lang,"✅ Доступ открыт"), reply_markup=main_menu(lang))
     else:
         kb = InlineKeyboardBuilder()
         kb.button(text="💰 Пополнить баланс", url=REF_LINK)
         kb.button(text="🔄 Проверить пополнение", callback_data="check_balance")
         kb.adjust(1)
-        await safe_edit(cb, MESSAGES["check_balance"][lang], reply_markup=kb.as_markup())
+        await safe_edit(cb, MESSAGES["check_balance"].get(lang,"⏳ Ожидаем пополнение"), reply_markup=kb.as_markup())
 
 @dp.callback_query(lambda c: c.data=="check_balance")
 async def check_balance(cb: types.CallbackQuery):
     user = await get_user(cb.from_user.id)
     lang = await get_language(cb.from_user.id)
-    if cb.from_user.id in AUTHORS or (user and user["balance"] >= MIN_DEPOSIT):
-        await safe_edit(cb, MESSAGES["access_open"][lang], reply_markup=main_menu(lang))
+    if cb.from_user.id in AUTHORS or (user and user["balance"]>=MIN_DEPOSIT):
+        await safe_edit(cb, MESSAGES["access_open"].get(lang,"✅ Доступ открыт"), reply_markup=main_menu(lang))
     else:
         await cb.answer(f"❌ Баланс меньше {MIN_DEPOSIT}$", show_alert=True)
 
@@ -281,7 +279,7 @@ async def main_menu_cb(cb: types.CallbackQuery):
     await safe_edit(cb, "Главное меню:" if lang=="ru" else "Main menu:", reply_markup=main_menu(lang))
 
 @dp.callback_query(lambda c: c.data=="pairs")
-async def pairs(cb: types.CallbackQuery):
+async def pairs_cb(cb: types.CallbackQuery):
     if not await has_access(cb.from_user.id):
         lang = await get_language(cb.from_user.id)
         await cb.answer("Нет доступа" if lang=="ru" else "No access", show_alert=True)
@@ -302,7 +300,7 @@ async def pair(cb: types.CallbackQuery):
 async def exp(cb: types.CallbackQuery):
     _, pair, exp_time = cb.data.split(":")
     lang = await get_language(cb.from_user.id)
-    direction, level = await get_signal(pair, int(exp_time), lang)
+    direction, level = await get_signal(pair,int(exp_time),lang)
     await safe_edit(cb,
         f"📊 СИГНАЛ KURUT TRADE\n\nПара: {pair.replace('=X','')}\nЭкспирация: {exp_time} мин\nНаправление: {direction}\nКачество: {level}",
         reply_markup=back_menu_kb(lang)
@@ -314,7 +312,7 @@ async def news(cb: types.CallbackQuery):
     lang = await get_language(cb.from_user.id)
     pair = random.choice(PAIRS)
     exp_time = random.choice(EXPIRATIONS)
-    direction, level = await get_signal(pair, exp_time, lang)
+    direction, level = await get_signal(pair,exp_time,lang)
     await safe_edit(cb,
         f"📰 НОВОСТНОЙ СИГНАЛ\n\n{pair.replace('=X','')} — {exp_time} мин\n{direction}\n{level}",
         reply_markup=back_menu_kb(lang)
@@ -328,7 +326,7 @@ async def change_lang(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("set_lang:"))
 async def set_lang(cb: types.CallbackQuery):
     lang_code = cb.data.split(":")[1]
-    await set_language(cb.from_user.id, lang_code)
+    await set_language(cb.from_user.id,lang_code)
     await safe_edit(cb, f"Язык установлен: {LANGUAGES.get(lang_code,'Русский')}", reply_markup=main_menu(lang_code))
 
 # ================= POSTBACK =================
