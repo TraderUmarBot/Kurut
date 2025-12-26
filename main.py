@@ -7,9 +7,10 @@ import pandas as pd
 import yfinance as yf
 
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.storage.memory import MemoryStorage
+
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiogram.methods import DeleteWebhook, SetWebhook
@@ -21,7 +22,7 @@ RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 PORT = int(os.getenv("PORT", 10000))
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut"
-AUTHORS = [6117198446, 7079260196, 5156851527]
+AUTHORS = [6117198446, 7079260196, 5156851527]  # Авторы бота
 MIN_DEPOSIT = 20.0
 
 INSTAGRAM = "https://www.instagram.com/kurut_trading?igsh=MWVtZHJzcjRvdTlmYw=="
@@ -70,10 +71,6 @@ async def init_db():
         """)
 
 async def upsert_user(user_id: int):
-    global DB_POOL
-    if DB_POOL is None:
-        logging.error("DB_POOL не инициализирован")
-        return
     async with DB_POOL.acquire() as conn:
         await conn.execute(
             "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING",
@@ -81,10 +78,6 @@ async def upsert_user(user_id: int):
         )
 
 async def get_user(user_id: int):
-    global DB_POOL
-    if DB_POOL is None:
-        logging.error("DB_POOL не инициализирован")
-        return None
     async with DB_POOL.acquire() as conn:
         return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
 
@@ -102,57 +95,68 @@ async def has_access(user_id: int) -> bool:
 def last(v):
     return float(v.iloc[-1])
 
-async def get_signal(pair: str, exp: int) -> tuple[str, str, int]:
-    """Максимально точный сигнал с EMA, RSI, ADX"""
-    interval = INTERVAL_MAP.get(exp, "1m")
-    for attempt in range(3):
-        try:
-            df = yf.download(pair, period="2d", interval=interval, progress=False)
-            if df.empty or len(df) < 50:
-                await asyncio.sleep(1)
-                continue
+async def get_signal(pair: str, exp: int) -> tuple[str, str]:
+    """Максимально точный сигнал"""
+    try:
+        interval = INTERVAL_MAP[exp]
+        df = yf.download(pair, period="2d", interval=interval, progress=False)
+        if df.empty or len(df) < 50:
+            return "ВНИЗ 📉", "⚠️ Слабый рынок"
 
-            close = df["Close"]
-            high = df["High"]
-            low = df["Low"]
+        close = df["Close"]
 
-            # EMA
-            ema20 = close.ewm(span=20).mean()
-            ema50 = close.ewm(span=50).mean()
+        # EMA и RSI
+        ema20 = close.ewm(span=20).mean()
+        ema50 = close.ewm(span=50).mean()
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rsi = 100 - (100 / (1 + gain / loss))
 
-            # RSI
-            delta = close.diff()
-            gain = delta.clip(lower=0).rolling(14).mean()
-            loss = (-delta.clip(upper=0)).rolling(14).mean()
-            rsi = 100 - (100 / (1 + gain / loss))
+        # Простейший ADX (упрощение для быстрого расчета)
+        high = df["High"]
+        low = df["Low"]
+        tr = pd.concat([high - low, abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
+        plus_dm = high.diff().clip(lower=0)
+        minus_dm = -low.diff().clip(lower=0)
+        atr = tr.rolling(14).mean()
+        plus_di = 100 * (plus_dm.rolling(14).sum() / atr)
+        minus_di = 100 * (minus_dm.rolling(14).sum() / atr)
+        dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+        adx = dx.rolling(14).mean()
 
-            # ADX
-            tr = pd.concat([high - low, abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
-            plus_dm = high.diff().clip(lower=0)
-            minus_dm = (-low.diff()).clip(lower=0)
-            plus_di = 100 * plus_dm.ewm(span=14).mean() / tr.ewm(span=14).mean()
-            minus_di = 100 * minus_dm.ewm(span=14).mean() / tr.ewm(span=14).mean()
-            dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-            adx = dx.ewm(span=14).mean()
+        buy = 0
+        sell = 0
 
-            # Рассчет сигнала
-            buy = sell = 0
-            if last(ema20) > last(ema50): buy += 2
-            else: sell += 2
-            if last(rsi) > 55: buy += 1
-            elif last(rsi) < 45: sell += 1
-            if last(adx) > 25: buy += 1; sell += 1
+        if last(ema20) > last(ema50):
+            buy += 2
+        else:
+            sell += 2
 
-            direction = "ВВЕРХ 📈" if buy > sell else "ВНИЗ 📉"
-            strength = abs(buy - sell)
-            level = "🔥 СИЛЬНЫЙ сигнал" if strength >= 3 else "⚡ СРЕДНИЙ сигнал" if strength == 2 else "⚠️ СЛАБЫЙ рынок"
-            confidence = min(100, 30 + strength*20)
-            return direction, level, confidence
+        if last(rsi) > 55:
+            buy += 2
+        elif last(rsi) < 45:
+            sell += 2
 
-        except Exception as e:
-            logging.warning(f"Попытка {attempt+1}: ошибка получения данных для {pair}: {e}")
-            await asyncio.sleep(1)
-    return "ВНИЗ 📉", "⚠️ Ошибка данных", 0
+        if last(adx) > 25:
+            buy += 1
+            sell += 1  # усиление сигнала
+
+        direction = "ВВЕРХ 📈" if buy > sell else "ВНИЗ 📉"
+        strength = abs(buy - sell)
+
+        if strength >= 3:
+            level = "🔥 СИЛЬНЫЙ сигнал"
+        elif strength == 2:
+            level = "⚡ СРЕДНИЙ сигнал"
+        else:
+            level = "⚠️ СЛАБЫЙ рынок (риск)"
+
+        return direction, level
+
+    except Exception as e:
+        logging.error(f"get_signal error: {e}")
+        return "ВНИЗ 📉", "⚠️ Ошибка данных"
 
 # ================= KEYBOARDS =================
 def main_menu():
@@ -187,12 +191,6 @@ def exp_kb(pair):
     kb.adjust(2)
     return kb.as_markup()
 
-def to_admin_kb():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="💬 Написать админу", url=TELEGRAM)
-    kb.adjust(1)
-    return kb.as_markup()
-
 # ================= HANDLERS =================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
@@ -219,7 +217,7 @@ async def instr2(cb: types.CallbackQuery):
     await cb.message.edit_text(
         "📘 ИНСТРУКЦИЯ KURUT TRADE\n\n"
         "Бот анализирует рынок с помощью профессиональных индикаторов.\n"
-        "Выберите валютную пару и экспирацию для получения сигнала.",
+        "Следуйте инструкциям, чтобы получить сигналы и использовать бота:",
         reply_markup=kb.as_markup()
     )
 
@@ -234,13 +232,19 @@ async def get_access(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data=="check_id")
 async def check_id(cb: types.CallbackQuery):
     await upsert_user(cb.from_user.id)
+    user = await get_user(cb.from_user.id)
+
     if cb.from_user.id in AUTHORS:
         await cb.message.edit_text("👑 Авторский доступ открыт", reply_markup=main_menu())
         return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💬 Написать админу", url=TELEGRAM)
+    kb.adjust(1)
     await cb.message.edit_text(
-        f"Ваш Telegram ID: {cb.from_user.id}\n"
-        "Отправьте этот ID админу для получения доступа.",
-        reply_markup=to_admin_kb()
+        f"Ваш Telegram ID: {cb.from_user.id}\n\n"
+        "📌 Отправьте этот ID администратору для открытия доступа.",
+        reply_markup=kb.as_markup()
     )
 
 @dp.callback_query(lambda c: c.data=="main_menu")
@@ -267,18 +271,23 @@ async def pair(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
 async def exp(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
-    direction, level, confidence = await get_signal(pair, int(exp))
+    direction, level = await get_signal(pair, int(exp))
+
+    strength_map = {"⚠️ СЛАБЫЙ рынок (риск)": 33, "⚡ СРЕДНИЙ сигнал": 66, "🔥 СИЛЬНЫЙ сигнал": 90}
+    confidence = strength_map.get(level, 50)
     blocks = int(confidence // 10)
     empty = 10 - blocks
     bar = "█" * blocks + "░" * empty
+
     await cb.message.edit_text(
         f"💎 VIP СИГНАЛ KURUT TRADE\n\n"
         f"📊 Пара: {pair.replace('=X','')}\n"
         f"⏱ Экспирация: {exp} мин\n\n"
         f"🎯 Направление: {direction}\n"
         f"📌 Качество: {level}\n\n"
-        f"📈 Уверенность: {confidence}%\n{bar}\n\n"
-        "🧠 Сигнал рассчитан по рынку в момент запроса",
+        f"📈 Уверенность: {confidence}%\n"
+        f"{bar}\n\n"
+        f"🧠 Сигнал рассчитан по рынку в момент запроса",
         reply_markup=back_menu_kb()
     )
 
@@ -287,7 +296,7 @@ async def news(cb: types.CallbackQuery):
     import random
     pair = random.choice(PAIRS)
     exp = random.choice(EXPIRATIONS)
-    direction, level, confidence = await get_signal(pair, exp)
+    direction, level = await get_signal(pair, exp)
     await cb.message.edit_text(
         f"📰 НОВОСТНОЙ СИГНАЛ\n\n"
         f"{pair.replace('=X','')} — {exp} мин\n"
@@ -295,21 +304,36 @@ async def news(cb: types.CallbackQuery):
         reply_markup=back_menu_kb()
     )
 
-# ================= START WITH WEBHOOK =================
+# ================= GRANT COMMAND =================
+@dp.message(Command("grant"))
+async def grant_access(msg: types.Message, command: CommandObject):
+    if msg.from_user.id not in AUTHORS:
+        await msg.reply("❌ У вас нет прав на использование этой команды.")
+        return
+    if not command.args:
+        await msg.reply("⚠️ Используйте команду так: /grant <Telegram ID пользователя>")
+        return
+    try:
+        user_id = int(command.args.strip())
+    except ValueError:
+        await msg.reply("❌ Неверный ID. Введите числовой Telegram ID.")
+        return
+    await upsert_user(user_id)
+    await update_balance(user_id, MIN_DEPOSIT)
+    await msg.reply(f"✅ Доступ открыт для пользователя с ID: {user_id}")
+
+# ================= START =================
 async def main():
     await init_db()
     await bot(DeleteWebhook(drop_pending_updates=True))
     await bot(SetWebhook(url=WEBHOOK_URL))
-
     app = web.Application()
     SimpleRequestHandler(dp, bot).register(app, WEBHOOK_PATH)
-
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
-
     logging.info("BOT STARTED")
     await asyncio.Event().wait()
 
-if __name__=="__main__":
+if __name__ == "__main__":
     asyncio.run(main())
