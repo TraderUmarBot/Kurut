@@ -11,41 +11,28 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from aiohttp import web
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler
-from aiogram.methods import DeleteWebhook, SetWebhook
-
 # ================= CONFIG =================
-
 TG_TOKEN = os.getenv("TG_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
-PORT = int(os.getenv("PORT", 10000))
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut"
 AUTHORS = [6117198446, 7079260196, 5156851527]
-MIN_DEPOSIT = 20.0
 
 INSTAGRAM = "https://www.instagram.com/kurut_trading?igsh=MWVtZHJzcjRvdTlmYw=="
 TELEGRAM = "https://t.me/KURUTTRADING"
 
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
-
 logging.basicConfig(level=logging.INFO)
 
-if not TG_TOKEN or not DATABASE_URL or not RENDER_EXTERNAL_HOSTNAME:
+if not TG_TOKEN or not DATABASE_URL:
     print("ENV ERROR")
     sys.exit(1)
 
 # ================= BOT =================
-
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 DB_POOL: asyncpg.Pool | None = None
 
 # ================= CONSTANTS =================
-
 PAIRS = [
     "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X",
     "EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X",
@@ -55,14 +42,9 @@ PAIRS = [
 EXPIRATIONS = [1, 5, 10]
 PAIRS_PER_PAGE = 6
 
-INTERVAL_MAP = {
-    1: "1m",
-    5: "5m",
-    10: "15m"
-}
+INTERVAL_MAP = {1:"1m",5:"5m",10:"15m"}
 
 # ================= DATABASE =================
-
 async def init_db():
     global DB_POOL
     DB_POOL = await asyncpg.create_pool(DATABASE_URL)
@@ -70,7 +52,7 @@ async def init_db():
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
-            balance FLOAT DEFAULT 0
+            access BOOLEAN DEFAULT FALSE
         );
         """)
 
@@ -85,72 +67,64 @@ async def get_user(user_id: int):
     async with DB_POOL.acquire() as conn:
         return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
 
-async def update_balance(user_id: int, amount: float):
+async def grant_access(user_id: int):
     async with DB_POOL.acquire() as conn:
-        await conn.execute("UPDATE users SET balance=$1 WHERE user_id=$2", amount, user_id)
+        await conn.execute("UPDATE users SET access=TRUE WHERE user_id=$1", user_id)
 
 async def has_access(user_id: int) -> bool:
     if user_id in AUTHORS:
         return True
     user = await get_user(user_id)
-    return bool(user and user["balance"] >= MIN_DEPOSIT)
+    return bool(user and user["access"])
 
 # ================= SIGNAL CORE =================
-
 def last(v):
     return float(v.iloc[-1])
 
-async def get_signal(pair: str, exp: int) -> tuple[str, str]:
-    """Максимально точный сигнал на выбранную пару и экспирацию"""
+async def get_signal(pair: str, exp: int) -> tuple[str,str]:
+    """Максимально точный сигнал"""
     try:
         interval = INTERVAL_MAP[exp]
         df = yf.download(pair, period="2d", interval=interval, progress=False)
-        if df.empty or len(df) < 50:
+        if df.empty or len(df)<50:
             return "ВНИЗ 📉", "⚠️ Слабый рынок"
 
         close = df["Close"]
-
-        # EMA и RSI
         ema20 = close.ewm(span=20).mean()
         ema50 = close.ewm(span=50).mean()
         delta = close.diff()
         gain = delta.clip(lower=0).rolling(14).mean()
         loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rsi = 100 - (100 / (1 + gain / loss))
+        rsi = 100-(100/(1+gain/loss))
 
         buy = 0
         sell = 0
 
         if last(ema20) > last(ema50):
-            buy += 2
+            buy +=2
         else:
-            sell += 2
+            sell +=2
 
-        if last(rsi) > 55:
-            buy += 2
-        elif last(rsi) < 45:
-            sell += 2
+        if last(rsi)>55:
+            buy +=2
+        elif last(rsi)<45:
+            sell +=2
 
-        # Определяем направление
-        direction = "ВВЕРХ 📈" if buy > sell else "ВНИЗ 📉"
-
-        # Уровень сигнала
-        strength = abs(buy - sell)
-        if strength >= 3:
-            level = "🔥 СИЛЬНЫЙ сигнал"
-        elif strength == 2:
-            level = "⚡ СРЕДНИЙ сигнал"
+        direction = "ВВЕРХ 📈" if buy>sell else "ВНИЗ 📉"
+        strength = abs(buy-sell)
+        if strength>=3:
+            level="🔥 СИЛЬНЫЙ сигнал"
+        elif strength==2:
+            level="⚡ СРЕДНИЙ сигнал"
         else:
-            level = "⚠️ СЛАБЫЙ рынок (риск)"
+            level="⚠️ СЛАБЫЙ рынок (риск)"
 
-        return direction, level
-
+        return direction,level
     except Exception as e:
         logging.error(f"get_signal error: {e}")
-        return "ВНИЗ 📉", "⚠️ Ошибка данных"
+        return "ВНИЗ 📉","⚠️ Ошибка данных"
 
 # ================= KEYBOARDS =================
-
 def main_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="📈 Валютные пары", callback_data="pairs")
@@ -166,12 +140,12 @@ def back_menu_kb():
 
 def pairs_kb(page=0):
     kb = InlineKeyboardBuilder()
-    start = page * PAIRS_PER_PAGE
-    for p in PAIRS[start:start + PAIRS_PER_PAGE]:
+    start=page*PAIRS_PER_PAGE
+    for p in PAIRS[start:start+PAIRS_PER_PAGE]:
         kb.button(text=p.replace("=X",""), callback_data=f"pair:{p}")
-    if page > 0:
+    if page>0:
         kb.button(text="⬅️ Назад", callback_data=f"page:{page-1}")
-    if start + PAIRS_PER_PAGE < len(PAIRS):
+    if start+PAIRS_PER_PAGE<len(PAIRS):
         kb.button(text="➡️ Вперёд", callback_data=f"page:{page+1}")
     kb.adjust(2)
     return kb.as_markup()
@@ -183,70 +157,54 @@ def exp_kb(pair):
     kb.adjust(2)
     return kb.as_markup()
 
-# ================= HANDLERS =================
+def contact_admin_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💬 Написать админу", url=TELEGRAM)
+    kb.adjust(1)
+    return kb.as_markup()
 
+# ================= HANDLERS =================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
+    await upsert_user(msg.from_user.id)
     if msg.from_user.id in AUTHORS:
-        await msg.answer("👑 Авторский доступ", reply_markup=main_menu())
+        await msg.answer("👑 Авторский доступ открыт", reply_markup=main_menu())
         return
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="➡️ Далее", callback_data="instr2")
+    kb=InlineKeyboardBuilder()
+    kb.button(text="➡️ Далее", callback_data="instr")
     kb.button(text="📸 Instagram", url=INSTAGRAM)
     kb.button(text="💬 Telegram", url=TELEGRAM)
     kb.adjust(1)
     await msg.answer(
-        "📘 Добро пожаловать в KURUT TRADE!\n\n"
-        "Ниже наши соцсети для связи и обучения:",
+        "📘 Добро пожаловать в KURUT TRADE!\n\nНиже наши соцсети для связи и обучения:",
         reply_markup=kb.as_markup()
     )
 
-@dp.callback_query(lambda c: c.data=="instr2")
-async def instr2(cb: types.CallbackQuery):
-    kb = InlineKeyboardBuilder()
+@dp.callback_query(lambda c:c.data=="instr")
+async def instr(cb: types.CallbackQuery):
+    kb=InlineKeyboardBuilder()
     kb.button(text="🔗 Получить доступ", callback_data="get_access")
     kb.adjust(1)
     await cb.message.edit_text(
-        "📘 ИНСТРУКЦИЯ KURUT TRADE\n\n"
-        "Бот анализирует рынок с помощью профессиональных индикаторов\n"
-        "Подходит для новичков и профи",
+        "📘 ИНСТРУКЦИЯ ПО БОТУ\n\n"
+        "1️⃣ Выбираем валютную пару\n"
+        "2️⃣ Выбираем экспирацию\n"
+        "3️⃣ Получаем сигнал с качеством и уверенность\n"
+        "4️⃣ Следуем рекомендациям или ждём следующего сигнала",
         reply_markup=kb.as_markup()
     )
 
-@dp.callback_query(lambda c: c.data=="get_access")
+@dp.callback_query(lambda c:c.data=="get_access")
 async def get_access(cb: types.CallbackQuery):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🔗 Регистрация", url=REF_LINK)
-    kb.button(text="✅ Проверить ID", callback_data="check_id")
-    kb.adjust(1)
-    await cb.message.edit_text("Доступ к боту:", reply_markup=kb.as_markup())
-
-@dp.callback_query(lambda c: c.data=="check_id")
-async def check_id(cb: types.CallbackQuery):
-    await upsert_user(cb.from_user.id)
     user = await get_user(cb.from_user.id)
-
     if cb.from_user.id in AUTHORS:
         await cb.message.edit_text("👑 Авторский доступ открыт", reply_markup=main_menu())
         return
-
-    if user and user["balance"] >= MIN_DEPOSIT:
-        await cb.message.edit_text("✅ Доступ открыт", reply_markup=main_menu())
-    else:
-        kb = InlineKeyboardBuilder()
-        kb.button(text="💰 Пополнить баланс", url=REF_LINK)
-        kb.button(text="🔄 Проверить пополнение", callback_data="check_balance")
-        kb.adjust(1)
-        await cb.message.edit_text("⏳ Ожидаем пополнение от 20$", reply_markup=kb.as_markup())
-
-@dp.callback_query(lambda c: c.data=="check_balance")
-async def check_balance(cb: types.CallbackQuery):
-    user = await get_user(cb.from_user.id)
-    if cb.from_user.id in AUTHORS or (user and user["balance"] >= MIN_DEPOSIT):
-        await cb.message.edit_text("✅ Доступ открыт", reply_markup=main_menu())
-    else:
-        await cb.answer("❌ Баланс меньше 20$", show_alert=True)
+    await cb.message.edit_text(
+        f"Для получения доступа отправьте свой Telegram ID админу.\n\n"
+        f"Ваш Telegram ID: {cb.from_user.id}",
+        reply_markup=contact_admin_kb()
+    )
 
 @dp.callback_query(lambda c: c.data=="main_menu")
 async def main_menu_cb(cb: types.CallbackQuery):
@@ -257,52 +215,44 @@ async def pairs(cb: types.CallbackQuery):
     if not await has_access(cb.from_user.id):
         await cb.answer("Нет доступа", show_alert=True)
         return
-    await cb.message.edit_text("Выберите пару", reply_markup=pairs_kb())
+    await cb.message.edit_text("Выберите валютную пару:", reply_markup=pairs_kb())
 
-@dp.callback_query(lambda c: c.data.startswith("page:"))
+@dp.callback_query(lambda c:c.data.startswith("page:"))
 async def page(cb: types.CallbackQuery):
-    page = int(cb.data.split(":")[1])
-    await cb.message.edit_text("Выберите пару", reply_markup=pairs_kb(page))
+    page=int(cb.data.split(":")[1])
+    await cb.message.edit_text("Выберите валютную пару:", reply_markup=pairs_kb(page))
 
-@dp.callback_query(lambda c: c.data.startswith("pair:"))
+@dp.callback_query(lambda c:c.data.startswith("pair:"))
 async def pair(cb: types.CallbackQuery):
-    pair = cb.data.split(":")[1]
-    await cb.message.edit_text("Выберите экспирацию", reply_markup=exp_kb(pair))
+    pair=cb.data.split(":")[1]
+    await cb.message.edit_text("Выберите экспирацию:", reply_markup=exp_kb(pair))
 
-@dp.callback_query(lambda c: c.data.startswith("exp:"))
+@dp.callback_query(lambda c:c.data.startswith("exp:"))
 async def exp(cb: types.CallbackQuery):
-    _, pair, exp = cb.data.split(":")
-    direction, level = await get_signal(pair, int(exp))
-
-    # Рассчитываем условную уверенность для примера
-    # (Можно заменить на более точный алгоритм)
-    strength_map = {"⚠️ СЛАБЫЙ рынок": 33, "⚡ СРЕДНИЙ сигнал": 66, "🔥 СИЛЬНЫЙ сигнал": 90}
-    confidence = strength_map.get(level, 50)
-
-    # Создаем прогресс-бар
-    blocks = int(confidence // 10)
-    empty = 10 - blocks
-    bar = "█" * blocks + "░" * empty
-
+    _,pair,exp=cb.data.split(":")
+    direction,level = await get_signal(pair,int(exp))
+    strength_map = {"⚠️ СЛАБЫЙ рынок":33,"⚡ СРЕДНИЙ сигнал":66,"🔥 СИЛЬНЫЙ сигнал":90}
+    confidence = strength_map.get(level,50)
+    blocks=int(confidence//10)
+    empty=10-blocks
+    bar="█"*blocks+"░"*empty
     await cb.message.edit_text(
         f"💎 VIP СИГНАЛ KURUT TRADE\n\n"
         f"📊 Пара: {pair.replace('=X','')}\n"
         f"⏱ Экспирация: {exp} мин\n\n"
         f"🎯 Направление: {direction}\n"
         f"📌 Качество: {level}\n\n"
-        f"📈 Уверенность: {confidence}%\n"
-        f"{bar}\n\n"
+        f"📈 Уверенность: {confidence}%\n{bar}\n\n"
         f"🧠 Сигнал рассчитан по рынку в момент запроса",
         reply_markup=back_menu_kb()
     )
 
-@dp.callback_query(lambda c: c.data=="news")
+@dp.callback_query(lambda c:c.data=="news")
 async def news(cb: types.CallbackQuery):
     import random
-    pair = random.choice(PAIRS)
-    exp = random.choice(EXPIRATIONS)
-    direction, level = await get_signal(pair, exp)
-
+    pair=random.choice(PAIRS)
+    exp=random.choice(EXPIRATIONS)
+    direction,level = await get_signal(pair,exp)
     await cb.message.edit_text(
         f"📰 НОВОСТНОЙ СИГНАЛ\n\n"
         f"{pair.replace('=X','')} — {exp} мин\n"
@@ -310,34 +260,11 @@ async def news(cb: types.CallbackQuery):
         reply_markup=back_menu_kb()
     )
 
-# ================= POSTBACK =================
-
-async def postback(request: web.Request):
-    click_id = request.query.get("click_id","").strip()
-    amount = request.query.get("amount","0")
-    if not click_id.isdigit():
-        return web.Response(text="NO CLICK_ID")
-    await upsert_user(int(click_id))
-    await update_balance(int(click_id), float(amount))
-    return web.Response(text="OK")
-
 # ================= START =================
-
 async def main():
     await init_db()
-    await bot(DeleteWebhook(drop_pending_updates=True))
-    await bot(SetWebhook(url=WEBHOOK_URL))
-
-    app = web.Application()
-    SimpleRequestHandler(dp, bot).register(app, WEBHOOK_PATH)
-    app.router.add_get("/postback", postback)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", PORT).start()
-
     logging.info("BOT STARTED")
-    await asyncio.Event().wait()
+    await dp.start_polling(bot)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     asyncio.run(main())
