@@ -10,19 +10,21 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.storage.memory import MemoryStorage
+
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiogram.methods import DeleteWebhook, SetWebhook
 
 # ================= CONFIG =================
+
 TG_TOKEN = os.getenv("TG_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 PORT = int(os.getenv("PORT", 10000))
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut"
-AUTHOR_ID = 7079260196  # ваш ID
-AUTHORS = [AUTHOR_ID]
+ADMIN_ID = 7079260196  # твоя личка для выдачи доступа
+AUTHOR_IDS = [6117198446, 7079260196]  # авторский доступ
 MIN_DEPOSIT = 20.0
 
 INSTAGRAM = "https://www.instagram.com/kurut_trading?igsh=MWVtZHJzcjRvdTlmYw=="
@@ -38,11 +40,13 @@ if not TG_TOKEN or not DATABASE_URL or not RENDER_EXTERNAL_HOSTNAME:
     sys.exit(1)
 
 # ================= BOT =================
+
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 DB_POOL: asyncpg.Pool | None = None
 
 # ================= CONSTANTS =================
+
 PAIRS = [
     "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X",
     "EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X",
@@ -51,9 +55,15 @@ PAIRS = [
 
 EXPIRATIONS = [1, 5, 10]
 PAIRS_PER_PAGE = 6
-INTERVAL_MAP = {1: "1m", 5: "5m", 10: "15m"}
+
+INTERVAL_MAP = {
+    1: "1m",
+    5: "5m",
+    10: "15m"
+}
 
 # ================= DATABASE =================
+
 async def init_db():
     global DB_POOL
     DB_POOL = await asyncpg.create_pool(DATABASE_URL)
@@ -73,26 +83,30 @@ async def upsert_user(user_id: int):
             user_id
         )
 
-async def grant_access(user_id: int):
-    async with DB_POOL.acquire() as conn:
-        await conn.execute("UPDATE users SET has_access=TRUE WHERE user_id=$1", user_id)
-
 async def get_user(user_id: int):
     async with DB_POOL.acquire() as conn:
         return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
 
+async def update_access(user_id: int, access: bool):
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (user_id, has_access) VALUES ($1, $2) "
+            "ON CONFLICT (user_id) DO UPDATE SET has_access=$2",
+            user_id, access
+        )
+
 async def has_access(user_id: int) -> bool:
-    if user_id in AUTHORS:
+    if user_id in AUTHOR_IDS:
         return True
     user = await get_user(user_id)
     return bool(user and user["has_access"])
 
 # ================= SIGNAL CORE =================
+
 def last(v):
     return float(v.iloc[-1])
 
 async def get_signal(pair: str, exp: int) -> tuple[str, str]:
-    """Сигнал на выбранную пару и экспирацию"""
     try:
         interval = INTERVAL_MAP[exp]
         df = yf.download(pair, period="2d", interval=interval, progress=False)
@@ -100,6 +114,8 @@ async def get_signal(pair: str, exp: int) -> tuple[str, str]:
             return "ВНИЗ 📉", "⚠️ Слабый рынок"
 
         close = df["Close"]
+
+        # EMA и RSI
         ema20 = close.ewm(span=20).mean()
         ema50 = close.ewm(span=50).mean()
         delta = close.diff()
@@ -109,23 +125,53 @@ async def get_signal(pair: str, exp: int) -> tuple[str, str]:
 
         buy = 0
         sell = 0
-        if last(ema20) > last(ema50): buy += 2
-        else: sell += 2
-        if last(rsi) > 55: buy += 2
-        elif last(rsi) < 45: sell += 2
+
+        if last(ema20) > last(ema50):
+            buy += 2
+        else:
+            sell += 2
+
+        if last(rsi) > 55:
+            buy += 2
+        elif last(rsi) < 45:
+            sell += 2
 
         direction = "ВВЕРХ 📈" if buy > sell else "ВНИЗ 📉"
-        strength = abs(buy - sell)
-        if strength >= 3: level = "🔥 СИЛЬНЫЙ сигнал"
-        elif strength == 2: level = "⚡ СРЕДНИЙ сигнал"
-        else: level = "⚠️ СЛАБЫЙ рынок (риск)"
 
-        return direction, level
+        strength = abs(buy - sell)
+        if strength >= 3:
+            level = "🔥 СИЛЬНЫЙ сигнал"
+        elif strength == 2:
+            level = "⚡ СРЕДНИЙ сигнал"
+        else:
+            level = "⚠️ СЛАБЫЙ рынок (риск)"
+
+        # Прогресс-бар уверенности
+        confidence_map = {"⚠️ СЛАБЫЙ рынок (риск)": 33, "⚡ СРЕДНИЙ сигнал": 66, "🔥 СИЛЬНЫЙ сигнал": 90}
+        confidence = confidence_map.get(level, 50)
+        blocks = int(confidence // 10)
+        empty = 10 - blocks
+        bar = "█" * blocks + "░" * empty
+
+        formatted_signal = (
+            f"💎 VIP СИГНАЛ KURUT TRADE\n\n"
+            f"📊 Пара: {pair.replace('=X','')}\n"
+            f"⏱ Экспирация: {exp} мин\n\n"
+            f"🎯 Направление: {direction}\n"
+            f"📌 Качество: {level}\n\n"
+            f"📈 Уверенность: {confidence}%\n"
+            f"{bar}\n\n"
+            f"🧠 Сигнал рассчитан по рынку в момент запроса"
+        )
+
+        return formatted_signal, level
+
     except Exception as e:
         logging.error(f"get_signal error: {e}")
-        return "ВНИЗ 📉", "⚠️ Ошибка данных"
+        return "❌ Ошибка данных", "⚠️ Ошибка данных"
 
 # ================= KEYBOARDS =================
+
 def main_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="📈 Валютные пары", callback_data="pairs")
@@ -144,8 +190,10 @@ def pairs_kb(page=0):
     start = page * PAIRS_PER_PAGE
     for p in PAIRS[start:start + PAIRS_PER_PAGE]:
         kb.button(text=p.replace("=X",""), callback_data=f"pair:{p}")
-    if page > 0: kb.button(text="⬅️ Назад", callback_data=f"page:{page-1}")
-    if start + PAIRS_PER_PAGE < len(PAIRS): kb.button(text="➡️ Вперёд", callback_data=f"page:{page+1}")
+    if page > 0:
+        kb.button(text="⬅️ Назад", callback_data=f"page:{page-1}")
+    if start + PAIRS_PER_PAGE < len(PAIRS):
+        kb.button(text="➡️ Вперёд", callback_data=f"page:{page+1}")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -156,14 +204,18 @@ def exp_kb(pair):
     kb.adjust(2)
     return kb.as_markup()
 
+def admin_button_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💬 Написать админу", url="https://t.me/KURUTTRADING")
+    kb.adjust(1)
+    return kb.as_markup()
+
 # ================= HANDLERS =================
+
 @dp.message(Command("start"))
 async def start(msg: types.Message):
-    await upsert_user(msg.from_user.id)
-    user = await get_user(msg.from_user.id)
-
-    if msg.from_user.id in AUTHORS:
-        await msg.answer("👑 Авторский доступ открыт!", reply_markup=main_menu())
+    if msg.from_user.id in AUTHOR_IDS:
+        await msg.answer("👑 Авторский доступ открыт", reply_markup=main_menu())
         return
 
     kb = InlineKeyboardBuilder()
@@ -171,7 +223,6 @@ async def start(msg: types.Message):
     kb.button(text="📸 Instagram", url=INSTAGRAM)
     kb.button(text="💬 Telegram", url=TELEGRAM)
     kb.adjust(1)
-
     await msg.answer(
         "📘 Добро пожаловать в KURUT TRADE!\n\n"
         "Ниже наши соцсети для связи и обучения:",
@@ -186,62 +237,72 @@ async def instr2(cb: types.CallbackQuery):
     await cb.message.edit_text(
         "📘 ИНСТРУКЦИЯ KURUT TRADE\n\n"
         "Бот анализирует рынок с помощью профессиональных индикаторов.\n"
-        "Для доступа необходимо получить ваш Telegram ID и отправить администратору.",
+        "Подходит для новичков и профи.",
         reply_markup=kb.as_markup()
     )
 
 @dp.callback_query(lambda c: c.data=="get_access")
 async def get_access(cb: types.CallbackQuery):
-    user_id = cb.from_user.id
-    await upsert_user(user_id)
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Проверить ID", callback_data="check_id")
     kb.button(text="🔗 Регистрация", url=REF_LINK)
+    kb.button(text="✅ Проверить ID", callback_data="check_id")
     kb.adjust(1)
     await cb.message.edit_text("Доступ к боту:", reply_markup=kb.as_markup())
 
 @dp.callback_query(lambda c: c.data=="check_id")
 async def check_id(cb: types.CallbackQuery):
-    user_id = cb.from_user.id
-    user = await get_user(user_id)
-    if await has_access(user_id):
-        await cb.message.edit_text("✅ Доступ открыт", reply_markup=main_menu())
-    else:
-        kb = InlineKeyboardBuilder()
-        kb.button(text="Написать админу", url=f"https://t.me/{TELEGRAM.split('/')[-1]}")
-        kb.adjust(1)
-        await cb.message.edit_text(f"Ваш Telegram ID: {user_id}\nОтправьте его админу для доступа", reply_markup=kb.as_markup())
+    await upsert_user(cb.from_user.id)
+    user = await get_user(cb.from_user.id)
 
-@dp.message(Command("grant"))
-async def grant(msg: types.Message):
-    if msg.from_user.id != AUTHOR_ID:
-        await msg.reply("❌ Только автор может выдавать доступ.")
+    if cb.from_user.id in AUTHOR_IDS:
+        await cb.message.edit_text("👑 Авторский доступ открыт", reply_markup=main_menu())
         return
-    try:
-        parts = msg.text.split()
-        if len(parts) != 2: raise ValueError
-        user_id = int(parts[1])
-        await upsert_user(user_id)
-        await grant_access(user_id)
-        await msg.reply(f"✅ Доступ выдан пользователю {user_id}")
-    except:
-        await msg.reply("❌ Использование: /grant USER_ID")
 
+    # Пользователь сам видит свой Telegram ID
+    await cb.message.edit_text(
+        f"💡 Ваш Telegram ID: {cb.from_user.id}\n\n"
+        "Отправьте его админу для получения доступа.",
+        reply_markup=admin_button_kb()
+    )
+
+# Grant доступ от админа
+@dp.message(Command("grant"))
+async def grant_access(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID:
+        await msg.reply("❌ У вас нет прав выдавать доступ")
+        return
+
+    args = msg.text.split()
+    if len(args) != 2:
+        await msg.reply("❌ Использование: /grant USER_ID")
+        return
+
+    try:
+        user_id = int(args[1])
+    except ValueError:
+        await msg.reply("❌ USER_ID должен быть числом")
+        return
+
+    await update_access(user_id, True)
+    await msg.reply(f"✅ Доступ выдан пользователю {user_id}")
+
+# Меню Главное
 @dp.callback_query(lambda c: c.data=="main_menu")
 async def main_menu_cb(cb: types.CallbackQuery):
     await cb.message.edit_text("Главное меню:", reply_markup=main_menu())
 
+# Валютные пары
 @dp.callback_query(lambda c: c.data=="pairs")
 async def pairs_cb(cb: types.CallbackQuery):
     if not await has_access(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
+        await cb.answer("❌ У вас нет доступа", show_alert=True)
         return
-    await cb.message.edit_text("Выберите валютную пару:", reply_markup=pairs_kb())
+    await cb.message.edit_text("Выберите пару:", reply_markup=pairs_kb())
 
 @dp.callback_query(lambda c: c.data.startswith("page:"))
 async def page_cb(cb: types.CallbackQuery):
     page = int(cb.data.split(":")[1])
-    await cb.message.edit_text("Выберите валютную пару:", reply_markup=pairs_kb(page))
+    await cb.message.edit_text("Выберите пару:", reply_markup=pairs_kb(page))
 
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
 async def pair_cb(cb: types.CallbackQuery):
@@ -251,37 +312,23 @@ async def pair_cb(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
 async def exp_cb(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
-    direction, level = await get_signal(pair, int(exp))
-    strength_map = {"⚠️ СЛАБЫЙ рынок (риск)": 33, "⚡ СРЕДНИЙ сигнал": 66, "🔥 СИЛЬНЫЙ сигнал": 90}
-    confidence = strength_map.get(level.split()[0], 50)
-    bar = "█" * (confidence // 10) + "░" * (10 - confidence // 10)
+    if not await has_access(cb.from_user.id):
+        await cb.answer("❌ У вас нет доступа", show_alert=True)
+        return
 
-    await cb.message.edit_text(
-        f"💎 VIP СИГНАЛ KURUT TRADE\n\n"
-        f"📊 Пара: {pair.replace('=X','')}\n"
-        f"⏱ Экспирация: {exp} мин\n\n"
-        f"🎯 Направление: {direction}\n"
-        f"📌 Качество: {level}\n\n"
-        f"📈 Уверенность: {confidence}%\n"
-        f"{bar}\n\n"
-        f"🧠 Сигнал рассчитан по рынку в момент запроса",
-        reply_markup=back_menu_kb()
-    )
+    signal_text, _ = await get_signal(pair, int(exp))
+    await cb.message.edit_text(signal_text, reply_markup=back_menu_kb())
 
 @dp.callback_query(lambda c: c.data=="news")
 async def news_cb(cb: types.CallbackQuery):
     import random
     pair = random.choice(PAIRS)
     exp = random.choice(EXPIRATIONS)
-    direction, level = await get_signal(pair, exp)
-    await cb.message.edit_text(
-        f"📰 НОВОСТНОЙ СИГНАЛ\n\n"
-        f"{pair.replace('=X','')} — {exp} мин\n"
-        f"{direction}\n{level}",
-        reply_markup=back_menu_kb()
-    )
+    signal_text, _ = await get_signal(pair, exp)
+    await cb.message.edit_text(signal_text, reply_markup=back_menu_kb())
 
 # ================= START SERVER =================
+
 async def main():
     await init_db()
     await bot(DeleteWebhook(drop_pending_updates=True))
@@ -293,6 +340,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
+
     logging.info("BOT STARTED")
     await asyncio.Event().wait()
 
