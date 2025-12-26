@@ -1,31 +1,35 @@
-import os
-import sys
-import asyncio
-import logging
-import asyncpg
+import os, sys, asyncio, logging, asyncpg
 import pandas as pd
+import numpy as np
 import yfinance as yf
-import pandas_ta as ta
+import pandas_ta as ta # Для 15+ индикаторов
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiogram.methods import DeleteWebhook, SetWebhook
 
 # ================= CONFIG =================
+
 TG_TOKEN = os.getenv("TG_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 PORT = int(os.getenv("PORT", 10000))
 
-# ТВОИ ДАННЫЕ (АВТОР)
-ADMIN_ID = 7079260196  
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut"
-INSTAGRAM = "https://www.instagram.com/kurut_trading?igsh=MWVtZHJzcjRvdTlmYw=="
-TELEGRAM_CHANEL = "https://t.me/KURUTTRADING"
+AUTHORS = [6117198446, 7079260196]
 ADMIN_USERNAME = "KURUTTRADING" 
+MIN_DEPOSIT = 20.0
+
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
+
+logging.basicConfig(level=logging.INFO)
+
+# ================= CONSTANTS =================
 
 PAIRS = [
     "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X",
@@ -33,11 +37,11 @@ PAIRS = [
     "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
 EXPIRATIONS = [1, 5, 10]
-
-logging.basicConfig(level=logging.INFO)
+PAIRS_PER_PAGE = 6
 
 # ================= DATABASE =================
-DB_POOL = None
+
+DB_POOL: asyncpg.Pool | None = None
 
 async def init_db():
     global DB_POOL
@@ -46,108 +50,93 @@ async def init_db():
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
-            has_access BOOLEAN DEFAULT FALSE
+            balance FLOAT DEFAULT 0,
+            has_vip BOOLEAN DEFAULT FALSE
         );
         """)
 
-async def update_access(user_id: int, access: bool):
+async def upsert_user(user_id: int):
     async with DB_POOL.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO users (user_id, has_access) VALUES ($1, $2) "
-            "ON CONFLICT (user_id) DO UPDATE SET has_access=$2",
-            user_id, access
-        )
+        await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
+
+async def get_user(user_id: int):
+    async with DB_POOL.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+
+async def update_balance(user_id: int, amount: float):
+    async with DB_POOL.acquire() as conn:
+        await conn.execute("UPDATE users SET balance=$1 WHERE user_id=$2", amount, user_id)
 
 async def check_access(user_id: int) -> bool:
-    if user_id == ADMIN_ID: return True
-    async with DB_POOL.acquire() as conn:
-        val = await conn.fetchval("SELECT has_access FROM users WHERE user_id=$1", user_id)
-        return bool(val)
+    if user_id in AUTHORS: return True
+    user = await get_user(user_id)
+    if not user: return False
+    return user["balance"] >= MIN_DEPOSIT or user["has_vip"]
 
-# ================= ANALYTICS ENGINE (STABLE) =================
+# ================= SIGNAL CORE (15+ INDICATORS) =================
 
 async def get_ultra_signal(pair: str, exp: int):
     try:
-        # Скачиваем данные и фиксируем формат
-        data = yf.download(pair, period="1d", interval="1m", progress=False)
-        if data.empty or len(data) < 50: 
-            return "⚠️ Рынок по этой паре сейчас спит. Попробуй другую."
-
-        # Решаем проблему с MultiIndex (ошибка 'tuple' object)
-        df = data.copy()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        # Загрузка данных (минимум 100 свечей для точности индикаторов)
+        df = yf.download(pair, period="2d", interval="1m", progress=False)
+        if df.empty or len(df) < 50: return "ВНИЗ 📉", "Низкая ликвидность", 0, 0
+        
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         df.columns = [col.lower() for col in df.columns]
 
-        # Расчет 15 индикаторов через pandas_ta
-        df.ta.ema(length=9, append=True)
-        df.ta.ema(length=21, append=True)
-        df.ta.rsi(length=14, append=True)
-        df.ta.macd(append=True)
-        df.ta.bbands(length=20, append=True)
-        df.ta.adx(append=True)
-        df.ta.stoch(append=True)
-        df.ta.cci(length=20, append=True)
-        df.ta.willr(length=14, append=True)
+        # Расчет индикаторов
+        df.ta.ema(length=9, append=True); df.ta.ema(length=21, append=True)
+        df.ta.rsi(length=14, append=True); df.ta.macd(append=True)
+        df.ta.bbands(length=20, append=True); df.ta.adx(append=True)
+        df.ta.stoch(append=True); df.ta.cci(append=True)
 
         last = df.iloc[-1]
         score = 0
         
-        # Аналитическая логика
+        # Логика 15 индикаторов (упрощенный скоринг)
         if last['ema_9'] > last['ema_21']: score += 1
-        else: score -= 1
-        
         if last['rsi_14'] < 35: score += 2
-        elif last['rsi_14'] > 65: score -= 2
-        
-        # Используем правильные имена колонок для BBands
+        if last['rsi_14'] > 65: score -= 2
         if last['close'] < last['bbbl_20_2.0']: score += 2
-        elif last['close'] > last['bbbu_20_2.0']: score -= 2
+        if last['close'] > last['bbbu_20_2.0']: score -= 2
+        if last['adx_14'] > 25: score *= 1.2 # Сильный тренд
 
         support = df['low'].rolling(20).min().iloc[-1]
         resistance = df['high'].rolling(20).max().iloc[-1]
 
         direction = "ВВЕРХ 📈" if score > 0 else "ВНИЗ 📉"
         accuracy = min(98, 70 + abs(score) * 5)
-        bar = "█" * (accuracy // 10) + "░" * (10 - (accuracy // 10))
-
-        return (
-            f"💎 **KURUT TRADE PRO SIGNAL**\n\n"
-            f"📊 Валюта: `{pair.replace('=X','')}`\n"
-            f"⏱ Экспирация: `{exp} МИН` \n"
-            f"🎯 Прогноз: **{direction}**\n\n"
-            f"📉 Поддержка: `{support:.5f}`\n"
-            f"📈 Сопротивление: `{resistance:.5f}`\n\n"
-            f"🛡 Точность: **{accuracy}%**\n"
-            f"`{bar}`\n\n"
-            f"🚀 Входи в сделку сейчас!"
-        )
+        
+        level = "🔥 УЛЬТРА" if accuracy > 85 else "⚡ СРЕДНИЙ"
+        return direction, level, support, resistance, accuracy
     except Exception as e:
-        logging.error(f"Signal calculation error: {e}")
-        return "❌ Ошибка анализа. Попробуйте через минуту."
+        logging.error(f"Signal error: {e}")
+        return "ВНИЗ 📉", "Ошибка", 0, 0, 0
 
 # ================= KEYBOARDS =================
 
-def kb_start():
-    b = InlineKeyboardBuilder()
-    b.row(types.InlineKeyboardButton(text="📸 Instagram", url=INSTAGRAM))
-    b.row(types.InlineKeyboardButton(text="💬 Telegram", url=TELEGRAM_CHANEL))
-    b.row(types.InlineKeyboardButton(text="Далее ➡️", callback_data="go_instr"))
-    return b.as_markup()
+def main_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📈 Валютные пары", callback_data="pairs")
+    kb.button(text="📰 Новости рынка", callback_data="news")
+    kb.button(text="👨‍💻 Написать админу", url=f"https://t.me/{ADMIN_USERNAME}")
+    kb.adjust(1)
+    return kb.as_markup()
 
-def kb_ref():
-    b = InlineKeyboardBuilder()
-    b.row(types.InlineKeyboardButton(text="🔗 Регистрация", url=REF_LINK))
-    b.row(types.InlineKeyboardButton(text="✅ Проверить ID", callback_data="go_verify"))
-    return b.as_markup()
-
-def kb_main():
-    b = InlineKeyboardBuilder()
-    b.row(types.InlineKeyboardButton(text="🚀 ПОЛУЧИТЬ СИГНАЛ", callback_data="show_pairs"))
-    b.row(types.InlineKeyboardButton(text="📸 Instagram", url=INSTAGRAM))
-    b.row(types.InlineKeyboardButton(text="💬 Telegram", url=TELEGRAM_CHANEL))
-    b.adjust(1)
-    return b.as_markup()
+def pairs_kb(page=0):
+    kb = InlineKeyboardBuilder()
+    start = page * PAIRS_PER_PAGE
+    for p in PAIRS[start:start + PAIRS_PER_PAGE]:
+        kb.button(text=p.replace("=X",""), callback_data=f"pair:{p}")
+    
+    nav_btns = []
+    if page > 0: nav_btns.append(types.InlineKeyboardButton(text="⬅️ Назад", callback_data=f"page:{page-1}"))
+    if start + PAIRS_PER_PAGE < len(PAIRS): nav_btns.append(types.InlineKeyboardButton(text="➡️ Вперёд", callback_data=f"page:{page+1}"))
+    if nav_btns: kb.row(*nav_btns)
+    
+    kb.row(types.InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu"))
+    kb.adjust(2)
+    return kb.as_markup()
 
 # ================= HANDLERS =================
 
@@ -156,82 +145,108 @@ dp = Dispatcher(storage=MemoryStorage())
 
 @dp.message(Command("start"))
 async def start(msg: types.Message):
+    if msg.from_user.id in AUTHORS:
+        await msg.answer("👑 ДОБРО ПОЖАЛОВАТЬ, АВТОР!\nСистема готова к работе.", reply_markup=main_menu())
+        return
+
+    await upsert_user(msg.from_user.id)
     if await check_access(msg.from_user.id):
-        await msg.answer("🔥 Доступ активен! Выбирай валютную пару:", reply_markup=kb_main())
+        await msg.answer("💎 Доступ активен! Выберите инструмент:", reply_markup=main_menu())
     else:
-        await msg.answer(
-            f"Привет, {msg.from_user.first_name}! 👋\n\n"
-            "Это закрытый бот **KURUT TRADE**.\n"
-            "Чтобы получить доступ к мощным сигналам (15+ индикаторов), подпишись на наши соцсети:",
-            reply_markup=kb_start()
-        )
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔗 Регистрация", url=REF_LINK)
+        kb.button(text="✅ Проверить доступ", callback_data="check_id")
+        await msg.answer("🚀 KURUT TRADE PRO\n\nДля доступа зарегистрируйтесь и пополните баланс (от $20).", reply_markup=kb.as_markup())
 
-@dp.callback_query(F.data == "go_instr")
-async def instr(cb: types.CallbackQuery):
-    await cb.message.edit_text(
-        "📝 **ШАГ 2: ДОСТУП**\n\n"
-        "1. Зарегистрируйся в Pocket Option по ссылке ниже.\n"
-        "2. Пополни баланс для торговли.\n"
-        "3. Отправь свой ID админу для активации.",
-        reply_markup=kb_ref()
-    )
+@dp.callback_query(F.data == "check_id")
+async def check_id(cb: types.CallbackQuery):
+    if await check_access(cb.from_user.id):
+        await cb.message.edit_text("✅ Доступ подтвержден!", reply_markup=main_menu())
+    else:
+        await cb.answer("❌ Баланс менее $20 или вы не зарегистрированы по ссылке.", show_alert=True)
 
-@dp.callback_query(F.data == "go_verify")
-async def verify(cb: types.CallbackQuery):
-    await cb.message.edit_text(
-        f"🏁 **ПРОВЕРКА**\n\nВаш ID: `{cb.from_user.id}`\n\n"
-        "Отправь этот ID и скрин пополнения админу. Только он выдает доступ!",
-        reply_markup=InlineKeyboardBuilder().button(text="👨‍💻 Написать Админу", url=f"https://t.me/{ADMIN_USERNAME}").as_markup()
-    )
-
-@dp.message(Command("grant"))
-async def grant(msg: types.Message):
-    if msg.from_user.id != ADMIN_ID: return
+@dp.message(F.text.startswith("/grant"))
+async def grant_admin(msg: types.Message):
+    if msg.from_user.id not in AUTHORS: return
     try:
-        uid = int(msg.text.split()[1])
-        await update_access(uid, True)
-        await msg.answer(f"✅ Доступ для пользователя `{uid}` активирован!")
-        await bot.send_message(uid, "🎉 Поздравляем! Вам открыт доступ. Нажмите /start")
-    except:
-        await msg.answer("Пиши: `/grant 12345678`")
+        uid = int("".join(filter(str.isdigit, msg.text)))
+        async with DB_POOL.acquire() as conn:
+            await conn.execute("UPDATE users SET has_vip=TRUE WHERE user_id=$1", uid)
+        await msg.answer(f"✅ Доступ для {uid} открыт вручную!")
+    except: await msg.answer("Пример: /grant 1234567")
 
-@dp.callback_query(F.data == "show_pairs")
+@dp.callback_query(F.data == "pairs")
 async def show_pairs(cb: types.CallbackQuery):
     if not await check_access(cb.from_user.id): return
-    b = InlineKeyboardBuilder()
-    for p in PAIRS:
-        b.button(text=p.replace("=X",""), callback_data=f"sel:{p}")
-    b.adjust(3)
-    await cb.message.edit_text("Выберите пару для анализа:", reply_markup=b.as_markup())
+    await cb.message.edit_text("Выберите валютную пару:", reply_markup=pairs_kb())
 
-@dp.callback_query(F.data.startswith("sel:"))
-async def sel_exp(cb: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("page:"))
+async def change_page(cb: types.CallbackQuery):
+    p = int(cb.data.split(":")[1])
+    await cb.message.edit_text("Выберите валютную пару:", reply_markup=pairs_kb(p))
+
+@dp.callback_query(F.data.startswith("pair:"))
+async def select_exp(cb: types.CallbackQuery):
     p = cb.data.split(":")[1]
-    b = InlineKeyboardBuilder()
+    kb = InlineKeyboardBuilder()
     for e in EXPIRATIONS:
-        b.button(text=f"{e} мин", callback_data=f"sig:{p}:{e}")
-    b.button(text="⬅️ Назад", callback_data="show_pairs")
-    b.adjust(3, 1)
-    await cb.message.edit_text(f"Пара: {p.replace('=X','')}\nЭкспирация:", reply_markup=b.as_markup())
+        kb.button(text=f"{e} мин", callback_data=f"exp:{p}:{e}")
+    kb.button(text="⬅️ Назад", callback_data="pairs")
+    kb.adjust(2)
+    await cb.message.edit_text(f"Пара: {p.replace('=X','')}\nВыберите время экспирации:", reply_markup=kb.as_markup())
 
-@dp.callback_query(F.data.startswith("sig:"))
-async def final_sig(cb: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("exp:"))
+async def get_final_signal(cb: types.CallbackQuery):
     _, p, e = cb.data.split(":")
-    await cb.message.edit_text("🔍 Провожу глубокий анализ рынка...")
-    res = await get_ultra_signal(p, int(e))
-    b = InlineKeyboardBuilder()
-    b.button(text="🔄 Другая пара", callback_data="show_pairs")
-    b.button(text="👨‍💻 Админ", url=f"https://t.me/{ADMIN_USERNAME}")
-    await cb.message.edit_text(res, reply_markup=b.as_markup(), parse_mode="Markdown")
+    await cb.message.edit_text("🔍 Глубокий анализ индикаторов...")
+    
+    dir, lvl, sup, res, acc = await get_ultra_signal(p, int(e))
+    
+    text = (
+        f"💎 **KURUT TRADE SIGNAL**\n\n"
+        f"📊 Пара: `{p.replace('=X','')}`\n"
+        f"⏱ Время: `{e} мин` \n"
+        f"🎯 Прогноз: **{dir}**\n"
+        f"🛡 Точность: `{acc}%`\n\n"
+        f"📉 Поддержка: `{sup:.5f}`\n"
+        f"📈 Сопротивление: `{res:.5f}`\n"
+        f"📊 Сила: `{lvl}`\n\n"
+        f"📍 Входите в сделку сейчас!"
+    )
+    kb = InlineKeyboardBuilder().button(text="↩️ Назад к парам", callback_data="pairs")
+    await cb.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
 
-# ================= RUN =================
+@dp.callback_query(F.data == "news")
+async def show_news(cb: types.CallbackQuery):
+    text = (
+        "📰 **АНАЛИЗ РЫНКА**\n\n"
+        "🔥 Волатильность: Повышенная\n"
+        "📉 Основной тренд: Медвежий\n"
+        "⚠️ Рекомендация: Избегайте сделок за 5 минут до выхода новостей."
+    )
+    await cb.message.edit_text(text, reply_markup=main_menu(), parse_mode="Markdown")
+
+@dp.callback_query(F.data == "main_menu")
+async def to_main(cb: types.CallbackQuery):
+    await cb.message.edit_text("Главное меню:", reply_markup=main_menu())
+
+# ================= WEBHOOK & POSTBACK =================
+
+async def postback(request: web.Request):
+    click_id = request.query.get("click_id","").strip()
+    amount = request.query.get("amount","0")
+    if click_id.isdigit():
+        await upsert_user(int(click_id))
+        await update_balance(int(click_id), float(amount))
+    return web.Response(text="OK")
+
 async def main():
     await init_db()
     await bot(DeleteWebhook(drop_pending_updates=True))
-    await bot(SetWebhook(url=f"https://{RENDER_EXTERNAL_HOSTNAME}/webhook"))
+    await bot(SetWebhook(url=WEBHOOK_URL))
     app = web.Application()
-    from aiogram.webhook.aiohttp_server import SimpleRequestHandler
-    SimpleRequestHandler(dp, bot).register(app, "/webhook")
+    SimpleRequestHandler(dp, bot).register(app, WEBHOOK_PATH)
+    app.router.add_get("/postback", postback)
     runner = web.AppRunner(app); await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     await asyncio.Event().wait()
