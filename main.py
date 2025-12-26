@@ -3,8 +3,8 @@ import sys
 import asyncio
 import logging
 import asyncpg
-import yfinance as yf
 import pandas as pd
+import yfinance as yf
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -15,17 +15,15 @@ from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiogram.methods import DeleteWebhook, SetWebhook
 
-# ================== CONFIG ==================
+# ================= CONFIG =================
 
 TG_TOKEN = os.getenv("TG_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 PORT = int(os.getenv("PORT", 10000))
 
+ADMIN_ID = 7079260196  # единственный админ
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut"
-ADMIN_USERNAME = "https://t.me/KURUTTRADING"
-
-AUTHORS = [6117198446, 7079260196, 5156851527]
 
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
@@ -36,13 +34,13 @@ if not TG_TOKEN or not DATABASE_URL or not RENDER_EXTERNAL_HOSTNAME:
     print("ENV ERROR")
     sys.exit(1)
 
-# ================== BOT ==================
+# ================= BOT =================
 
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 DB_POOL: asyncpg.Pool | None = None
 
-# ================== DATA ==================
+# ================= CONSTANTS =================
 
 PAIRS = [
     "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X",
@@ -50,13 +48,16 @@ PAIRS = [
     "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
 
-EXPIRATIONS = {
-    "M1": "1m",
-    "M5": "5m",
-    "M15": "15m"
+EXPIRATIONS = [1, 5, 15]
+PAIRS_PER_PAGE = 6
+
+INTERVAL_MAP = {
+    1: "1m",
+    5: "5m",
+    15: "15m"
 }
 
-# ================== DATABASE ==================
+# ================= DATABASE =================
 
 async def init_db():
     global DB_POOL
@@ -64,42 +65,36 @@ async def init_db():
     async with DB_POOL.acquire() as conn:
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id BIGINT PRIMARY KEY,
-            access BOOLEAN DEFAULT FALSE
+            user_id BIGINT PRIMARY KEY
         );
         """)
 
-async def upsert_user(user_id: int):
+async def grant_user(user_id: int):
     async with DB_POOL.acquire() as conn:
         await conn.execute(
             "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING",
             user_id
         )
 
-async def grant_access(user_id: int):
-    async with DB_POOL.acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET access=TRUE WHERE user_id=$1",
-            user_id
-        )
-
 async def has_access(user_id: int) -> bool:
-    if user_id in AUTHORS:
+    if user_id == ADMIN_ID:
         return True
     async with DB_POOL.acquire() as conn:
-        row = await conn.fetchrow("SELECT access FROM users WHERE user_id=$1", user_id)
-        return bool(row and row["access"])
+        row = await conn.fetchrow("SELECT user_id FROM users WHERE user_id=$1", user_id)
+        return bool(row)
 
-# ================== SIGNAL CORE ==================
+# ================= SIGNAL CORE =================
 
-def last(series):
-    return float(series.iloc[-1])
+def last(v):
+    return float(v.iloc[-1])
 
-async def get_signal(pair: str, tf: str):
+async def get_signal(pair: str, exp: int):
     try:
-        df = yf.download(pair, period="2d", interval=tf, progress=False)
-        if df.empty or len(df) < 60:
-            return None
+        interval = INTERVAL_MAP[exp]
+        df = yf.download(pair, period="2d", interval=interval, progress=False)
+
+        if df.empty or len(df) < 50:
+            return "❌ Нет данных", "Рынок слабый"
 
         close = df["Close"]
 
@@ -109,170 +104,161 @@ async def get_signal(pair: str, tf: str):
         delta = close.diff()
         gain = delta.clip(lower=0).rolling(14).mean()
         loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
+        rsi = 100 - (100 / (1 + gain / loss))
 
         buy = sell = 0
 
         if last(ema20) > last(ema50):
-            buy += 2
+            buy += 1
         else:
-            sell += 2
+            sell += 1
 
         if last(rsi) > 55:
-            buy += 2
+            buy += 1
         elif last(rsi) < 45:
-            sell += 2
+            sell += 1
 
-        direction = "📈 ВВЕРХ" if buy > sell else "📉 ВНИЗ"
+        direction = "📈 ВВЕРХ (BUY)" if buy > sell else "📉 ВНИЗ (SELL)"
         strength = abs(buy - sell)
 
-        if strength >= 3:
-            quality = "🔥 СИЛЬНЫЙ"
-        elif strength == 2:
-            quality = "⚡ СРЕДНИЙ"
+        if strength == 2:
+            level = "🔥 СИЛЬНЫЙ СИГНАЛ"
         else:
-            quality = "⚠️ СЛАБЫЙ"
+            level = "⚠️ СРЕДНИЙ СИГНАЛ"
 
-        return direction, quality
+        return direction, level
 
     except Exception as e:
-        logging.error(f"signal error: {e}")
-        return None
+        logging.error(e)
+        return "❌ Ошибка", "Ошибка анализа"
 
-# ================== KEYBOARDS ==================
+# ================= KEYBOARDS =================
 
-def kb_start():
+def main_menu():
     kb = InlineKeyboardBuilder()
-    kb.button(text="➡️ Далее", callback_data="next")
+    kb.button(text="📈 Получить сигнал", callback_data="pairs")
     kb.adjust(1)
     return kb.as_markup()
 
-def kb_access():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🔗 Регистрация", url=REF_LINK)
-    kb.button(text="🆔 Проверить ID", callback_data="my_id")
-    kb.adjust(1)
-    return kb.as_markup()
-
-def kb_main():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📊 Получить сигнал", callback_data="pairs")
-    kb.adjust(1)
-    return kb.as_markup()
-
-def kb_pairs():
-    kb = InlineKeyboardBuilder()
-    for p in PAIRS:
-        kb.button(text=p.replace("=X",""), callback_data=f"pair:{p}")
-    kb.adjust(2)
-    return kb.as_markup()
-
-def kb_tf(pair):
-    kb = InlineKeyboardBuilder()
-    for name, tf in EXPIRATIONS.items():
-        kb.button(text=name, callback_data=f"tf:{pair}:{tf}:{name}")
-    kb.adjust(3)
-    return kb.as_markup()
-
-def kb_back():
+def back_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ В меню", callback_data="menu")
     kb.adjust(1)
     return kb.as_markup()
 
-# ================== HANDLERS ==================
+def pairs_kb(page=0):
+    kb = InlineKeyboardBuilder()
+    start = page * PAIRS_PER_PAGE
+    for p in PAIRS[start:start + PAIRS_PER_PAGE]:
+        kb.button(text=p.replace("=X",""), callback_data=f"pair:{p}")
+    if page > 0:
+        kb.button(text="⬅️", callback_data=f"page:{page-1}")
+    if start + PAIRS_PER_PAGE < len(PAIRS):
+        kb.button(text="➡️", callback_data=f"page:{page+1}")
+    kb.adjust(2)
+    return kb.as_markup()
+
+def exp_kb(pair):
+    kb = InlineKeyboardBuilder()
+    for e in EXPIRATIONS:
+        kb.button(text=f"{e} мин", callback_data=f"exp:{pair}:{e}")
+    kb.adjust(2)
+    return kb.as_markup()
+
+# ================= HANDLERS =================
 
 @dp.message(Command("start"))
 async def start(msg: types.Message):
-    await upsert_user(msg.from_user.id)
+    if msg.from_user.id == ADMIN_ID:
+        await msg.answer("👑 Админ-доступ открыт", reply_markup=main_menu())
+        return
 
-    await msg.answer(
-        "👋 Добро пожаловать в KURUT TRADE\n\n"
-        "📊 Профессиональные сигналы\n"
-        "🤖 Анализ рынка в реальном времени\n\n"
-        "Нажмите «Далее», чтобы продолжить",
-        reply_markup=kb_start()
-    )
-
-@dp.callback_query(lambda c: c.data=="next")
-async def next_step(cb: types.CallbackQuery):
-    await cb.message.edit_text(
-        "📘 ИНСТРУКЦИЯ\n\n"
-        "1️⃣ Зарегистрируйтесь по ссылке ниже\n"
-        "2️⃣ Нажмите «Проверить ID»\n"
-        "3️⃣ Отправьте ID администратору\n"
-        "4️⃣ Админ откроет доступ\n\n"
-        "⚠️ Доступ выдаётся вручную",
-        reply_markup=kb_access()
-    )
-
-@dp.callback_query(lambda c: c.data=="my_id")
-async def my_id(cb: types.CallbackQuery):
     kb = InlineKeyboardBuilder()
-    kb.button(text="✍️ Написать админу", url=ADMIN_USERNAME)
-    kb.adjust(1)
+    kb.button(text="➡️ Далее", callback_data="info")
+    await msg.answer(
+        "📘 Добро пожаловать в KURUT TRADE\n\n"
+        "Бот даёт торговые сигналы.\n"
+        "Для доступа нужно отправить ваш Telegram ID админу.",
+        reply_markup=kb.as_markup()
+    )
 
+@dp.callback_query(lambda c: c.data == "info")
+async def info(cb: types.CallbackQuery):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔗 Регистрация", url=REF_LINK)
+    kb.button(text="🆔 Получить мой ID", callback_data="myid")
+    kb.adjust(1)
     await cb.message.edit_text(
-        f"🆔 Ваш Telegram ID:\n\n{cb.from_user.id}\n\n"
-        "📌 Скопируйте ID и отправьте администратору",
+        "🧾 КАК ПОЛУЧИТЬ ДОСТУП:\n\n"
+        "1️⃣ Зарегистрируйтесь по ссылке\n"
+        "2️⃣ Нажмите «Получить мой ID»\n"
+        "3️⃣ Отправьте ID админу\n"
+        "4️⃣ Админ выдаст доступ",
+        reply_markup=kb.as_markup()
+    )
+
+@dp.callback_query(lambda c: c.data == "myid")
+async def myid(cb: types.CallbackQuery):
+    uid = cb.from_user.id
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✉️ Написать админу", url=f"https://t.me/{ADMIN_ID}")
+    kb.adjust(1)
+    await cb.message.edit_text(
+        f"🆔 ВАШ TELEGRAM ID:\n\n{uid}\n\n"
+        "Отправьте этот ID админу для получения доступа.",
         reply_markup=kb.as_markup()
     )
 
 @dp.message(Command("grant"))
 async def grant(msg: types.Message):
-    if msg.from_user.id not in AUTHORS:
+    if msg.from_user.id != ADMIN_ID:
         return
-    try:
-        uid = int(msg.text.split()[1])
-        await upsert_user(uid)
-        await grant_access(uid)
-        await msg.answer(f"✅ Доступ выдан пользователю {uid}")
-    except:
-        await msg.answer("❌ Использование: /grant USER_ID")
 
-@dp.callback_query(lambda c: c.data=="menu")
+    parts = msg.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await msg.answer("❌ Использование:\n/grant USER_ID")
+        return
+
+    user_id = int(parts[1])
+    await grant_user(user_id)
+    await msg.answer(f"✅ Доступ выдан пользователю {user_id}")
+
+@dp.callback_query(lambda c: c.data == "menu")
 async def menu(cb: types.CallbackQuery):
-    if not await has_access(cb.from_user.id):
-        await cb.answer("❌ Нет доступа", show_alert=True)
-        return
-    await cb.message.edit_text("Главное меню:", reply_markup=kb_main())
+    await cb.message.edit_text("Главное меню:", reply_markup=main_menu())
 
-@dp.callback_query(lambda c: c.data=="pairs")
+@dp.callback_query(lambda c: c.data == "pairs")
 async def pairs(cb: types.CallbackQuery):
     if not await has_access(cb.from_user.id):
-        await cb.answer("❌ Нет доступа", show_alert=True)
+        await cb.answer("⛔ Нет доступа", show_alert=True)
         return
-    await cb.message.edit_text("Выберите валютную пару:", reply_markup=kb_pairs())
+    await cb.message.edit_text("Выберите валютную пару:", reply_markup=pairs_kb())
+
+@dp.callback_query(lambda c: c.data.startswith("page:"))
+async def page(cb: types.CallbackQuery):
+    page = int(cb.data.split(":")[1])
+    await cb.message.edit_text("Выберите валютную пару:", reply_markup=pairs_kb(page))
 
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
 async def pair(cb: types.CallbackQuery):
     pair = cb.data.split(":")[1]
-    await cb.message.edit_text("Выберите таймфрейм:", reply_markup=kb_tf(pair))
+    await cb.message.edit_text("Выберите экспирацию:", reply_markup=exp_kb(pair))
 
-@dp.callback_query(lambda c: c.data.startswith("tf:"))
-async def tf(cb: types.CallbackQuery):
-    _, pair, tf, name = cb.data.split(":")
-    result = await get_signal(pair, tf)
-
-    if not result:
-        await cb.message.edit_text("⚠️ Сейчас нет сильного сигнала", reply_markup=kb_back())
-        return
-
-    direction, quality = result
+@dp.callback_query(lambda c: c.data.startswith("exp:"))
+async def exp(cb: types.CallbackQuery):
+    _, pair, exp = cb.data.split(":")
+    direction, level = await get_signal(pair, int(exp))
 
     await cb.message.edit_text(
         f"💎 СИГНАЛ KURUT TRADE\n\n"
         f"📊 Пара: {pair.replace('=X','')}\n"
-        f"⏱ Таймфрейм: {name}\n\n"
+        f"⏱ Экспирация: {exp} мин\n\n"
         f"🎯 Направление: {direction}\n"
-        f"📌 Качество: {quality}\n\n"
-        f"🧠 Анализ: EMA + RSI\n"
-        f"⚠️ Торгуйте с управлением риска",
-        reply_markup=kb_back()
+        f"📌 Качество: {level}",
+        reply_markup=back_menu()
     )
 
-# ================== START ==================
+# ================= START =================
 
 async def main():
     await init_db()
