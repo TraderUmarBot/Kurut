@@ -68,12 +68,30 @@ async def init_db():
     global DB_POOL
     DB_POOL = await asyncpg.create_pool(DATABASE_URL)
     async with DB_POOL.acquire() as conn:
+        # Создаём таблицу users, если нет
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
-            has_access BOOLEAN DEFAULT FALSE
+            balance FLOAT DEFAULT 0
         );
         """)
+
+        # Проверяем, есть ли колонка has_access
+        column_exists = await conn.fetchval("""
+        SELECT EXISTS (
+            SELECT 1 
+            FROM information_schema.columns 
+            WHERE table_name='users' 
+              AND column_name='has_access'
+        );
+        """)
+
+        # Если колонки нет, добавляем её
+        if not column_exists:
+            await conn.execute("""
+            ALTER TABLE users ADD COLUMN has_access BOOLEAN DEFAULT FALSE;
+            """)
+
 
 async def upsert_user(user_id: int):
     async with DB_POOL.acquire() as conn:
@@ -95,7 +113,7 @@ async def update_access(user_id: int, access: bool):
         )
 
 async def has_access(user_id: int) -> bool:
-    if user_id in AUTHOR_IDS:
+    if user_id in AUTHORS:  # твои ID авторов
         return True
     user = await get_user(user_id)
     return bool(user and user["has_access"])
