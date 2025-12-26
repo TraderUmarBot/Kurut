@@ -10,7 +10,6 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.storage.memory import MemoryStorage
-
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiogram.methods import DeleteWebhook, SetWebhook
@@ -22,9 +21,11 @@ RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 PORT = int(os.getenv("PORT", 10000))
 
 REF_LINK = "https://po-ru4.click/register?utm_campaign=797321&utm_source=affiliate&utm_medium=sr&a=6KE9lr793exm8X&ac=kurut"
-AUTHORS = [6117198446, 7079260196, 5156851527]  # Авторы
+AUTHORS = [6117198446, 7079260196, 5156851527]
 MIN_DEPOSIT = 20.0
-ADMIN_TG = "https://t.me/KURUTTRADING"
+
+INSTAGRAM = "https://www.instagram.com/kurut_trading?igsh=MWVtZHJzcjRvdTlmYw=="
+TELEGRAM = "https://t.me/KURUTTRADING"
 
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
@@ -46,9 +47,15 @@ PAIRS = [
     "EURJPY=X","GBPJPY=X","AUDJPY=X","EURGBP=X","EURAUD=X","GBPAUD=X",
     "CADJPY=X","CHFJPY=X","EURCAD=X","GBPCAD=X","AUDCAD=X","AUDCHF=X","CADCHF=X"
 ]
+
 EXPIRATIONS = [1, 5, 10]
 PAIRS_PER_PAGE = 6
-INTERVAL_MAP = {1: "1m", 5: "5m", 10: "15m"}
+
+INTERVAL_MAP = {
+    1: "1m",
+    5: "5m",
+    10: "15m"
+}
 
 # ================= DATABASE =================
 async def init_db():
@@ -63,10 +70,21 @@ async def init_db():
         """)
 
 async def upsert_user(user_id: int):
+    global DB_POOL
+    if DB_POOL is None:
+        logging.error("DB_POOL не инициализирован")
+        return
     async with DB_POOL.acquire() as conn:
-        await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
+        await conn.execute(
+            "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            user_id
+        )
 
 async def get_user(user_id: int):
+    global DB_POOL
+    if DB_POOL is None:
+        logging.error("DB_POOL не инициализирован")
+        return None
     async with DB_POOL.acquire() as conn:
         return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
 
@@ -81,81 +99,66 @@ async def has_access(user_id: int) -> bool:
     return bool(user and user["balance"] >= MIN_DEPOSIT)
 
 # ================= SIGNAL CORE =================
-def last(v: pd.Series) -> float:
+def last(v):
     return float(v.iloc[-1])
 
 async def get_signal(pair: str, exp: int) -> tuple[str, str, int]:
-    """Максимально точный сигнал с расчетом уверенности"""
-    try:
-        interval = INTERVAL_MAP[exp]
-        df = yf.download(pair, period="2d", interval=interval, progress=False)
-        if df.empty or len(df) < 50:
-            return "ВНИЗ 📉", "⚠️ Слабый рынок", 30
+    """Максимально точный сигнал с EMA, RSI, ADX"""
+    interval = INTERVAL_MAP.get(exp, "1m")
+    for attempt in range(3):
+        try:
+            df = yf.download(pair, period="2d", interval=interval, progress=False)
+            if df.empty or len(df) < 50:
+                await asyncio.sleep(1)
+                continue
 
-        close = df["Close"]
-        high = df["High"]
-        low = df["Low"]
+            close = df["Close"]
+            high = df["High"]
+            low = df["Low"]
 
-        # EMA и RSI
-        ema20 = close.ewm(span=20).mean()
-        ema50 = close.ewm(span=50).mean()
-        delta = close.diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rsi = 100 - (100 / (1 + gain / loss))
+            # EMA
+            ema20 = close.ewm(span=20).mean()
+            ema50 = close.ewm(span=50).mean()
 
-        # Простая версия ADX
-        tr = pd.concat([high - low, abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
-        plus_dm = high.diff()
-        minus_dm = low.diff() * -1
-        plus_dm[plus_dm < 0] = 0
-        minus_dm[minus_dm < 0] = 0
-        plus_di = 100 * plus_dm.ewm(span=14).mean() / tr.ewm(span=14).mean()
-        minus_di = 100 * minus_dm.ewm(span=14).mean() / tr.ewm(span=14).mean()
-        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-        adx = dx.ewm(span=14).mean()
+            # RSI
+            delta = close.diff()
+            gain = delta.clip(lower=0).rolling(14).mean()
+            loss = (-delta.clip(upper=0)).rolling(14).mean()
+            rsi = 100 - (100 / (1 + gain / loss))
 
-        # Счетчики buy/sell
-        buy = 0
-        sell = 0
+            # ADX
+            tr = pd.concat([high - low, abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
+            plus_dm = high.diff().clip(lower=0)
+            minus_dm = (-low.diff()).clip(lower=0)
+            plus_di = 100 * plus_dm.ewm(span=14).mean() / tr.ewm(span=14).mean()
+            minus_di = 100 * minus_dm.ewm(span=14).mean() / tr.ewm(span=14).mean()
+            dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+            adx = dx.ewm(span=14).mean()
 
-        if last(ema20) > last(ema50):
-            buy += 2
-        else:
-            sell += 2
+            # Рассчет сигнала
+            buy = sell = 0
+            if last(ema20) > last(ema50): buy += 2
+            else: sell += 2
+            if last(rsi) > 55: buy += 1
+            elif last(rsi) < 45: sell += 1
+            if last(adx) > 25: buy += 1; sell += 1
 
-        if last(rsi) > 55:
-            buy += 1
-        elif last(rsi) < 45:
-            sell += 1
+            direction = "ВВЕРХ 📈" if buy > sell else "ВНИЗ 📉"
+            strength = abs(buy - sell)
+            level = "🔥 СИЛЬНЫЙ сигнал" if strength >= 3 else "⚡ СРЕДНИЙ сигнал" if strength == 2 else "⚠️ СЛАБЫЙ рынок"
+            confidence = min(100, 30 + strength*20)
+            return direction, level, confidence
 
-        if last(adx) > 25:  # сильный тренд
-            buy += 1
-            sell += 1
-
-        direction = "ВВЕРХ 📈" if buy > sell else "ВНИЗ 📉"
-        strength = abs(buy - sell)
-        if strength >= 3:
-            level = "🔥 СИЛЬНЫЙ сигнал"
-        elif strength == 2:
-            level = "⚡ СРЕДНИЙ сигнал"
-        else:
-            level = "⚠️ СЛАБЫЙ рынок (риск)"
-
-        # Уверенность %
-        confidence = min(100, 30 + strength * 20)
-        return direction, level, confidence
-
-    except Exception as e:
-        logging.error(f"get_signal error: {e}")
-        return "ВНИЗ 📉", "⚠️ Ошибка данных", 0
+        except Exception as e:
+            logging.warning(f"Попытка {attempt+1}: ошибка получения данных для {pair}: {e}")
+            await asyncio.sleep(1)
+    return "ВНИЗ 📉", "⚠️ Ошибка данных", 0
 
 # ================= KEYBOARDS =================
 def main_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="📈 Валютные пары", callback_data="pairs")
     kb.button(text="📰 Новости", callback_data="news")
-    kb.button(text="💰 Проверить ID", callback_data="check_id")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -186,7 +189,7 @@ def exp_kb(pair):
 
 def to_admin_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="💬 Написать админу", url=ADMIN_TG)
+    kb.button(text="💬 Написать админу", url=TELEGRAM)
     kb.adjust(1)
     return kb.as_markup()
 
@@ -194,12 +197,19 @@ def to_admin_kb():
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     if msg.from_user.id in AUTHORS:
-        await msg.answer("👑 Авторский доступ открыт", reply_markup=main_menu())
+        await msg.answer("👑 Авторский доступ", reply_markup=main_menu())
         return
 
     kb = InlineKeyboardBuilder()
     kb.button(text="➡️ Далее", callback_data="instr2")
-    await msg.answer("📘 Добро пожаловать в KURUT TRADE!\n\nБот анализирует рынок и дает сигналы.", reply_markup=kb.as_markup())
+    kb.button(text="📸 Instagram", url=INSTAGRAM)
+    kb.button(text="💬 Telegram", url=TELEGRAM)
+    kb.adjust(1)
+    await msg.answer(
+        "📘 Добро пожаловать в KURUT TRADE!\n\n"
+        "Ниже наши соцсети для связи и обучения:",
+        reply_markup=kb.as_markup()
+    )
 
 @dp.callback_query(lambda c: c.data=="instr2")
 async def instr2(cb: types.CallbackQuery):
@@ -208,20 +218,18 @@ async def instr2(cb: types.CallbackQuery):
     kb.adjust(1)
     await cb.message.edit_text(
         "📘 ИНСТРУКЦИЯ KURUT TRADE\n\n"
-        "1️⃣ Выберите валютную пару\n"
-        "2️⃣ Выберите экспирацию\n"
-        "3️⃣ Получите сигнал и анализ\n"
-        "4️⃣ Чтобы получить доступ к боту, нажмите далее",
+        "Бот анализирует рынок с помощью профессиональных индикаторов.\n"
+        "Выберите валютную пару и экспирацию для получения сигнала.",
         reply_markup=kb.as_markup()
     )
 
 @dp.callback_query(lambda c: c.data=="get_access")
 async def get_access(cb: types.CallbackQuery):
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Проверить ID", callback_data="check_id")
     kb.button(text="🔗 Регистрация", url=REF_LINK)
+    kb.button(text="✅ Проверить ID", callback_data="check_id")
     kb.adjust(1)
-    await cb.message.edit_text("Для доступа к боту:", reply_markup=kb.as_markup())
+    await cb.message.edit_text("Доступ к боту:", reply_markup=kb.as_markup())
 
 @dp.callback_query(lambda c: c.data=="check_id")
 async def check_id(cb: types.CallbackQuery):
@@ -242,29 +250,35 @@ async def main_menu_cb(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data=="pairs")
 async def pairs(cb: types.CallbackQuery):
     if not await has_access(cb.from_user.id):
-        await cb.answer("Нет доступа. Проверьте ID у администратора.", show_alert=True)
+        await cb.answer("Нет доступа", show_alert=True)
         return
-    await cb.message.edit_text("Выберите валютную пару:", reply_markup=pairs_kb())
+    await cb.message.edit_text("Выберите пару", reply_markup=pairs_kb())
+
+@dp.callback_query(lambda c: c.data.startswith("page:"))
+async def page(cb: types.CallbackQuery):
+    page = int(cb.data.split(":")[1])
+    await cb.message.edit_text("Выберите пару", reply_markup=pairs_kb(page))
 
 @dp.callback_query(lambda c: c.data.startswith("pair:"))
 async def pair(cb: types.CallbackQuery):
     pair = cb.data.split(":")[1]
-    await cb.message.edit_text("Выберите экспирацию:", reply_markup=exp_kb(pair))
+    await cb.message.edit_text("Выберите экспирацию", reply_markup=exp_kb(pair))
 
 @dp.callback_query(lambda c: c.data.startswith("exp:"))
 async def exp(cb: types.CallbackQuery):
     _, pair, exp = cb.data.split(":")
     direction, level, confidence = await get_signal(pair, int(exp))
     blocks = int(confidence // 10)
-    bar = "█" * blocks + "░" * (10 - blocks)
+    empty = 10 - blocks
+    bar = "█" * blocks + "░" * empty
     await cb.message.edit_text(
         f"💎 VIP СИГНАЛ KURUT TRADE\n\n"
         f"📊 Пара: {pair.replace('=X','')}\n"
-        f"⏱ Экспирация: {exp} мин\n"
+        f"⏱ Экспирация: {exp} мин\n\n"
         f"🎯 Направление: {direction}\n"
         f"📌 Качество: {level}\n\n"
         f"📈 Уверенность: {confidence}%\n{bar}\n\n"
-        f"🧠 Сигнал рассчитан по рынку в момент запроса",
+        "🧠 Сигнал рассчитан по рынку в момент запроса",
         reply_markup=back_menu_kb()
     )
 
@@ -274,17 +288,14 @@ async def news(cb: types.CallbackQuery):
     pair = random.choice(PAIRS)
     exp = random.choice(EXPIRATIONS)
     direction, level, confidence = await get_signal(pair, exp)
-    blocks = int(confidence // 10)
-    bar = "█" * blocks + "░" * (10 - blocks)
     await cb.message.edit_text(
         f"📰 НОВОСТНОЙ СИГНАЛ\n\n"
         f"{pair.replace('=X','')} — {exp} мин\n"
-        f"{direction}\n{level}\n"
-        f"📈 Уверенность: {confidence}%\n{bar}",
+        f"{direction}\n{level}",
         reply_markup=back_menu_kb()
     )
 
-# ================= START =================
+# ================= START WITH WEBHOOK =================
 async def main():
     await init_db()
     await bot(DeleteWebhook(drop_pending_updates=True))
@@ -292,6 +303,7 @@ async def main():
 
     app = web.Application()
     SimpleRequestHandler(dp, bot).register(app, WEBHOOK_PATH)
+
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
@@ -299,5 +311,5 @@ async def main():
     logging.info("BOT STARTED")
     await asyncio.Event().wait()
 
-if __name__ == "__main__":
+if __name__=="__main__":
     asyncio.run(main())
